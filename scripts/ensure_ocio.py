@@ -4,11 +4,14 @@
 ``oiio-python`` sometimes rewrites ``PyOpenColorIO.so`` to link against the
 OpenColorIO 2.4.0 dylib it vendors under ``OpenImageIO/.dylibs/``.  That makes
 ``PyOpenColorIO.GetVersion()`` report 2.4.0 even when the ``opencolorio``
-package metadata says 2.5.1, and the bundled ACES Studio v4 config
+package metadata says 2.5.x, and the bundled ACES Studio v4 config
 (``ocio_profile_version: 2.5``) then fails to load.
 
 This script detects that mismatch and reinstalls ``opencolorio`` so the
 extension links its own ``@loader_path/libOpenColorIO.dylib`` again.
+
+Version checks after reinstall run in a **fresh subprocess** so a previously
+loaded 2.4 extension module cannot mask a successful repair.
 """
 
 from __future__ import annotations
@@ -17,7 +20,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-
 
 REQUIRED = (2, 5, 0)
 PACKAGE = "opencolorio>=2.5.1"
@@ -28,15 +30,20 @@ def _parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(n) for n in nums[:3]) if nums else (0,)
 
 
-def _runtime_version() -> str:
-    import PyOpenColorIO as ocio
-
-    return str(ocio.GetVersion())
+def _runtime_version_fresh() -> str:
+    """Import OCIO in a clean interpreter so .so linkage is re-read from disk."""
+    code = (
+        "import PyOpenColorIO as o; print(o.GetVersion(), end=''); "
+        "print('\\n' + o.__file__, end='')"
+    )
+    out = subprocess.check_output([sys.executable, "-c", code], text=True)
+    # First line: version; second: path (optional)
+    return out.splitlines()[0].strip()
 
 
 def _is_broken() -> tuple[bool, str]:
     try:
-        ver = _runtime_version()
+        ver = _runtime_version_fresh()
     except Exception as e:
         return True, f"import failed: {e}"
     if _parse_version(ver) < REQUIRED:
@@ -45,10 +52,27 @@ def _is_broken() -> tuple[bool, str]:
 
 
 def _reinstall() -> int:
-    # Prefer uv when available (project venv), fall back to the active pip.
+    # Target *this* interpreter's environment (uv run / CI venv).
     cmds = [
-        ["uv", "pip", "install", "--reinstall-package", "opencolorio", PACKAGE],
-        [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", PACKAGE],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--reinstall-package",
+            "opencolorio",
+            PACKAGE,
+        ],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            PACKAGE,
+        ],
     ]
     for cmd in cmds:
         try:
@@ -58,7 +82,10 @@ def _reinstall() -> int:
         except FileNotFoundError:
             continue
         except subprocess.CalledProcessError as e:
-            print(f"ensure_ocio: command failed ({e.returncode}): {' '.join(cmd)}", file=sys.stderr)
+            print(
+                f"ensure_ocio: command failed ({e.returncode}): {' '.join(cmd)}",
+                file=sys.stderr,
+            )
             return e.returncode
     print("ensure_ocio: neither uv nor pip available", file=sys.stderr)
     return 1
@@ -88,9 +115,9 @@ def main() -> int:
     print(f"ensure_ocio: repaired — OpenColorIO {ver}")
     # Spot-check the macOS install name when otool is available.
     try:
-        import PyOpenColorIO as ocio
-
-        so = Path(ocio.__file__).resolve().parent / "PyOpenColorIO.so"
+        code = "import PyOpenColorIO as o; print(o.__file__)"
+        mod = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+        so = Path(mod).resolve().parent / "PyOpenColorIO.so"
         if so.is_file():
             out = subprocess.check_output(["otool", "-L", str(so)], text=True)
             first = next((ln.strip() for ln in out.splitlines()[1:] if ln.strip()), "")
