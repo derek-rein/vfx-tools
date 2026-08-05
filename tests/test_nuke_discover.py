@@ -13,14 +13,7 @@ from src.core.ocio_utils import list_nuke_configs, resolve_ocio_config
 def _fake_nuke_tree(root: Path, version: str = "17.0v3") -> Path:
     """Build a minimal Nuke-like OCIOConfigs tree under *root*."""
     install = root / f"Nuke{version}"
-    configs = (
-        install
-        / f"Nuke{version}.app"
-        / "Contents"
-        / "Resources"
-        / "OCIOConfigs"
-        / "configs"
-    )
+    configs = install / f"Nuke{version}.app" / "Contents" / "Resources" / "OCIOConfigs" / "configs"
     configs.mkdir(parents=True)
 
     studio = configs / "fn-nuke_studio-config-v3.0.0_aces-v2.0_ocio-v2.4.ocio"

@@ -85,9 +85,7 @@ class TestSpaceResolution:
         cfg = resolve_ocio_for_cli(None)
         logs: list[str] = []
         # Minimal namespace
-        args = build_parser().parse_args(
-            ["video2exr", "-i", str(tmp_path / "x.mov")]
-        )
+        args = build_parser().parse_args(["video2exr", "-i", str(tmp_path / "x.mov")])
         # No real video — still must resolve display-ish src + scene-linear dst
         src, dst = resolve_v2e_spaces(cfg, args, logs.append)
         assert cfg.getColorSpace(src) is not None
