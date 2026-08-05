@@ -8,7 +8,6 @@ authors = [
 dependencies = [
     "av>=17.0.0",
     "oiio-python>=3.0.10.0.1",
-    "nuitka[onefile]>=4.0",
     "PySide6-Essentials>=6.8.3",
     "numpy>=2.2.6",
     "opencolorio>=2.5.1",
@@ -23,6 +22,10 @@ dev = [
     "pillow>=12.2.0",
     "ruff>=0.11.0",
     "pytest>=8.0.0",
+    "basedpyright>=1.28.0",
+]
+bundle = [
+    "nuitka[onefile]>=4.0",
 ]
 
 [tool.pytest.ini_options]
@@ -40,3 +43,28 @@ exclude = ["src/rc_resources.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
+
+# Type checking for our code. C-extension modules (OCIO / OIIO / av) ship incomplete
+# stubs — keep checks useful without drowning in third-party noise.
+[tool.basedpyright]
+include = ["src", "main.py", "tests"]
+exclude = ["**/rc_resources.py", "**/__pycache__"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportAny = false
+reportExplicitAny = false
+# Incomplete PySide6 / OCIO / OIIO / av stubs trigger these liberally.
+reportAttributeAccessIssue = "warning"
+reportArgumentType = "warning"
+reportCallIssue = "warning"
+reportReturnType = "warning"
+reportOptionalMemberAccess = "warning"
+reportPrivateUsage = false
+reportUnusedCallResult = false
+# fileseq / similar packages export symbols without typing ``__all__``.
+reportPrivateImportUsage = false

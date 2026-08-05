@@ -13,7 +13,7 @@ def parse_frame_range(spec: str) -> list[int]:
     if not spec or not spec.strip():
         return []
     fs = fileseq.FrameSet(spec.strip())
-    return sorted(fs)
+    return sorted(int(f) for f in fs)
 
 
 def format_frame_range(frames: list[int]) -> str:

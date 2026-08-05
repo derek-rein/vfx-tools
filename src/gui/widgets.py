@@ -11,20 +11,21 @@ if TYPE_CHECKING:
 from PySide6.QtCore import (
     QDir,
     QObject,
+    QPoint,
     QRegularExpression,
     QSettings,
     QStandardPaths,
     Qt,
+    QThread,
     QTimer,
     Signal,
+    Slot,
 )
 from PySide6.QtGui import (
     QAction,
-    QColor,
     QGuiApplication,
     QIcon,
     QPainter,
-    QPen,
     QPixmap,
     QRegularExpressionValidator,
 )
@@ -48,7 +49,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
-    QSizeGrip,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -78,9 +78,17 @@ from ..core.constants import (
     OCIO_SOURCE_ENV,
     OCIO_SOURCE_FILE,
     SCALE_OPTIONS,
-    VIDEO_CODECS,
+    available_video_codecs,
+    video_codec_by_key,
 )
-from ..core.ocio_utils import list_app_configs, list_builtin_configs, resolve_ocio_config
+from ..core.nuke_discover import is_nuke_source_key
+from ..core.ocio_utils import (
+    find_equivalent_space,
+    list_app_configs,
+    list_builtin_configs,
+    list_nuke_configs,
+    resolve_ocio_config,
+)
 from ..core.sequence import probe_exr_colorspace, probe_exr_metadata, scan_exr_sequences
 from ..core.video import probe_video_metadata, scan_video_files
 from .style import DESC_STYLE, HINT_STYLE, STATUS_DIM, STATUS_ERR, STATUS_OK
@@ -97,35 +105,83 @@ except ImportError:
 
 
 class ColorSpaceButton(QToolButton):
-    """A button that pops up a nested QMenu grouped by OCIO family."""
+    """A button that pops up a nested QMenu grouped by OCIO family.
+
+    The menu is shown manually under the press point (not via QToolButton's
+    InstantPopup + setMenu path). That path often opens at the wrong global
+    corner once an app-wide QSS stylesheet is applied.
+
+    When the active OCIO config changes, :meth:`populate` may leave the
+    control in an **invalid** state if the previous space has no equivalent —
+    :meth:`current_space` then returns ``""`` so Convert stays disabled.
+    """
 
     space_changed = Signal(str)
 
+    # Visual cue when the displayed name is not in the current config.
+    _INVALID_STYLE = (
+        "QToolButton { color: #e07070; border: 1px solid #a04040; "
+        "background-color: #3a2020; }"
+    )
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        # DelayedPopup + no setMenu — we own popup positioning in mouse/key events.
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.DelayedPopup)
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._current = ""
+        self._valid = False
         self._menu = QMenu(self)
-        self.setMenu(self._menu)
         self._set_display("(none)")
+        self._apply_valid_style()
 
     def current_space(self) -> str:
+        """Canonical space name if valid; empty string when invalid/unset."""
+        return self._current if self._valid and self._current else ""
+
+    def displayed_space(self) -> str:
+        """Name shown on the button (may be invalid for the active config)."""
         return self._current
 
+    def is_valid(self) -> bool:
+        return self._valid and bool(self._current)
+
     def set_current_space(self, name: str) -> None:
-        self._current = name
-        self._set_display(name)
+        """Set the selection; marks invalid if *name* is empty."""
+        self._current = name or ""
+        self._valid = bool(name)
+        self._set_display(name or "(none)")
+        self._apply_valid_style()
+
+    def set_invalid(self, wanted: str) -> None:
+        """Show *wanted* as missing from the active config (Convert disabled)."""
+        self._current = wanted or ""
+        self._valid = False
+        label = wanted if wanted else "(none)"
+        self._set_display(f"⚠ {label}")
+        tip = (
+            f"“{wanted}” is not in the current OCIO config "
+            f"(and no equivalent was found). Pick a color space."
+            if wanted
+            else "Select a color space."
+        )
+        self.setToolTip(tip)
+        self._apply_valid_style()
 
     def populate(self, families: dict[str, list[str]], select: str = "") -> None:
+        """Rebuild the menu. *select* must already be a name present in *families*
+        (or empty). Callers should run :func:`~src.core.ocio_utils.find_equivalent_space`
+        first; use :meth:`set_invalid` when no match exists.
+        """
         old_menu = self._menu
         self._menu = QMenu(self)
-        self.setMenu(self._menu)
         old_menu.deleteLater()
 
         submenu_cache: dict[str, QMenu] = {}
         found = False
+        all_names: set[str] = set()
 
         for family in sorted(families.keys()):
             names = families[family]
@@ -146,6 +202,7 @@ class ColorSpaceButton(QToolButton):
                     submenu_cache[family] = target_menu
 
             for cs_name in names:
+                all_names.add(cs_name)
                 action = target_menu.addAction(cs_name)
                 action.triggered.connect(lambda checked, n=cs_name: self._pick(n))
                 if cs_name == select:
@@ -153,13 +210,55 @@ class ColorSpaceButton(QToolButton):
 
         if select and found:
             self._pick(select)
+        elif select and select in all_names:
+            self._pick(select)
         elif select:
-            self._current = select
-            self._set_display(select)
+            # Name not in menu — invalid until the user picks.
+            self.set_invalid(select)
+        else:
+            self._current = ""
+            self._valid = False
+            self._set_display("(none)")
+            self.setToolTip("Select a color space.")
+            self._apply_valid_style()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._popup_menu(event.position().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (
+            Qt.Key.Key_Space,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+            Qt.Key.Key_Down,
+        ):
+            # Keyboard open: under the left edge of the button (combo-like).
+            self._popup_menu(QPoint(0, self.height() // 2))
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _popup_menu(self, local_pos) -> None:
+        """Show the family menu under the press, relative to this button."""
+        if self._menu is None or not self._menu.actions():
+            return
+        # Place the menu just below the button, X following the click so a
+        # wide control doesn't always open at the far left of the window.
+        if not isinstance(local_pos, QPoint):
+            local_pos = QPoint(int(local_pos.x()), int(local_pos.y()))
+        x = max(0, min(local_pos.x(), max(0, self.width() - 8)))
+        global_pos = self.mapToGlobal(QPoint(x, self.height()))
+        self._menu.popup(global_pos)
 
     def _pick(self, name: str) -> None:
         self._current = name
+        self._valid = True
         self._set_display(name)
+        self._apply_valid_style()
         self.space_changed.emit(name)
 
     def try_select(self, name: str) -> bool:
@@ -175,6 +274,12 @@ class ColorSpaceButton(QToolButton):
             self._pick(found)
             return True
         return False
+
+    def _apply_valid_style(self) -> None:
+        if self._valid:
+            self.setStyleSheet("")
+        else:
+            self.setStyleSheet(self._INVALID_STYLE)
 
     @staticmethod
     def _find_action(menu: QMenu, name: str) -> bool:
@@ -204,7 +309,8 @@ class ColorSpaceButton(QToolButton):
         metrics = self.fontMetrics()
         elided = metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, max(self.width() - 30, 120))
         self.setText(elided)
-        self.setToolTip(text)
+        if self._valid:
+            self.setToolTip(text)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +416,7 @@ class OcioConfigPanel(QGroupBox):
 
         self._builtin_configs = list_builtin_configs()
         self._app_configs = list_app_configs()
+        self._nuke_configs = list_nuke_configs()
 
         env_ocio = os.environ.get("OCIO", "")
         env_label = (
@@ -327,6 +434,26 @@ class OcioConfigPanel(QGroupBox):
                 short += "  \u2605"
             self._source_combo.addItem(short, name)
         if self._app_configs:
+            self._source_combo.insertSeparator(self._source_combo.count())
+
+        # Local Nuke installs — path references only (never redistributed).
+        for name, label, recommended in self._nuke_configs:
+            short = label
+            if recommended:
+                short += "  \u2605"
+            self._source_combo.addItem(short, name)
+            # Tooltip shows full on-disk path so users know it's their Nuke install.
+            from ..core.nuke_discover import resolve_nuke_config_path
+
+            p = resolve_nuke_config_path(name)
+            if p is not None:
+                idx = self._source_combo.count() - 1
+                self._source_combo.setItemData(
+                    idx,
+                    f"Uses OCIO from your Nuke install (not redistributed):\n{p}",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+        if self._nuke_configs:
             self._source_combo.insertSeparator(self._source_combo.count())
 
         for name, label, recommended in self._builtin_configs:
@@ -392,6 +519,13 @@ class OcioConfigPanel(QGroupBox):
             desc = f"File: {Path(file_path).name}"
         elif source == OCIO_SOURCE_BUNDLED or source == BUNDLED_ACES_STUDIO_KEY:
             desc = "ACES Studio (bundled)"
+        elif is_nuke_source_key(source):
+            from ..core.nuke_discover import nuke_source_label, resolve_nuke_config_path
+
+            desc = nuke_source_label(source)
+            p = resolve_nuke_config_path(source)
+            if p is not None:
+                self._status.setToolTip(str(p))
         else:
             desc = source
         self._status.setText(f"\u2714  {desc}  ({n} color spaces)")
@@ -442,29 +576,8 @@ def _copy_to_clipboard(text: str) -> None:
         QGuiApplication.clipboard().setText(text)
 
 
-class SizeGrip(QSizeGrip):
-    """A window-corner resize grip that paints its own diagonal-line texture.
-
-    Qt's native ``QSizeGrip`` stops drawing the familiar corner texture as soon
-    as an app-wide QSS stylesheet is applied (the style engine paints nothing),
-    which is why ours rendered blank. We keep ``QSizeGrip``'s built-in resize
-    behaviour and just draw the classic three nested diagonal lines.
-    """
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setFixedSize(16, 16)
-
-    def paintEvent(self, _event) -> None:
-        p = QPainter(self)
-        pen = QPen(QColor(0x70, 0x70, 0x70))
-        pen.setWidth(1)
-        p.setPen(pen)
-        w, h = self.width(), self.height()
-        margin = 3
-        for offset in (0, 4, 8):
-            p.drawLine(w - margin - offset, h - margin, w - margin, h - margin - offset)
-        p.end()
+# SizeGrip lives in :mod:`src.gui.size_grip` (imported by window / slate_widgets)
+# so the slate package does not create an import cycle with this module.
 
 
 class _FavoritesDropList(QListWidget):
@@ -560,10 +673,14 @@ class _PlacesSidebar(QWidget):
         self._fav_start = self._list.count()
 
         settings = QSettings()
-        saved = settings.value(self._FAVORITES_KEY, [])
-        if isinstance(saved, str):
-            saved = [saved] if saved else []
-        for fav_path in saved:
+        raw = settings.value(self._FAVORITES_KEY, [])
+        if isinstance(raw, str):
+            favs: list[str] = [raw] if raw else []
+        elif isinstance(raw, (list, tuple)):
+            favs = [str(x) for x in raw]
+        else:
+            favs = []
+        for fav_path in favs:
             if Path(fav_path).is_dir():
                 self._add_fav_item(fav_path)
 
@@ -760,32 +877,31 @@ _SEARCH_SKIP_DIRS = frozenset(
     }
 )
 
-_SEARCH_SKIP_ABSPATHS: set[str] = set()
-for _d in (
-    "/System",
-    "/Library",
-    "/private",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/etc",
-    "/var",
-    "/opt",
-    "/cores",
-    "/dev",
-    "/proc",
-    "/sys",
-    "/run",
-    "/snap",
-    "C:\\Windows",
-    "C:\\Program Files",
-    "C:\\Program Files (x86)",
-    "C:\\ProgramData",
-    "C:\\$Recycle.Bin",
-    "C:\\Recovery",
-):
-    _SEARCH_SKIP_ABSPATHS.add(_d)
-_SEARCH_SKIP_ABSPATHS = frozenset(_SEARCH_SKIP_ABSPATHS)
+_SEARCH_SKIP_ABSPATHS: frozenset[str] = frozenset(
+    {
+        "/System",
+        "/Library",
+        "/private",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/var",
+        "/opt",
+        "/cores",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/run",
+        "/snap",
+        "C:\\Windows",
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+        "C:\\ProgramData",
+        "C:\\$Recycle.Bin",
+        "C:\\Recovery",
+    }
+)
 
 _SEARCH_SKIP_FILES = frozenset(
     {
@@ -1002,8 +1118,11 @@ class _SearchableTree(QWidget):
         layout.addWidget(self._search_status)
 
         self._worker = _DirSearchWorker(self, ext_filter=ext_filter, dirs_only=dirs_only)
-        self._worker.batch_ready.connect(self._on_batch)
-        self._worker.search_finished.connect(self._on_search_done)
+        # Emits come from plain threading.Thread — must queue onto the GUI thread.
+        self._worker.batch_ready.connect(self._on_batch, Qt.ConnectionType.QueuedConnection)
+        self._worker.search_finished.connect(
+            self._on_search_done, Qt.ConnectionType.QueuedConnection
+        )
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -1676,7 +1795,8 @@ class VideoBrowserDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 _EXR_HAS_SETTINGS = {"dwaa", "dwab", "zip", "zips"}
-_CODEC_HAS_SETTINGS = {"h264", "prores", "prores_4444"}
+# Profile is selected via the codec dropdown itself for ProRes / DNxHR ladders.
+_CODEC_HAS_SETTINGS = {"h264", "hevc", "hevc_8", "cineform", "cineform_rgb"}
 
 _EXR_COMPRESSION_HELP: dict[str, str] = {
     "none": "No compression. Fastest write, largest files.",
@@ -1733,7 +1853,9 @@ class ExrCompressionSettingsDialog(QDialog):
             self._dwa_spin = QSpinBox()
             self._dwa_spin.setRange(0, 250)
             self._dwa_spin.setValue(saved)
-            self._dwa_spin.setFixedWidth(64)
+            self._dwa_spin.setMinimumWidth(72)
+            self._dwa_spin.setFixedWidth(72)
+            self._dwa_spin.setAlignment(Qt.AlignmentFlag.AlignRight)
             self._dwa_spin.setToolTip(
                 "0 = lossless, 45 = visually lossless (default), higher = more compression"
             )
@@ -1755,7 +1877,9 @@ class ExrCompressionSettingsDialog(QDialog):
             self._zip_spin = QSpinBox()
             self._zip_spin.setRange(1, 9)
             self._zip_spin.setValue(saved)
-            self._zip_spin.setFixedWidth(64)
+            self._zip_spin.setMinimumWidth(72)
+            self._zip_spin.setFixedWidth(72)
+            self._zip_spin.setAlignment(Qt.AlignmentFlag.AlignRight)
             self._zip_spin.setToolTip("1 = fastest, 9 = best compression")
             slider.valueChanged.connect(self._zip_spin.setValue)
             self._zip_spin.valueChanged.connect(slider.setValue)
@@ -1794,37 +1918,39 @@ class ExrCompressionSettingsDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 _CODEC_HELP: dict[str, str] = {
-    "prores": "Apple ProRes 422 HQ — high quality, large files, wide compatibility.",
-    "prores_4444": "Apple ProRes 4444 — highest quality ProRes with alpha support.",
-    "h264": "H.264 — excellent compression, universal playback support.",
-    "dnxhr_hq": "DNxHR HQ — Avid's high-quality intermediate codec.",
-    "dnxhr_hqx": "DNxHR HQX — 10-bit variant for high-end workflows.",
-    "ffv1": "FFV1 — mathematically lossless, open-source archival codec.",
+    "prores_proxy": "ProRes 422 Proxy — lightest ProRes; 10-bit 4:2:2 offline/proxy.",
+    "prores_lt": "ProRes 422 LT — lighter intermediate; 10-bit 4:2:2.",
+    "prores_422": "ProRes 422 (Standard) — balanced intermediate; 10-bit 4:2:2.",
+    "prores": "ProRes 422 HQ — default finishing intermediate; 10-bit 4:2:2 (prores_ks).",
+    "prores_4444": "ProRes 4444 — 12-bit 4:4:4:4 with alpha; compositing/delivery.",
+    "prores_xq": "ProRes 4444 XQ — highest ProRes tier; 12-bit 4:4:4:4 with alpha.",
+    "prores_vt_proxy": (
+        "Hardware ProRes Proxy via Apple VideoToolbox. macOS only; faster, "
+        "quality/controls differ slightly from software prores_ks."
+    ),
+    "prores_vt_lt": "Hardware ProRes LT via VideoToolbox (macOS only).",
+    "prores_vt_422": "Hardware ProRes 422 via VideoToolbox (macOS only).",
+    "prores_vt_hq": "Hardware ProRes HQ via VideoToolbox (macOS only).",
+    "prores_vt_4444": "Hardware ProRes 4444 via VideoToolbox (macOS only).",
+    "prores_vt_xq": "Hardware ProRes 4444 XQ via VideoToolbox (macOS only).",
+    "cineform": (
+        "GoPro CineForm (cfhd) — 10-bit 4:2:2 wavelet intermediate. "
+        "Quality ladder film3+…low in settings."
+    ),
+    "cineform_rgb": ("GoPro CineForm RGB — 12-bit planar RGB (gbrp12le) for RGB pipelines."),
+    "dnxhr_lb": "DNxHR LB — lightest Avid/Resolve profile; 8-bit 4:2:2.",
+    "dnxhr_sq": "DNxHR SQ — standard quality; 8-bit 4:2:2.",
+    "dnxhr_hq": "DNxHR HQ — high quality intermediate; 8-bit 4:2:2 (not 10-bit).",
+    "dnxhr_hqx": "DNxHR HQX — 10-bit 4:2:2; use when 10-bit headroom is required.",
+    "dnxhr_444": "DNxHR 444 — 10-bit 4:4:4 for highest chroma fidelity in DNx family.",
+    "h264": ("H.264 / AVC — 8-bit 4:2:0 delivery/review. Not a grading intermediate."),
+    "hevc": (
+        "H.265 / HEVC — 10-bit 4:2:0 delivery (libx265). Smaller than ProRes; "
+        "not a scene-linear intermediate."
+    ),
+    "hevc_8": "H.265 / HEVC — 8-bit 4:2:0 delivery for maximum player compatibility.",
+    "ffv1": "FFV1 — mathematically lossless 10-bit 4:4:4 archival intermediate.",
 }
-
-_H264_PRESETS = [
-    "ultrafast",
-    "superfast",
-    "veryfast",
-    "faster",
-    "fast",
-    "medium",
-    "slow",
-    "slower",
-    "veryslow",
-]
-
-_PRORES_PROFILES = [
-    ("0", "Proxy"),
-    ("1", "LT"),
-    ("2", "Standard"),
-    ("3", "HQ"),
-]
-
-_PRORES_4444_PROFILES = [
-    ("4", "4444"),
-    ("5", "4444 XQ"),
-]
 
 
 class VideoCodecSettingsDialog(QDialog):
@@ -1840,13 +1966,18 @@ class VideoCodecSettingsDialog(QDialog):
         self._codec_key = codec_key
         self._settings = settings
 
-        display = codec_key
-        for k, d, _c, _p in VIDEO_CODECS:
-            if k == codec_key:
-                display = d
-                break
+        from ..core.constants import (
+            CINEFORM_QUALITY_OPTIONS,
+            DEFAULT_CINEFORM_QUALITY,
+            X26X_PRESETS,
+            video_codec_by_key,
+        )
+
+        spec = video_codec_by_key(codec_key)
+        display = spec.display_name if spec else codec_key
+        bit_note = spec.format_label if spec else ""
         self.setWindowTitle(f"Codec Settings — {display}")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(480)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
@@ -1857,16 +1988,33 @@ class VideoCodecSettingsDialog(QDialog):
             lbl.setWordWrap(True)
             lbl.setStyleSheet(DESC_STYLE)
             layout.addWidget(lbl)
+        if bit_note:
+            bit_lbl = QLabel(f"<b>Encode format:</b> {bit_note}")
+            bit_lbl.setWordWrap(True)
+            bit_lbl.setStyleSheet(HINT_STYLE)
+            layout.addWidget(bit_lbl)
+        if spec and spec.platforms:
+            plat = QLabel(
+                f"<i>Platform: {', '.join(spec.platforms)} only (hidden on other OSes).</i>"
+            )
+            plat.setWordWrap(True)
+            plat.setStyleSheet(HINT_STYLE)
+            layout.addWidget(plat)
 
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._crf_spin: QSpinBox | None = None
         self._preset: QComboBox | None = None
-        self._prores_profile: QComboBox | None = None
+        self._cineform_quality: QComboBox | None = None
+        self._settings_prefix = "h264"
+        if codec_key in ("hevc", "hevc_8"):
+            self._settings_prefix = "hevc"
 
-        if codec_key == "h264":
-            saved_crf = int(settings.value("codec_opts/h264_crf", 18))
+        if codec_key in ("h264", "hevc", "hevc_8"):
+            crf_key = f"codec_opts/{self._settings_prefix}_crf"
+            preset_key = f"codec_opts/{self._settings_prefix}_preset"
+            saved_crf = int(settings.value(crf_key, 18))
             crf_row = QHBoxLayout()
             crf_row.setSpacing(6)
             crf_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1875,7 +2023,9 @@ class VideoCodecSettingsDialog(QDialog):
             self._crf_spin = QSpinBox()
             self._crf_spin.setRange(0, 51)
             self._crf_spin.setValue(saved_crf)
-            self._crf_spin.setFixedWidth(48)
+            self._crf_spin.setMinimumWidth(72)
+            self._crf_spin.setFixedWidth(72)
+            self._crf_spin.setAlignment(Qt.AlignmentFlag.AlignRight)
             self._crf_spin.setToolTip(
                 "0 = lossless, 18 = visually lossless, 23 = default, 51 = worst quality"
             )
@@ -1886,35 +2036,27 @@ class VideoCodecSettingsDialog(QDialog):
             form.addRow("CRF (quality)", crf_row)
 
             self._preset = QComboBox()
-            for p in _H264_PRESETS:
+            for p in X26X_PRESETS:
                 self._preset.addItem(p, p)
-            saved_preset = settings.value("codec_opts/h264_preset", "medium")
-            idx = _H264_PRESETS.index(saved_preset) if saved_preset in _H264_PRESETS else 5
+            saved_preset = settings.value(preset_key, "medium")
+            idx = X26X_PRESETS.index(saved_preset) if saved_preset in X26X_PRESETS else 5
             self._preset.setCurrentIndex(idx)
             self._preset.setToolTip("Slower = better compression at same quality")
             form.addRow("Preset", self._preset)
 
-        elif codec_key == "prores":
-            self._prores_profile = QComboBox()
-            for val, label in _PRORES_PROFILES:
-                self._prores_profile.addItem(label, val)
-            saved_prof = settings.value("codec_opts/prores_profile", "3")
-            for i in range(self._prores_profile.count()):
-                if self._prores_profile.itemData(i) == saved_prof:
-                    self._prores_profile.setCurrentIndex(i)
+        elif codec_key in ("cineform", "cineform_rgb"):
+            self._cineform_quality = QComboBox()
+            for val, label in CINEFORM_QUALITY_OPTIONS:
+                self._cineform_quality.addItem(label, val)
+            saved_q = str(settings.value("codec_opts/cineform_quality", DEFAULT_CINEFORM_QUALITY))
+            for i in range(self._cineform_quality.count()):
+                if self._cineform_quality.itemData(i) == saved_q:
+                    self._cineform_quality.setCurrentIndex(i)
                     break
-            form.addRow("Profile", self._prores_profile)
-
-        elif codec_key == "prores_4444":
-            self._prores_profile = QComboBox()
-            for val, label in _PRORES_4444_PROFILES:
-                self._prores_profile.addItem(label, val)
-            saved_prof = settings.value("codec_opts/prores4444_profile", "4")
-            for i in range(self._prores_profile.count()):
-                if self._prores_profile.itemData(i) == saved_prof:
-                    self._prores_profile.setCurrentIndex(i)
-                    break
-            form.addRow("Profile", self._prores_profile)
+            self._cineform_quality.setToolTip(
+                "FFmpeg cfhd quality: film3+/film3 ≈ least compression; low ≈ smallest"
+            )
+            form.addRow("Quality", self._cineform_quality)
 
         layout.addLayout(form)
 
@@ -1932,29 +2074,26 @@ class VideoCodecSettingsDialog(QDialog):
             result["crf"] = str(self._crf_spin.value())
         if self._preset is not None:
             result["preset"] = self._preset.currentData() or "medium"
-        if self._prores_profile is not None:
-            result["profile"] = self._prores_profile.currentData() or "3"
-            result["vendor"] = "apl0"
+        if self._cineform_quality is not None:
+            result["quality"] = self._cineform_quality.currentData() or "film3"
         return result
 
     def accept(self) -> None:
-        if self._codec_key == "h264":
+        if self._codec_key in ("h264", "hevc", "hevc_8"):
             if self._crf_spin:
-                self._settings.setValue("codec_opts/h264_crf", self._crf_spin.value())
+                self._settings.setValue(
+                    f"codec_opts/{self._settings_prefix}_crf",
+                    self._crf_spin.value(),
+                )
             if self._preset:
                 self._settings.setValue(
-                    "codec_opts/h264_preset",
+                    f"codec_opts/{self._settings_prefix}_preset",
                     self._preset.currentData(),
                 )
-        elif self._codec_key == "prores" and self._prores_profile:
+        elif self._codec_key in ("cineform", "cineform_rgb") and self._cineform_quality:
             self._settings.setValue(
-                "codec_opts/prores_profile",
-                self._prores_profile.currentData(),
-            )
-        elif self._codec_key == "prores_4444" and self._prores_profile:
-            self._settings.setValue(
-                "codec_opts/prores4444_profile",
-                self._prores_profile.currentData(),
+                "codec_opts/cineform_quality",
+                self._cineform_quality.currentData(),
             )
         super().accept()
 
@@ -1972,6 +2111,51 @@ class VideoInput(NamedTuple):
     height: int
     fps: float
     frame_count: int
+
+
+class _InputProbeWorker(QObject):
+    """Background probe for video / EXR inputs (avoids freezing the GUI thread)."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, mode: str, path: str) -> None:
+        super().__init__()
+        self._mode = mode
+        self._path = path
+
+    @Slot()
+    def run(self) -> None:
+        path = self._path
+        try:
+            if self._mode == "video2exr":
+                from ..core.video import probe_video
+
+                w, h, fps, total = probe_video(path)
+                self.finished.emit(
+                    {
+                        "kind": "video",
+                        "path": path,
+                        "w": w,
+                        "h": h,
+                        "fps": fps,
+                        "total": total,
+                    }
+                )
+            else:
+                from ..core.sequence import find_exr_sequence_info
+
+                _paths, _name, frame_nums, _pad, seq = find_exr_sequence_info(path)
+                self.finished.emit(
+                    {
+                        "kind": "exr",
+                        "path": path,
+                        "frame_nums": frame_nums,
+                        "seq": seq,
+                    }
+                )
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class ConvertTab(QWidget):
@@ -2202,8 +2386,13 @@ class ConvertTab(QWidget):
             opts_layout.addRow("Frame rate", self.fps_widget)
 
             self.codec_combo = QComboBox()
-            for key, display, _codec, _pix in VIDEO_CODECS:
-                self.codec_combo.addItem(display, key)
+            for spec in available_video_codecs():
+                tip = spec.format_label
+                if spec.platforms:
+                    tip += f" · {', '.join(spec.platforms)} only"
+                self.codec_combo.addItem(spec.display_name, spec.key)
+                idx = self.codec_combo.count() - 1
+                self.codec_combo.setItemData(idx, tip, Qt.ItemDataRole.ToolTipRole)
             saved_codec = settings.value(f"{mode}/video_codec", DEFAULT_VIDEO_CODEC)
             for i in range(self.codec_combo.count()):
                 if self.codec_combo.itemData(i) == saved_codec:
@@ -2303,7 +2492,7 @@ class ConvertTab(QWidget):
         # Validate any saved input path once the event loop starts.
         saved = self.input_path.text().strip()
         if saved:
-            QTimer.singleShot(0, lambda: self.set_input(saved))
+            QTimer.singleShot(0, self, lambda: self.set_input_async(saved))
 
     def _on_input_text_changed(self, text: str) -> None:
         """React to manual edits (typing / paste) in the input field.
@@ -2353,9 +2542,9 @@ class ConvertTab(QWidget):
             return False
         if not self.output_path.text().strip():
             return False
-        if not self.src_btn.current_space():
+        if not self.src_btn.is_valid():
             return False
-        if not self.dst_btn.current_space():
+        if not self.dst_btn.is_valid():
             return False
         return True
 
@@ -2364,15 +2553,80 @@ class ConvertTab(QWidget):
         families: dict[str, list[str]],
         ocio_cfg: object | None = None,
     ) -> None:
+        """Rebuild color-space menus for a (possibly new) OCIO config.
+
+        Keeps the current selection when possible, remaps via
+        :func:`find_equivalent_space`, or marks the button invalid so Convert
+        stays disabled until the user picks a space that exists in *ocio_cfg*.
+        """
         self._ocio_cfg = ocio_cfg
         if self._mode == "video2exr":
             default_src, default_dst = DEFAULT_SRC_V2E, DEFAULT_DST_V2E
         else:
             default_src, default_dst = DEFAULT_SRC_E2V, DEFAULT_DST_E2V
-        saved_src = self._settings.value(f"{self._mode}/src_space", default_src)
-        saved_dst = self._settings.value(f"{self._mode}/dst_space", default_dst)
-        self.src_btn.populate(families, saved_src)
-        self.dst_btn.populate(families, saved_dst)
+
+        # Prefer the live selection (including an invalid “wanted” name) so a
+        # config switch remaps what the user was using; fall back to settings.
+        wanted_src = (
+            self.src_btn.displayed_space()
+            or self._settings.value(f"{self._mode}/src_space", default_src)
+            or default_src
+        )
+        wanted_dst = (
+            self.dst_btn.displayed_space()
+            or self._settings.value(f"{self._mode}/dst_space", default_dst)
+            or default_dst
+        )
+        # Strip invalid-state warning prefix if re-populating after a failed map.
+        if isinstance(wanted_src, str) and wanted_src.startswith("⚠ "):
+            wanted_src = wanted_src[2:].strip()
+        if isinstance(wanted_dst, str) and wanted_dst.startswith("⚠ "):
+            wanted_dst = wanted_dst[2:].strip()
+
+        resolved_src = ""
+        resolved_dst = ""
+        if ocio_cfg is not None:
+            resolved_src = find_equivalent_space(ocio_cfg, str(wanted_src))
+            resolved_dst = find_equivalent_space(ocio_cfg, str(wanted_dst))
+        else:
+            # No config — only exact names in the (empty) families will work.
+            resolved_src = str(wanted_src) if wanted_src else ""
+            resolved_dst = str(wanted_dst) if wanted_dst else ""
+
+        if resolved_src:
+            self.src_btn.populate(families, resolved_src)
+            if resolved_src != wanted_src:
+                self.log_message.emit(
+                    f"Source color space remapped: {wanted_src} → {resolved_src}"
+                )
+        else:
+            self.src_btn.populate(families, "")
+            self.src_btn.set_invalid(str(wanted_src) if wanted_src else "")
+            if wanted_src:
+                self.log_message.emit(
+                    f"Source color space “{wanted_src}” not in new OCIO config — pick one"
+                )
+
+        if resolved_dst:
+            self.dst_btn.populate(families, resolved_dst)
+            if resolved_dst != wanted_dst:
+                self.log_message.emit(
+                    f"Destination color space remapped: {wanted_dst} → {resolved_dst}"
+                )
+        else:
+            self.dst_btn.populate(families, "")
+            self.dst_btn.set_invalid(str(wanted_dst) if wanted_dst else "")
+            if wanted_dst:
+                self.log_message.emit(
+                    f"Destination color space “{wanted_dst}” not in new OCIO config — pick one"
+                )
+
+        # Persist only valid selections so we don't lock in a dead name.
+        if self.src_btn.is_valid():
+            self._settings.setValue(f"{self._mode}/src_space", self.src_btn.current_space())
+        if self.dst_btn.is_valid():
+            self._settings.setValue(f"{self._mode}/dst_space", self.dst_btn.current_space())
+        self._emit_readiness()
 
     def get_fps(self) -> float:
         if self.fps_widget:
@@ -2402,9 +2656,14 @@ class ConvertTab(QWidget):
         if not self.codec_combo:
             return ("h264", "libx264", "yuv420p")
         key = self.codec_combo.currentData() or DEFAULT_VIDEO_CODEC
-        for k, _display, codec, pix in VIDEO_CODECS:
-            if k == key:
-                return (k, codec, pix)
+        spec = video_codec_by_key(str(key))
+        if spec is not None and spec.is_available():
+            return (spec.key, spec.libav_codec, spec.pix_fmt)
+        # Fall back to first available codec on this platform.
+        avail = available_video_codecs()
+        if avail:
+            s = avail[0]
+            return (s.key, s.libav_codec, s.pix_fmt)
         return ("h264", "libx264", "yuv420p")
 
     def get_exr_opts(self) -> dict[str, str]:
@@ -2421,23 +2680,24 @@ class ConvertTab(QWidget):
 
     def get_codec_opts(self) -> dict[str, str]:
         """Return saved video codec options for PyAV stream.options."""
+        from ..core.convert import _default_codec_opts
+
         key = self.get_video_codec_info()[0]
+        opts = dict(_default_codec_opts(key))
         if key == "h264":
             crf = str(int(self._settings.value("codec_opts/h264_crf", 18)))
             preset = self._settings.value("codec_opts/h264_preset", "medium")
-            return {"crf": crf, "preset": preset}
-        if key == "prores":
-            prof = self._settings.value("codec_opts/prores_profile", "3")
-            return {"profile": prof, "vendor": "apl0"}
-        if key == "prores_4444":
-            prof = self._settings.value("codec_opts/prores4444_profile", "4")
-            return {"profile": prof, "vendor": "apl0"}
-        if key.startswith("dnxhr"):
-            profile = "dnxhr_hq" if key == "dnxhr_hq" else "dnxhr_hqx"
-            return {"profile": profile}
-        if key == "ffv1":
-            return {"slicecrc": "1"}
-        return {}
+            opts.update({"crf": crf, "preset": str(preset)})
+        elif key in ("hevc", "hevc_8"):
+            crf = str(int(self._settings.value("codec_opts/hevc_crf", 18)))
+            preset = self._settings.value("codec_opts/hevc_preset", "medium")
+            opts.update({"crf": crf, "preset": str(preset)})
+        elif key in ("cineform", "cineform_rgb"):
+            from ..core.constants import DEFAULT_CINEFORM_QUALITY
+
+            q = self._settings.value("codec_opts/cineform_quality", DEFAULT_CINEFORM_QUALITY)
+            opts["quality"] = str(q)
+        return opts
 
     def slate_model(self):
         """Return the per-tab :class:`SlateModel`, or ``None`` for non-slate modes."""
@@ -2651,14 +2911,13 @@ class ConvertTab(QWidget):
         codec_key = ""
         if self.codec_combo:
             codec_key = self.codec_combo.currentData() or ""
-        if codec_key in ("prores", "prores_4444"):
-            return ".mov"
         if codec_key == "ffv1":
             return ".mkv"
-        if codec_key == "h264":
+        if codec_key in ("h264", "hevc", "hevc_8"):
             return ".mp4"
-        if codec_key == "dnxhr_hq":
+        if str(codec_key).startswith("dnxhr"):
             return ".mxf"
+        # ProRes (software + VideoToolbox), CineForm, etc.
         return ".mov"
 
     def _auto_fill_video_output(self, exr_dir: str) -> None:
@@ -2703,7 +2962,7 @@ class ConvertTab(QWidget):
         if self.src_btn.try_select(preferred):
             self.log_message.emit(f"Auto-detected source color space: {preferred}")
             self.src_btn.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, lambda: self.src_btn.setStyleSheet(""))
+            QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
 
     def _update_output_placeholder(self) -> None:
         """Update the output placeholder and current pattern to reflect padding."""
@@ -2719,7 +2978,7 @@ class ConvertTab(QWidget):
             if updated != current:
                 self.output_path.setText(updated)
                 self.output_path.setStyleSheet("background-color: #3a3020;")
-                QTimer.singleShot(500, lambda: self.output_path.setStyleSheet(""))
+                QTimer.singleShot(500, self, lambda: self.output_path.setStyleSheet(""))
 
     def _update_output_ext(self) -> None:
         """Update the output path extension to match the current codec."""
@@ -2733,7 +2992,7 @@ class ConvertTab(QWidget):
         if p.suffix.lower() != new_ext:
             self.output_path.setText(str(p.with_suffix(new_ext)))
             self.output_path.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, lambda: self.output_path.setStyleSheet(""))
+            QTimer.singleShot(500, self, lambda: self.output_path.setStyleSheet(""))
 
     def _update_dst_for_codec(self) -> None:
         """Suggest a sensible destination colorspace for the selected codec."""
@@ -2759,7 +3018,7 @@ class ConvertTab(QWidget):
                     break
         if self.dst_btn.try_select(preferred):
             self.dst_btn.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, lambda: self.dst_btn.setStyleSheet(""))
+            QTimer.singleShot(500, self, lambda: self.dst_btn.setStyleSheet(""))
 
     def _auto_detect_colorspace(self, exr_dir: str) -> None:
         """Probe colorspace from EXRs and select it in src_btn if found."""
@@ -2779,11 +3038,135 @@ class ConvertTab(QWidget):
         if self.src_btn.try_select(canonical):
             self.log_message.emit(f"Auto-detected source color space: {canonical}")
             self.src_btn.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, lambda: self.src_btn.setStyleSheet(""))
+            QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
         else:
             self.log_message.emit(f'EXR color space "{cs}" not found in current OCIO config')
 
     # -- Input model --
+
+    def set_input_async(self, path: str) -> None:
+        """Probe *path* off the GUI thread, then apply results on the main thread.
+
+        Heavy PyAV / OIIO probes on large MXFs must not freeze the UI.
+        """
+        path = path.strip()
+        if not path:
+            self.set_input(path)
+            return
+
+        # Bump generation so late results from a cancelled probe are ignored.
+        self._probe_gen = getattr(self, "_probe_gen", 0) + 1
+        gen = self._probe_gen
+
+        # Replace any in-flight probe so a newer path wins.
+        old_thr = getattr(self, "_probe_thread", None)
+        old_worker = getattr(self, "_probe_worker", None)
+        if old_worker is not None:
+            try:
+                old_worker.finished.disconnect()
+                old_worker.failed.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        if old_thr is not None and old_thr.isRunning():
+            old_thr.quit()
+            old_thr.wait(500)
+
+        thr = QThread(self)
+        worker = _InputProbeWorker(self._mode, path)
+        worker.moveToThread(thr)
+        thr.started.connect(worker.run)
+
+        def _ok(result: object) -> None:
+            if gen != getattr(self, "_probe_gen", 0):
+                return
+            self._apply_probe_result(result)
+
+        def _fail(err: str) -> None:
+            if gen != getattr(self, "_probe_gen", 0):
+                return
+            self.log_message.emit(f"Could not open input: {err}")
+
+        def _cleanup() -> None:
+            if getattr(self, "_probe_thread", None) is thr:
+                self._probe_thread = None
+                self._probe_worker = None
+
+        worker.finished.connect(_ok, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(_fail, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(thr.quit)
+        worker.failed.connect(thr.quit)
+        thr.finished.connect(worker.deleteLater)
+        thr.finished.connect(thr.deleteLater)
+        thr.finished.connect(_cleanup)
+        self._probe_thread = thr
+        self._probe_worker = worker
+        thr.start()
+
+    def _apply_probe_result(self, result: object) -> None:
+        """Apply a successful async probe result on the GUI thread."""
+        if not isinstance(result, dict):
+            return
+        kind = result.get("kind")
+        path = str(result.get("path", ""))
+
+        # Probe mode must match this tab (guards against cross-tab races).
+        if kind == "video" and self._mode != "video2exr":
+            return
+        if kind == "exr" and self._mode != "exr2video":
+            return
+
+        if kind == "video":
+            self._video_info = VideoInput(
+                path,
+                int(result["w"]),
+                int(result["h"]),
+                float(result["fps"]),
+                int(result["total"]),
+            )
+            self._input_seq = None
+            frames = list(range(1, int(result["total"]) + 1))
+            display = path
+            actual = path
+        elif kind == "exr":
+            seq = result.get("seq")
+            if seq is None:
+                self.log_message.emit(f"Could not resolve EXR sequence: {path}")
+                return
+            self._input_seq = seq
+            self._video_info = None
+            frames = list(result.get("frame_nums") or [])
+            pad = "#" * seq.zfill()
+            display = f"{seq.dirname()}{seq.basename()}{pad}{seq.extension()}"
+            actual = seq.dirname().rstrip("/") or path
+        else:
+            return
+
+        from ..core.framerange import format_frame_range
+
+        self.input_path.blockSignals(True)
+        self.input_path.setText(display)
+        self.input_path.blockSignals(False)
+
+        if frames:
+            range_str = format_frame_range(frames)
+            self._full_input_range = range_str
+            self._frame_range_edit.setText(range_str)
+            self._reset_range_btn.setEnabled(True)
+        else:
+            self._full_input_range = ""
+            self._frame_range_edit.clear()
+            self._reset_range_btn.setEnabled(False)
+
+        if self._mode == "video2exr":
+            self._auto_fill_exr_output(path)
+            self._auto_detect_video_colorspace(path)
+        elif self._input_seq is not None:
+            exr_dir = self._input_seq.dirname().rstrip("/")
+            self._auto_fill_video_output(exr_dir)
+            self._auto_detect_colorspace(exr_dir)
+
+        self._settings.setValue(f"{self._mode}/input", actual)
+        self._emit_readiness()
 
     def set_input(self, path: str) -> bool:
         """Validate *path* and adopt it as the current input.

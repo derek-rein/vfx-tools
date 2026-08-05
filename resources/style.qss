@@ -39,7 +39,9 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit {
     color: @FG;
 }
 QSpinBox, QDoubleSpinBox {
+    /* Room for up/down arrows without eating the value digits. */
     padding-right: 18px;
+    min-width: 56px;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
 QPlainTextEdit:focus, QTextEdit:focus {

@@ -1,5 +1,8 @@
 # Tag format: v1.2.3
 # Push: git tag v1.2.3 && git push origin v1.2.3
+#
+# Gate: lint + full pytest suite (unit + integration) must pass on all
+# platforms before any Nuitka build or GitHub Release is published.
 
 name: Release
 
@@ -17,7 +20,86 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # ── Quality gate (must pass before build / sign / publish) ────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Ruff check
+        run: uv run ruff check src/ main.py tests/
+
+      - name: Ruff format check
+        run: uv run ruff format --check src/ main.py tests/
+
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Qt offscreen system libs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run full test suite (unit + integration)
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run pytest -v
+
+  # Blocks build until every lint + test matrix cell is green.
+  gate:
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require lint + all tests green before release build
+        shell: bash
+        run: |
+          echo "lint=${{ needs.lint.result }}"
+          echo "test=${{ needs.test.result }}"
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "ERROR: lint failed — aborting release" >&2
+            exit 1
+          fi
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "ERROR: tests failed — aborting release" >&2
+            exit 1
+          fi
+          echo "Release gate passed — proceeding to multi-platform build"
+
   build:
+    needs: gate
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +141,7 @@ jobs:
           restore-keys: nuitka-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --group bundle
 
       - name: Inject version from tag
         shell: bash

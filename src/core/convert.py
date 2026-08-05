@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from fractions import Fraction
 from pathlib import Path
 
 import av
 import numpy as np
 import PyOpenColorIO as OCIO
 
-from .exr_io import read_exr, read_exr_safe, write_exr
+from .exr_io import read_exr, write_exr
 from .ocio_utils import (
     get_compositing_space,
     get_overlay_authoring_space,
     linearize_overlay,
+    load_config_from_source_info,
     make_cpu_processor,
 )
 from .pool import _alpha_over_rgb, process_frame_e2v, process_frame_v2e
@@ -24,6 +27,32 @@ ProgressCallback = Callable[[int, int], None]
 LogCallback = Callable[[str], None]
 
 _DEFAULT_WORKERS = min(os.cpu_count() or 4, 8)
+
+# Always spawn — forking a Qt multi-threaded process on Linux deadlocks.
+_MP_CTX = multiprocessing.get_context("spawn")
+
+
+def _process_pool(max_workers: int) -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(max_workers=max_workers, mp_context=_MP_CTX)
+
+
+def _ensure_ocio(
+    ocio_cfg: OCIO.Config | None,
+    config_source: str,
+    config_path: str,
+) -> OCIO.Config:
+    if ocio_cfg is not None:
+        return ocio_cfg
+    return load_config_from_source_info(config_source, config_path)
+
+
+# Common non-integer broadcast / film rates → exact rationals for libav.
+_FPS_RATIONALS: dict[float, Fraction] = {
+    23.976: Fraction(24000, 1001),
+    23.98: Fraction(24000, 1001),
+    29.97: Fraction(30000, 1001),
+    59.94: Fraction(60000, 1001),
+}
 
 
 def _frame_num_from_path(filepath: str) -> int | None:
@@ -39,6 +68,20 @@ def _frame_num_from_path(filepath: str) -> int | None:
     if m:
         return int(m.group(1))
     return None
+
+
+def _fps_to_rate(fps: float) -> Fraction | int:
+    """Return a libav-compatible frame rate (prefer exact rationals)."""
+    if fps <= 0:
+        return 24
+    # Exact integer rates.
+    if abs(fps - round(fps)) < 1e-6:
+        return int(round(fps))
+    for key, rat in _FPS_RATIONALS.items():
+        if abs(fps - key) < 0.01:
+            return rat
+    # Approximate any other float as a reduced fraction (cap denominator).
+    return Fraction(fps).limit_denominator(1001)
 
 
 def _video_metadata(
@@ -72,18 +115,59 @@ def _scaled_dims(w: int, h: int, scale: float) -> tuple[int, int]:
     return sw, sh
 
 
-def _configure_stream(stream, codec_key: str) -> None:
-    """Set codec-specific options on a PyAV output stream."""
-    if codec_key in ("prores", "prores_4444"):
-        profile = "3" if codec_key == "prores" else "4"
-        stream.options = {"profile": profile, "vendor": "apl0"}
-    elif codec_key == "h264":
-        stream.options = {"crf": "18", "preset": "medium"}
-    elif codec_key.startswith("dnxhr"):
-        profile = "dnxhr_hq" if codec_key == "dnxhr_hq" else "dnxhr_hqx"
-        stream.options = {"profile": profile}
-    elif codec_key == "ffv1":
-        stream.options = {"slicecrc": "1"}
+def _default_codec_opts(codec_key: str) -> dict[str, str]:
+    """Built-in codec options when the caller does not supply any."""
+    from .constants import (
+        DEFAULT_CINEFORM_QUALITY,
+        DNXHR_PROFILE,
+        PRORES_KS_PROFILE,
+        PRORES_VT_PROFILE,
+    )
+
+    if codec_key in PRORES_KS_PROFILE:
+        return {"profile": PRORES_KS_PROFILE[codec_key], "vendor": "apl0"}
+    if codec_key in PRORES_VT_PROFILE:
+        # VideoToolbox accepts numeric profile 0–5 (same ladder as prores_ks).
+        return {"profile": PRORES_VT_PROFILE[codec_key]}
+    if codec_key in DNXHR_PROFILE:
+        return {"profile": DNXHR_PROFILE[codec_key]}
+    if codec_key == "h264":
+        return {"crf": "18", "preset": "medium"}
+    if codec_key in ("hevc", "hevc_8"):
+        return {"crf": "18", "preset": "medium"}
+    if codec_key in ("cineform", "cineform_rgb"):
+        return {"quality": DEFAULT_CINEFORM_QUALITY}
+    if codec_key == "ffv1":
+        return {"slicecrc": "1"}
+    return {}
+
+
+def _configure_stream(
+    stream,
+    codec_key: str,
+    codec_opts: dict[str, str] | None = None,
+) -> None:
+    """Set codec-specific options on a PyAV output stream.
+
+    *codec_opts* (from GUI/CLI) overrides the defaults for the given *codec_key*.
+    """
+    opts = dict(_default_codec_opts(codec_key))
+    if codec_opts:
+        opts.update({str(k): str(v) for k, v in codec_opts.items()})
+    if opts:
+        stream.options = opts
+
+
+def _cancel_pool(pool: ProcessPoolExecutor, pending: dict) -> None:
+    """Best-effort cancel of in-flight pool work."""
+    for fut in list(pending):
+        fut.cancel()
+    pending.clear()
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        # Older Python without cancel_futures (not expected on 3.13).
+        pool.shutdown(wait=False)
 
 
 def _bake_slate_to_display(
@@ -141,7 +225,7 @@ def _encode_slate_video_frame(
 def run_video_to_exr(
     video_path: str,
     output_dir: Path,
-    ocio_cfg: OCIO.Config,
+    ocio_cfg: OCIO.Config | None,
     src_space: str,
     dst_space: str,
     progress: ProgressCallback | None = None,
@@ -156,7 +240,10 @@ def run_video_to_exr(
     start_frame: int = 1001,
     frame_set: set[int] | None = None,
     slate_frame: np.ndarray | None = None,
+    exr_opts: dict[str, str] | None = None,
+    deinterlace: str = "auto",
 ) -> None:
+    ocio_cfg = _ensure_ocio(ocio_cfg, config_source, config_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     w, h, _fps, total = probe_video(video_path)
@@ -173,7 +260,7 @@ def run_video_to_exr(
         slate_num = start_frame - 1
         slate_path = str(output_dir / f"{stem}.{slate_num:{fmt}}.exr")
         rgb3 = np.ascontiguousarray(slate_frame[:, :, :3], dtype=np.float32)
-        write_exr(slate_path, rgb3, compression=compression)
+        write_exr(slate_path, rgb3, compression=compression, exr_opts=exr_opts)
         if log:
             log(f"Slate frame written \u2192 {slate_path}")
 
@@ -197,6 +284,8 @@ def run_video_to_exr(
             padding,
             start_frame,
             frame_set,
+            exr_opts=exr_opts,
+            deinterlace=deinterlace,
         )
         return
 
@@ -212,11 +301,11 @@ def run_video_to_exr(
 
     idx = 0
     submitted = 0
+    finished = 0
     try:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            pending = {}
-            frame_iter = decode_video_frames(container, stream, log=log)
-            finished = 0
+        with _process_pool(n_workers) as pool:
+            pending: dict = {}
+            frame_iter = decode_video_frames(container, stream, deinterlace=deinterlace, log=log)
             all_submitted = False
 
             def _submit_batch() -> None:
@@ -230,6 +319,7 @@ def run_video_to_exr(
                         all_submitted = True
                         return
                     if cancel_check and cancel_check():
+                        _cancel_pool(pool, pending)
                         raise RuntimeError("Cancelled")
                     idx += 1
                     if frame_set and idx not in frame_set:
@@ -253,6 +343,7 @@ def run_video_to_exr(
                         config_path,
                         src_space,
                         dst_space,
+                        exr_opts,
                     )
                     pending[fut] = idx
                     submitted += 1
@@ -262,6 +353,9 @@ def run_video_to_exr(
 
             _submit_batch()
             while pending:
+                if cancel_check and cancel_check():
+                    _cancel_pool(pool, pending)
+                    raise RuntimeError("Cancelled")
                 done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for done in done_set:
                     done.result()
@@ -297,6 +391,8 @@ def _v2e_serial(
     padding: int = 4,
     start_frame: int = 1001,
     frame_set: set[int] | None = None,
+    exr_opts: dict[str, str] | None = None,
+    deinterlace: str = "auto",
 ) -> None:
     cpu = make_cpu_processor(ocio_cfg, src_space, dst_space)
     render_total = len(frame_set) if frame_set else total
@@ -314,7 +410,7 @@ def _v2e_serial(
     idx = 0
     written = 0
     try:
-        for frame in decode_video_frames(container, stream, log=log):
+        for frame in decode_video_frames(container, stream, deinterlace=deinterlace, log=log):
             if cancel_check and cancel_check():
                 raise RuntimeError("Cancelled")
             idx += 1
@@ -336,6 +432,7 @@ def _v2e_serial(
                 compression=compression,
                 src_space=src_space,
                 dst_space=dst_space,
+                exr_opts=exr_opts,
             )
             written += 1
             if progress:
@@ -356,7 +453,7 @@ def _v2e_serial(
 def run_exr_to_video(
     input_spec: str,
     output_video: Path,
-    ocio_cfg: OCIO.Config,
+    ocio_cfg: OCIO.Config | None,
     src_space: str,
     dst_space: str,
     fps: float,
@@ -375,6 +472,7 @@ def run_exr_to_video(
     burnin_overlay: np.ndarray | None = None,
     slate_overlay: np.ndarray | None = None,
     overlay_provider: Callable[[int | None], np.ndarray | None] | None = None,
+    codec_opts: dict[str, str] | None = None,
 ) -> None:
     """Encode an EXR sequence (with optional slate / overlays) to a video.
 
@@ -407,7 +505,10 @@ def run_exr_to_video(
         token such as ``<frame>``; it forces the single-threaded path and
         re-renders + re-linearises the overlay for every frame.  When ``None``
         the static *burnin_overlay* is reused for all frames (the fast path).
+    codec_opts
+        Optional libav codec options (e.g. ``{"crf": "18", "preset": "medium"}``).
     """
+    ocio_cfg = _ensure_ocio(ocio_cfg, config_source, config_path)
     paths, basename = find_exr_sequence(input_spec)
 
     if frame_set:
@@ -471,6 +572,7 @@ def run_exr_to_video(
             burnin_working=burnin_working,
             overlay_auth_space=overlay_auth,
             overlay_provider=overlay_provider,
+            codec_opts=codec_opts,
         )
         return
 
@@ -480,13 +582,14 @@ def run_exr_to_video(
     output_video = Path(output_video)
     output_video.parent.mkdir(parents=True, exist_ok=True)
 
+    rate = _fps_to_rate(fps)
     container = av.open(str(output_video), mode="w")
     container.metadata.update(_video_metadata(src_space, dst_space, codec_key))
-    stream = container.add_stream(video_codec, rate=int(fps))
+    stream = container.add_stream(video_codec, rate=rate)
     stream.width = ow
     stream.height = oh
     stream.pix_fmt = pix_fmt_out
-    _configure_stream(stream, codec_key)
+    _configure_stream(stream, codec_key, codec_opts)
 
     max_inflight = n_workers * 2
     do_resize = scale < 1.0
@@ -505,8 +608,8 @@ def run_exr_to_video(
             if log:
                 log("Slate frame encoded as first video frame")
 
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            pending = {}
+        with _process_pool(n_workers) as pool:
+            pending: dict = {}
             ready: dict[int, np.ndarray] = {}
             next_encode = 1
             submit_idx = 0
@@ -515,6 +618,7 @@ def run_exr_to_video(
                 nonlocal submit_idx
                 while len(pending) < max_inflight and submit_idx < total:
                     if cancel_check and cancel_check():
+                        _cancel_pool(pool, pending)
                         raise RuntimeError("Cancelled")
                     path = paths[submit_idx]
                     frame_idx = submit_idx + 1
@@ -547,6 +651,9 @@ def run_exr_to_video(
 
             _submit_batch()
             while pending:
+                if cancel_check and cancel_check():
+                    _cancel_pool(pool, pending)
+                    raise RuntimeError("Cancelled")
                 done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for done in done_set:
                     pending.pop(done)
@@ -589,6 +696,7 @@ def _e2v_serial(
     burnin_working: np.ndarray | None = None,
     overlay_auth_space: str = "",
     overlay_provider: Callable[[int | None], np.ndarray | None] | None = None,
+    codec_opts: dict[str, str] | None = None,
 ) -> None:
     cpu_to_working = make_cpu_processor(ocio_cfg, src_space, working_space)
     cpu_to_display = make_cpu_processor(ocio_cfg, working_space, dst_space)
@@ -599,13 +707,14 @@ def _e2v_serial(
     output_video = Path(output_video)
     output_video.parent.mkdir(parents=True, exist_ok=True)
 
+    rate = _fps_to_rate(fps)
     container = av.open(str(output_video), mode="w")
     container.metadata.update(_video_metadata(src_space, dst_space, codec_key))
-    stream = container.add_stream(video_codec, rate=int(fps))
+    stream = container.add_stream(video_codec, rate=rate)
     stream.width = w
     stream.height = h
     stream.pix_fmt = pix_fmt_out
-    _configure_stream(stream, codec_key)
+    _configure_stream(stream, codec_key, codec_opts)
 
     do_resize = scale < 1.0
 
@@ -626,9 +735,11 @@ def _e2v_serial(
         for idx, path in enumerate(paths, 1):
             if cancel_check and cancel_check():
                 raise RuntimeError("Cancelled")
-            rgb = read_exr_safe(path, w, h)
+            rgb = read_exr(path)
             frame_buf = np.ascontiguousarray(rgb[:, :, :3], dtype=np.float32)
             fh, fw = frame_buf.shape[:2]
+            # *w*/*h* are the (possibly scaled) output dims; process at native
+            # EXR resolution and only reformat the VideoFrame if needed.
             cpu_to_working.apply(OCIO.PackedImageDesc(frame_buf, fw, fh, 3))
 
             # Per-frame tokens (e.g. <frame>) require re-rendering + re-linearising
@@ -652,7 +763,7 @@ def _e2v_serial(
             rgb_u16 = np.clip(frame_buf * 65535.0, 0.0, 65535.0).astype(np.uint16)
 
             vf = av.VideoFrame.from_ndarray(rgb_u16, format="rgb48le")
-            if do_resize:
+            if do_resize or (fw, fh) != (w, h):
                 vf = vf.reformat(width=w, height=h)
             for packet in stream.encode(vf):
                 container.mux(packet)

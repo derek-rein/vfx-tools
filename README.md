@@ -80,7 +80,7 @@ Common options:
 | `--workers N` | both | `0` = auto, `1` = single-threaded |
 | `--scale FACTOR` | both | e.g. `0.5` for half resolution |
 | `--exr-compression NAME` | `video2exr` | e.g. `dwaa`, `zip`, `none` (see `--help`) |
-| `--codec KEY` | `exr2video` | e.g. `prores`, `h264`, `prores_4444`, `dnxhr_hq`, `ffv1` |
+| `--codec KEY` | `exr2video` | Full ladder with bit depth in names: ProRes Proxy…XQ, DNxHR LB…444, CineForm, HEVC 8/10-bit, H.264, FFV1. **VideoToolbox ProRes** keys (`prores_vt_*`) are **macOS-only**. |
 
 Run `uv run python main.py video2exr --help` or `exr2video --help` for the full list.
 
@@ -92,8 +92,13 @@ Run `uv run python main.py video2exr --help` or `exr2video --help` for the full 
 ```bash
 git clone https://github.com/derek-rein/exr-converter.git
 cd exr-converter
-uv sync
+make sync   # uv sync + ensure OpenColorIO 2.5+ (see below)
 ```
+
+> **OpenColorIO 2.5 note:** The bundled ACES Studio config needs OCIO **2.5+**.
+> Installing / upgrading `oiio-python` can rewire `PyOpenColorIO` to its vendored
+> **2.4** dylib. If you see *“config is version 2.5… library (2.4.0) is not able
+> to load”*, run `make ensure-ocio` (or `make sync`).
 
 ## Building from source
 
@@ -138,7 +143,14 @@ make release PART=patch        # bump + commit + tag + push (triggers Release wo
 make release PUSH=0            # local only; push branch + tag yourself when ready
 ```
 
-CI for lint: [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+### CI / release gates
+
+| Workflow | When | Gate |
+|----------|------|------|
+| [CI](.github/workflows/ci.yml) | push / PR to `main` | Ruff + **full pytest suite** (unit + integration) on Linux, macOS, Windows. Aggregate job `ci-ok` is green only if every matrix cell passes. |
+| [Release](.github/workflows/release.yml) | tag `v*` | Same lint + full suite must pass (`gate` job) **before** Nuitka builds, Cosign, or the GitHub Release is created. A failing test aborts the release; no artifacts are published. |
+
+Enable **branch protection** on `main` and require the `ci-ok` status check so merges also require a green suite.
 
 ## License
 

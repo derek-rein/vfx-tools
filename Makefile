@@ -7,7 +7,8 @@
 #   make release PART=patch               # bump + lock + commit + tag + push (triggers Release workflow)
 #   make release PUSH=0                   # … local only; push branch + tag yourself to trigger CI
 
-.PHONY: help run lint fmt test test-unit resources bundle clean bump release
+.PHONY: help run lint typecheck fmt test test-unit resources bundle clean bump release \
+	sync ensure-ocio
 
 APP_NAME := exr_converter
 MACOS_BUNDLE_NAME := EXR Converter
@@ -16,7 +17,8 @@ ENTRY    := main.py
 # silently uses this project's .venv instead of warning about the mismatch.
 UV       := env -u VIRTUAL_ENV uv
 PYTHON   := $(UV) run python
-RCC      := $(UV) run pyside6-rcc
+# Qt rcc from the PySide6 package (console-script wrappers can point at a stale venv).
+RCC      := $(PYTHON) -c 'import subprocess,sys; from pathlib import Path; import PySide6; r=Path(PySide6.__file__).resolve().parent/"Qt"/"libexec"/"rcc"; sys.exit(subprocess.call([str(r),"-g","python",*sys.argv[1:]]))'
 BUMP     := python3 scripts/bump_app_version.py
 PART     ?= patch
 # PUSH=1 (default): push branch + tag so GitHub receives the tag and runs .github/workflows/release.yml
@@ -30,7 +32,10 @@ help:
 	@echo "EXR Converter"
 	@echo ""
 	@echo "  make run                               # launch the GUI"
+	@echo "  make sync                              # uv sync + ensure OCIO 2.5+ linkage"
+	@echo "  make ensure-ocio                       # repair OpenColorIO if oiio rewired it to 2.4"
 	@echo "  make lint / fmt                        # ruff check / format"
+	@echo "  make typecheck                         # basedpyright"
 	@echo "  make test / make test-unit             # full suite / unit tests only"
 	@echo "  make resources                         # regenerate Qt resources"
 	@echo "  make bundle                            # Nuitka standalone build"
@@ -42,15 +47,29 @@ help:
 	@echo ""
 	@echo "Current tags: git tag -l 'v*' --sort=-v:refname | head"
 
+# ── Dependencies ─────────────────────────────────────────────────────────────
+# oiio-python can rewire PyOpenColorIO.so to its vendored OCIO 2.4 dylib, which
+# cannot load the bundled ACES Studio v4 config (profile 2.5). Reinstall OCIO last.
+
+sync:
+	$(UV) sync
+	$(PYTHON) scripts/ensure_ocio.py
+
+ensure-ocio:
+	$(PYTHON) scripts/ensure_ocio.py
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
-run:
+run: ensure-ocio
 	$(PYTHON) $(ENTRY)
 
 # ── Lint & Format ────────────────────────────────────────────────────────────
 
 lint:
 	$(UV) run ruff check src/ main.py tests/
+
+typecheck:
+	$(UV) run basedpyright src/ main.py
 
 fmt:
 	$(UV) run ruff format src/ main.py tests/
@@ -77,6 +96,8 @@ src/rc_resources.py: resources.qrc resources/icons/icon.png resources/style.qss
 ICON ?= resources/icons/icon.icns
 
 bundle: resources
+	$(UV) sync --group bundle
+	$(PYTHON) scripts/ensure_ocio.py
 	$(PYTHON) -m nuitka \
 		--standalone \
 		--output-dir=dist \

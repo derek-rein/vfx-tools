@@ -7,6 +7,9 @@ and a live QPainter-driven preview on the right.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
+
 from PySide6.QtCore import (
     QEvent,
     QPointF,
@@ -63,9 +66,11 @@ from ..services.cache_prefs import (
 )
 from ..services.exr_prefetch import ExrPrefetchService
 from ..services.frame_cache import FrameCache
+from .size_grip import SizeGrip
 from .timeline_slider import TimelineSlider
 from .token_line_edit import TokenLineEdit
-from .widgets import SizeGrip
+
+log = logging.getLogger(__name__)
 
 # Playback RAM cache — uint16 RGB; 75% prefetch ahead, 25% lookback.
 _PREFETCH_WORKERS = 4
@@ -336,8 +341,10 @@ def extract_thumbnail_b64(input_path: str, mode: str) -> str:
                 total = max(1, int(float(stream.duration * stream.time_base) * fps + 0.5))
             mid = max(0, (total or 1) // 2)
             fps = float(stream.average_rate) if stream.average_rate else 24.0
-            target_ts = int(mid / fps / stream.time_base)
-            container.seek(target_ts, stream=stream)
+            tb = stream.time_base
+            if tb is not None and float(tb) != 0.0:
+                target_ts = int(mid / fps / float(tb))
+                container.seek(target_ts, stream=stream)
             frame = None
             for f in container.decode(video=0):
                 frame = f
@@ -394,9 +401,11 @@ def extract_thumbnail_b64(input_path: str, mode: str) -> str:
 
         qbuf = QBuffer()
         qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
-        qimg.save(qbuf, "JPEG", 85)
-        return base64.b64encode(qbuf.data().data()).decode("ascii")
+        # PySide6 stubs type ``format`` as bytes-like; pass a real QByteArray name.
+        qimg.save(qbuf, b"JPEG", 85)
+        return base64.b64encode(bytes(qbuf.data().data())).decode("ascii")
     except Exception:
+        log.debug("thumbnail extract failed for %s", input_path, exc_info=True)
         return ""
 
 
@@ -993,7 +1002,9 @@ class SlatePreviewView(QGraphicsView):
             dx = pos.x() - self._last_pos.x()
             self._last_pos = pos
             s = 1.02 ** (dx * 0.5)
-            self._scale_at(s, self._zoom_anchor_view)
+            anchor = self._zoom_anchor_view
+            if anchor is not None:
+                self._scale_at(s, anchor)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -1092,12 +1103,30 @@ class _ShuttleBar(QWidget):
         self._btn_last.clicked.connect(self._on_last)
 
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._advance)
+        self._advance_cb: Callable[[], None] | None = None
+        self._timer.timeout.connect(self._on_timer_tick)
         self._refresh_timer_interval()
 
         # If the user grabs the playhead, stop playback so the timer doesn't
         # fight their drag.
         self._timeline.value_changed.connect(self._on_user_scrubbed)
+
+    def set_advance_callback(self, callback: Callable[[], None] | None) -> None:
+        """Replace the default per-tick advance with a custom callback.
+
+        Used by the slate dialog for cache-first playback (stall until the next
+        frame is in RAM).  Pass ``None`` to restore the default step-forward.
+        """
+        self._advance_cb = callback
+
+    def is_timer_active(self) -> bool:
+        return self._timer.isActive()
+
+    def stop_timer(self) -> None:
+        self._timer.stop()
+
+    def start_timer(self) -> None:
+        self._timer.start()
 
     @staticmethod
     def _make_btn(text: str, tooltip: str) -> QPushButton:
@@ -1143,6 +1172,12 @@ class _ShuttleBar(QWidget):
         # play timer itself fired set_value → value_changed.
         if self._btn_play.isChecked() and self._timeline._dragging_playhead:
             self._btn_play.setChecked(False)
+
+    def _on_timer_tick(self) -> None:
+        if self._advance_cb is not None:
+            self._advance_cb()
+        else:
+            self._advance()
 
     def _advance(self) -> None:
         cur = self._timeline.value()
@@ -1275,6 +1310,12 @@ class SlateDialog(QDialog):
         self._prefetch: ExrPrefetchService | None = None
         self._playback_wait_frame: int | None = None
         self._cache_paused = False
+        # Optional cache-status widgets (only built when EXR shot frames exist).
+        self._cache_pct_slider: QSlider | None = None
+        self._cache_pct_label: QLabel | None = None
+        self._cache_bar: QProgressBar | None = None
+        self._cache_pause_btn: QToolButton | None = None
+        self._cache_clear_btn: QToolButton | None = None
 
         # Resolve EXR frame range (only available for exr2video mode)
         if input_path and mode == "exr2video":
@@ -1291,7 +1332,7 @@ class SlateDialog(QDialog):
                     self._slate_frame = self._first_shot - 1
                     self._current_frame = self._slate_frame
             except Exception:
-                pass
+                log.exception("Could not resolve EXR sequence for slate preview: %s", input_path)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1336,17 +1377,16 @@ class SlateDialog(QDialog):
             self._timeline = TimelineSlider()
             ideal_h = self._timeline._ideal_height()
             self._timeline.setFixedHeight(ideal_h)
-            self._timeline.set_range(self._slate_frame, self._last_shot)
+            last = self._last_shot if self._last_shot is not None else self._slate_frame
+            self._timeline.set_range(self._slate_frame, last)
             self._timeline.set_marker_frames({self._slate_frame: "SLATE"})
             self._timeline.set_value(self._slate_frame)
             self._timeline.value_changed.connect(self._on_timeline_changed)
 
             self._shuttle = _ShuttleBar(self._timeline, fps=self.fps())
             self._shuttle.setFixedHeight(ideal_h)
-            # Cache-first playback: stall the shuttle until the next frame
-            # is decoded (Triton-style) instead of advancing into a miss.
-            self._shuttle._timer.timeout.disconnect(self._shuttle._advance)
-            self._shuttle._timer.timeout.connect(self._playback_tick)
+            # Cache-first playback: stall until the next frame is in RAM.
+            self._shuttle.set_advance_callback(self._playback_tick)
 
             self._prefetch = ExrPrefetchService(
                 self._exr_seq,
@@ -1612,8 +1652,11 @@ class SlateDialog(QDialog):
 
     def event(self, ev: QEvent) -> bool:
         if ev.type() == QEvent.Type.StatusTip:
-            self._status_bar.showMessage(ev.tip())
-            return True
+            from PySide6.QtGui import QStatusTipEvent
+
+            if isinstance(ev, QStatusTipEvent):
+                self._status_bar.showMessage(ev.tip())
+                return True
         return super().event(ev)
 
     # -- Frame routing --
@@ -1629,7 +1672,7 @@ class SlateDialog(QDialog):
         if not playing:
             self._playback_wait_frame = None
             if self._shuttle is not None:
-                self._shuttle._timer.stop()
+                self._shuttle.stop_timer()
         self._shot_cache.set_batch_mode(playing)
         self._sync_prefetch()
         if playing:
@@ -1660,14 +1703,18 @@ class SlateDialog(QDialog):
         if self._timeline is None:
             return
         slate_on = self._model is None or self._model.slate_enabled
+        first = self._first_shot
+        last = self._last_shot
+        if first is None or last is None:
+            return
         if slate_on:
-            self._timeline.set_range(self._slate_frame, self._last_shot)
+            self._timeline.set_range(self._slate_frame, last)
             self._timeline.set_marker_frames({self._slate_frame: "SLATE"})
         else:
-            self._timeline.set_range(self._first_shot, self._last_shot)
+            self._timeline.set_range(first, last)
             self._timeline.set_marker_frames({})
             if self._current_frame == self._slate_frame:
-                self._goto_frame(self._first_shot)
+                self._goto_frame(first)
 
     def _goto_frame(self, frame: int) -> None:
         """Move playhead to *frame* and refresh the preview."""
@@ -1812,7 +1859,7 @@ class SlateDialog(QDialog):
 
         if self._needs_exr_cache(nxt) and not self._shot_cache.contains(nxt):
             self._playback_wait_frame = nxt
-            self._shuttle._timer.stop()
+            self._shuttle.stop_timer()
             if self._prefetch is not None:
                 self._prefetch.request_immediate(nxt)
             return
@@ -1826,8 +1873,8 @@ class SlateDialog(QDialog):
                 self._playback_wait_frame = None
                 skip = self._next_playback_frame(frame)
                 self._goto_frame(skip)
-                if self._shuttle is not None and not self._shuttle._timer.isActive():
-                    self._shuttle._timer.start()
+                if self._shuttle is not None and not self._shuttle.is_timer_active():
+                    self._shuttle.start_timer()
             return
 
         if frame == self._current_frame:
@@ -1835,8 +1882,8 @@ class SlateDialog(QDialog):
 
         if frame == self._playback_wait_frame and self._is_playing():
             self._goto_frame(frame)
-            if self._shuttle is not None and not self._shuttle._timer.isActive():
-                self._shuttle._timer.start()
+            if self._shuttle is not None and not self._shuttle.is_timer_active():
+                self._shuttle.start_timer()
 
         self._sync_prefetch()
 
@@ -1864,6 +1911,7 @@ class SlateDialog(QDialog):
                 thumbnail_b64=self._form.thumbnail_b64(),
             )
         except Exception:
+            log.exception("Slate preview render failed")
             return
 
         self._comp_f32 = np.ascontiguousarray(rgba[..., :3].copy(), dtype=np.float32)
@@ -1950,6 +1998,7 @@ class SlateDialog(QDialog):
 
             self._working_space = get_compositing_space(self._ocio_cfg)
         except Exception:
+            log.exception("Could not resolve compositing space")
             self._working_space = ""
         return self._working_space
 
@@ -1985,6 +2034,7 @@ class SlateDialog(QDialog):
             try:
                 cpu.apply(OCIO.PackedImageDesc(buf, w, h, 3))
             except Exception:
+                log.exception("Worker src→working OCIO apply failed")
                 return rgb_u16
             # float16 keeps cache footprint identical to uint16 RGB while
             # preserving the headroom of working-space (>1.0) values.
@@ -2006,6 +2056,7 @@ class SlateDialog(QDialog):
 
             return get_overlay_authoring_space(self._ocio_cfg) or SLATE_COLORSPACE
         except Exception:
+            log.exception("Could not resolve overlay authoring space")
             return SLATE_COLORSPACE
 
     def _get_src_to_working_proc(self, src_space: str):
@@ -2024,6 +2075,9 @@ class SlateDialog(QDialog):
 
             proc = make_cpu_processor(self._ocio_cfg, src_space, working_space)
         except Exception:
+            log.exception(
+                "Failed to build src→working processor (%s → %s)", src_space, working_space
+            )
             proc = None
         self._ocio_proc_cache[key] = proc
         return proc
@@ -2133,6 +2187,7 @@ class SlateDialog(QDialog):
             cpu.apply(OCIO.PackedImageDesc(buf, w, h, 3))
             self._working_f32 = buf
         except Exception:
+            log.exception("GUI-thread src→working OCIO apply failed")
             self._working_f32 = self._comp_f32
         return self._working_f32
 
@@ -2191,6 +2246,7 @@ class SlateDialog(QDialog):
                 cpu.applyRGB(pixels)
                 self._display_f32 = pixels.reshape(h, w, 3)
             except Exception:
+                log.exception("Static working→display OCIO apply failed")
                 self._display_f32 = composed
             self._refresh_gain_gamma()
             return
@@ -2203,6 +2259,7 @@ class SlateDialog(QDialog):
             cpu.applyRGB(pixels)
             self._display_f32 = pixels.reshape(h, w, 3)
         except Exception:
+            log.exception("Viewer EC working→display OCIO apply failed")
             self._display_f32 = composed
 
         self._paint_display_buffer(self._display_f32)
@@ -2253,11 +2310,34 @@ class SlateDialog(QDialog):
         import numpy as np
         from PySide6.QtGui import QImage, QPixmap
 
-        comp_u8 = (np.clip(rgb_f32, 0.0, 1.0) * 255 + 0.5).astype(np.uint8)
+        comp_u8 = np.ascontiguousarray((np.clip(rgb_f32, 0.0, 1.0) * 255 + 0.5).astype(np.uint8))
 
         fh, fw = comp_u8.shape[:2]
-        qimg = QImage(comp_u8.data, fw, fh, fw * 3, QImage.Format.Format_RGB888)
-        pix = QPixmap.fromImage(qimg.copy())
+        # 4-byte-aligned bytesPerLine for RGB888 (required by some backends).
+        bpl = (fw * 3 + 3) & ~3
+        if bpl == fw * 3:
+            buf = comp_u8
+        else:
+            buf = np.zeros((fh, bpl), dtype=np.uint8)
+            flat = comp_u8.reshape(fh, -1)
+            buf[:, : fw * 3] = flat
+        # .copy() so QImage owns its memory (external buffer would dangle).
+        qimg = QImage(buf.data, fw, fh, bpl, QImage.Format.Format_RGB888).copy()
+        del buf
+        # HiDPI: upscale the pixmap to device pixels so Retina views stay sharp
+        # when the QGraphicsView scales into the scene.
+        dpr = float(self.devicePixelRatioF() or 1.0)
+        if dpr > 1.01:
+            qimg = qimg.scaled(
+                int(fw * dpr + 0.5),
+                int(fh * dpr + 0.5),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            qimg.setDevicePixelRatio(dpr)
+        pix = QPixmap.fromImage(qimg)
+        if dpr > 1.01:
+            pix.setDevicePixelRatio(dpr)
 
         scene = self._preview._scene
         if self._preview_pixmap_item is not None:
@@ -2268,14 +2348,17 @@ class SlateDialog(QDialog):
         w, h = self.resolution()
         preview_h = 1080
         preview_w = int(preview_h * w / max(h, 1))
-        if pix.width() > 0 and pix.height() > 0:
-            sx = preview_w / pix.width()
-            sy = preview_h / pix.height()
+        # Logical pixmap size (device pixels / dpr).
+        lw = max(1, int(round(pix.width() / max(dpr, 1.0))))
+        lh = max(1, int(round(pix.height() / max(dpr, 1.0))))
+        if lw > 0 and lh > 0:
+            sx = preview_w / lw
+            sy = preview_h / lh
             s = min(sx, sy)
             self._preview_pixmap_item.setScale(s)
             self._preview_pixmap_item.setPos(
-                (preview_w - pix.width() * s) / 2,
-                (preview_h - pix.height() * s) / 2,
+                (preview_w - lw * s) / 2,
+                (preview_h - lh * s) / 2,
             )
 
     def _reapply_display_with_ec(self) -> None:

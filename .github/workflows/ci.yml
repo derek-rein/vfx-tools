@@ -25,6 +25,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
+      - name: Ensure OpenColorIO 2.5+ linkage
+        run: uv run python scripts/ensure_ocio.py
+
       - name: Ruff check
         run: uv run ruff check src/ main.py tests/
 
@@ -33,39 +36,7 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: astral-sh/setup-uv@v7
-        with:
-          version: "latest"
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-
-      - name: Install Qt offscreen system libs (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libegl1 libgl1 libxkbcommon0 libdbus-1-3
-
-      - name: Install dependencies
-        run: uv sync --group dev
-
-      - name: Run unit tests
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: uv run pytest -m "not integration"
-
-  integration:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -91,8 +62,34 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
-      - name: Run integration tests (source tree)
+      - name: Ensure OpenColorIO 2.5+ linkage
+        run: uv run python scripts/ensure_ocio.py
+
+      - name: Run full test suite (unit + integration)
         shell: bash
         env:
           QT_QPA_PLATFORM: offscreen
-        run: uv run pytest tests/test_integration_conversions.py -v -m integration
+        # Full suite — including @pytest.mark.integration. Missing optional
+        # manifest media is skipped, not failed.
+        run: uv run pytest -v
+
+  # Single aggregate check used by branch protection / required status.
+  ci-ok:
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require lint + all test matrix jobs green
+        shell: bash
+        run: |
+          echo "lint=${{ needs.lint.result }}"
+          echo "test=${{ needs.test.result }}"
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "Lint failed" >&2
+            exit 1
+          fi
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Tests failed" >&2
+            exit 1
+          fi
+          echo "CI gate passed"
