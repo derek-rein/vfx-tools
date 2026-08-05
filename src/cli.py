@@ -81,9 +81,7 @@ def _resolve_config_source(ocio_arg: str | None) -> tuple[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description=(
-            "Convert between video and EXR with OCIO — simpler happy-path than ffmpeg."
-        ),
+        description=("Convert between video and EXR with OCIO — simpler happy-path than ffmpeg."),
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

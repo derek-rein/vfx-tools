@@ -221,9 +221,7 @@ class MainWindow(QMainWindow):
         self._copy_path_cb.setToolTip(
             "Copy the output path to the clipboard (Nuke-style #### pattern for EXR sequences)."
         )
-        self._copy_path_cb.setChecked(
-            self._settings.value("ui/copy_path_after", True, type=bool)
-        )
+        self._copy_path_cb.setChecked(self._settings.value("ui/copy_path_after", True, type=bool))
         self._copy_path_cb.toggled.connect(
             lambda v: self._settings.setValue("ui/copy_path_after", v)
         )
@@ -233,12 +231,8 @@ class MainWindow(QMainWindow):
             "Open the finished video in the system default player "
             "(or reveal the EXR folder in the file manager)."
         )
-        self._open_after_cb.setChecked(
-            self._settings.value("ui/open_after", False, type=bool)
-        )
-        self._open_after_cb.toggled.connect(
-            lambda v: self._settings.setValue("ui/open_after", v)
-        )
+        self._open_after_cb.setChecked(self._settings.value("ui/open_after", False, type=bool))
+        self._open_after_cb.toggled.connect(lambda v: self._settings.setValue("ui/open_after", v))
         after_row.addWidget(self._open_after_cb)
         after_row.addStretch()
         top_layout.addLayout(after_row)

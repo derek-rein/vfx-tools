@@ -120,8 +120,7 @@ class ColorSpaceButton(QToolButton):
 
     # Visual cue when the displayed name is not in the current config.
     _INVALID_STYLE = (
-        "QToolButton { color: #e07070; border: 1px solid #a04040; "
-        "background-color: #3a2020; }"
+        "QToolButton { color: #e07070; border: 1px solid #a04040; background-color: #3a2020; }"
     )
 
     def __init__(self, parent: QWidget | None = None):
@@ -2596,9 +2595,7 @@ class ConvertTab(QWidget):
         if resolved_src:
             self.src_btn.populate(families, resolved_src)
             if resolved_src != wanted_src:
-                self.log_message.emit(
-                    f"Source color space remapped: {wanted_src} → {resolved_src}"
-                )
+                self.log_message.emit(f"Source color space remapped: {wanted_src} → {resolved_src}")
         else:
             self.src_btn.populate(families, "")
             self.src_btn.set_invalid(str(wanted_src) if wanted_src else "")
