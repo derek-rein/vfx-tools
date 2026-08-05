@@ -102,10 +102,9 @@ def any_per_frame_token(texts: object) -> bool:
         return has_per_frame_token(texts)
     if isinstance(texts, Mapping):
         return any(has_per_frame_token(str(v)) for v in texts.values())
-    try:
+    if isinstance(texts, (list, tuple, set, frozenset)):
         return any(has_per_frame_token(str(v)) for v in texts)
-    except TypeError:
-        return False
+    return False
 
 
 def substitute(text: str | None, values: Mapping[str, str]) -> str:

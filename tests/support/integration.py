@@ -252,9 +252,9 @@ def write_synthetic_video(
 
     for i in range(frames):
         img = np.zeros((height, width, 3), dtype=np.uint8)
-        img[:, :, 0] = 30 + i * 40
+        img[:, :, 0] = (30 + i * 40) % 256
         img[:, :, 1] = 90
-        img[:, :, 2] = 150 + i * 10
+        img[:, :, 2] = (150 + i * 10) % 256
         frame = av.VideoFrame.from_ndarray(img, format="rgb24")
         for packet in stream.encode(frame):
             container.mux(packet)

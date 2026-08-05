@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import pytest
 
-from src.core.convert import _frame_num_from_path, _scaled_dims
+from src.core.convert import (
+    _configure_stream,
+    _default_codec_opts,
+    _fps_to_rate,
+    _frame_num_from_path,
+    _scaled_dims,
+)
 
 
 class TestScaledDims:
@@ -48,3 +56,50 @@ class TestFrameNumFromPath:
 
     def test_leading_zeros_preserved_as_int(self):
         assert _frame_num_from_path("x.0007.exr") == 7
+
+
+class TestFpsToRate:
+    def test_integer_fps(self):
+        assert _fps_to_rate(24.0) == 24
+        assert _fps_to_rate(25) == 25
+
+    def test_film_23_976(self):
+        rate = _fps_to_rate(23.976)
+        assert isinstance(rate, Fraction)
+        assert rate == Fraction(24000, 1001)
+        assert abs(float(rate) - 23.976) < 0.001
+
+    def test_ntsc_29_97(self):
+        rate = _fps_to_rate(29.97)
+        assert rate == Fraction(30000, 1001)
+
+    def test_not_truncated_to_int(self):
+        # Regression: previously rate=int(fps) turned 23.976 into 23.
+        assert _fps_to_rate(23.976) != 23
+
+    def test_zero_falls_back(self):
+        assert _fps_to_rate(0) == 24
+
+
+class TestConfigureStream:
+    def test_default_h264_opts(self):
+        opts = _default_codec_opts("h264")
+        assert opts["crf"] == "18"
+        assert opts["preset"] == "medium"
+
+    def test_overrides_applied(self):
+        class _FakeStream:
+            options: dict = {}
+
+        stream = _FakeStream()
+        _configure_stream(stream, "h264", {"crf": "23", "preset": "fast"})
+        assert stream.options["crf"] == "23"
+        assert stream.options["preset"] == "fast"
+
+    def test_prores_defaults(self):
+        class _FakeStream:
+            options: dict = {}
+
+        stream = _FakeStream()
+        _configure_stream(stream, "prores", None)
+        assert stream.options["profile"] == "3"

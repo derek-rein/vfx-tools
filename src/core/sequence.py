@@ -167,6 +167,8 @@ def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
     if p.is_file():
         for s in exr_seqs:
             fs = s.frameSet()
+            if not fs:
+                continue
             for f in fs:
                 if Path(s.frame(f)).name == p.name:
                     frames = sorted(fs)
@@ -174,7 +176,10 @@ def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
         return [str(p)], p.stem
 
     seq = exr_seqs[0]
-    frames = sorted(seq.frameSet())
+    fs = seq.frameSet()
+    if not fs:
+        raise RuntimeError(f"EXR sequence has no frames in {scan_dir}")
+    frames = sorted(fs)
     return [seq.frame(f) for f in frames], seq.basename().rstrip("._")
 
 
@@ -201,6 +206,8 @@ def find_exr_sequence_info(
     if p.is_file():
         for s in exr_seqs:
             fs = s.frameSet()
+            if not fs:
+                continue
             for f in fs:
                 if Path(s.frame(f)).name == p.name:
                     seq = s
@@ -210,7 +217,10 @@ def find_exr_sequence_info(
     if seq is None:
         seq = exr_seqs[0]
 
-    frames = sorted(seq.frameSet())
+    fs = seq.frameSet()
+    if not fs:
+        raise RuntimeError(f"EXR sequence has no frames in {scan_dir}")
+    frames = sorted(int(f) for f in fs)
     paths = [seq.frame(f) for f in frames]
     name = seq.basename().rstrip("._")
     pad_width = seq.zfill()

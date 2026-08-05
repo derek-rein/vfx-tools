@@ -60,7 +60,8 @@ def load_stylesheet() -> str:
     f = QFile(":/style.qss")
     if not f.open(QIODevice.OpenModeFlag.ReadOnly | QIODevice.OpenModeFlag.Text):
         return ""
-    raw = bytes(f.readAll()).decode("utf-8")
+    # QByteArray → bytes: use .data() for a clean buffer view on all PySide versions.
+    raw = bytes(f.readAll().data()).decode("utf-8")
     f.close()
     _cache = _VAR_RE.sub(lambda m: _PALETTE.get(m.group(1), m.group(0)), raw)
     return _cache

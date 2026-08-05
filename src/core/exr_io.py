@@ -14,37 +14,65 @@ def _display_window(spec) -> tuple[int, int, int, int]:
     return 0, 0, spec.width, spec.height
 
 
+def apply_exr_compression_attrs(
+    spec: oiio.ImageSpec,
+    compression: str,
+    exr_opts: dict[str, str] | None = None,
+) -> None:
+    """Set compression name and optional DWA / ZIP level attributes on *spec*."""
+    spec.attribute("compression", compression)
+    if not exr_opts:
+        return
+    if compression in ("dwaa", "dwab"):
+        level = exr_opts.get("dwa_compression_level")
+        if level is not None:
+            try:
+                # OIIO accepts the unprefixed name and stores it as
+                # openexr:dwaCompressionLevel on the written file.
+                spec.attribute("dwaCompressionLevel", float(level))
+            except (TypeError, ValueError):
+                pass
+    elif compression in ("zip", "zips"):
+        level = exr_opts.get("zip_level")
+        if level is not None:
+            try:
+                # OIIO / OpenEXR zip compression level (1–9).
+                spec.attribute("compressionlevel", int(level))
+            except (TypeError, ValueError):
+                pass
+
+
 def read_exr(path: str) -> np.ndarray:
     """Read an EXR file and return float32 array (H, W, 3).
 
     Always extracts RGB only, even if the source has alpha or more channels.
     Crops to the display window, discarding any overscan from the data window.
-    Returns a black frame if the file is corrupt or unreadable.
+
+    Raises
+    ------
+    RuntimeError
+        If the file cannot be opened or pixels cannot be read.
     """
-    try:
-        buf = oiio.ImageBuf(path)
-        if buf.has_error:
-            raise RuntimeError(buf.geterror())
-        spec = buf.spec()
-        dx, dy, dw, dh = _display_window(spec)
-        roi = oiio.ROI(dx, dx + dw, dy, dy + dh, 0, 1, 0, min(spec.nchannels, 3))
-        pixels = np.ascontiguousarray(buf.get_pixels(oiio.FLOAT, roi), dtype=np.float32)
-        if pixels.ndim == 3 and pixels.shape[2] >= 3:
-            return pixels[:, :, :3]
-        if pixels.ndim == 3 and pixels.shape[2] == 1:
-            return np.repeat(pixels, 3, axis=2)
-        return pixels
-    except Exception:
-        try:
-            inp = oiio.ImageInput.open(path)
-            if inp:
-                s = inp.spec()
-                _, _, fw, fh = _display_window(s)
-                inp.close()
-                return np.zeros((fh, fw, 3), dtype=np.float32)
-        except Exception:
-            pass
-        return np.zeros((1080, 1920, 3), dtype=np.float32)
+    buf = oiio.ImageBuf(path)
+    if buf.has_error:
+        raise RuntimeError(f"Failed to open EXR {path!r}: {buf.geterror()}")
+    spec = buf.spec()
+    dx, dy, dw, dh = _display_window(spec)
+    if dw <= 0 or dh <= 0:
+        raise RuntimeError(f"Invalid display window in EXR {path!r}")
+    roi = oiio.ROI(dx, dx + dw, dy, dy + dh, 0, 1, 0, min(spec.nchannels, 3))
+    pixels = np.ascontiguousarray(buf.get_pixels(oiio.FLOAT, roi), dtype=np.float32)
+    if buf.has_error:
+        raise RuntimeError(f"Failed to read pixels from EXR {path!r}: {buf.geterror()}")
+    if pixels is None or pixels.size == 0:
+        raise RuntimeError(f"Empty pixel buffer from EXR {path!r}")
+    if pixels.ndim == 3 and pixels.shape[2] >= 3:
+        return pixels[:, :, :3]
+    if pixels.ndim == 3 and pixels.shape[2] == 1:
+        return np.repeat(pixels, 3, axis=2)
+    if pixels.ndim == 2:
+        return np.repeat(pixels[:, :, np.newaxis], 3, axis=2)
+    raise RuntimeError(f"Unsupported pixel layout in EXR {path!r}: shape={pixels.shape}")
 
 
 def read_exr_uint16(path: str) -> np.ndarray | None:
@@ -57,6 +85,8 @@ def read_exr_uint16(path: str) -> np.ndarray | None:
         dx, dy, dw, dh = _display_window(spec)
         roi = oiio.ROI(dx, dx + dw, dy, dy + dh, 0, 1, 0, min(spec.nchannels, 3))
         pixels = buf.get_pixels(oiio.UINT16, roi)
+        if pixels is None:
+            return None
         if pixels.ndim == 3 and pixels.shape[2] >= 3:
             return np.ascontiguousarray(pixels[:, :, :3])
         if pixels.ndim == 3 and pixels.shape[2] == 1:
@@ -67,11 +97,11 @@ def read_exr_uint16(path: str) -> np.ndarray | None:
 
 
 def read_exr_safe(path: str, w: int, h: int) -> np.ndarray:
-    """Read an EXR, returning a black frame of (h, w, 3) on any error."""
+    """Read an EXR, returning a black frame of (h, w, 3) on any error or size mismatch."""
     try:
         rgb = read_exr(path)
         if rgb.shape[:2] != (h, w):
-            return rgb
+            return np.zeros((h, w, 3), dtype=np.float32)
         return rgb
     except Exception:
         return np.zeros((h, w, 3), dtype=np.float32)
@@ -83,13 +113,20 @@ def write_exr(
     compression: str = "dwaa",
     src_space: str = "",
     dst_space: str = "",
+    exr_opts: dict[str, str] | None = None,
 ) -> None:
-    """Write a float32 (H, W, 3) array as half-float EXR."""
+    """Write a float32 (H, W, 3) array as half-float EXR.
+
+    Raises
+    ------
+    RuntimeError
+        If the write fails (disk full, permissions, unsupported compression, …).
+    """
     from .constants import APP_NAME, APP_VERSION
 
     h, w = rgb.shape[:2]
     spec = oiio.ImageSpec(w, h, 3, oiio.HALF)
-    spec.attribute("compression", compression)
+    apply_exr_compression_attrs(spec, compression, exr_opts)
     spec.attribute("Software", f"{APP_NAME} {APP_VERSION}")
     if dst_space:
         spec.attribute("oiio:ColorSpace", dst_space)
@@ -102,4 +139,7 @@ def write_exr(
         oiio.ROI(0, w, 0, h, 0, 1, 0, 3),
         np.ascontiguousarray(rgb[:, :, :3], dtype=np.float32),
     )
-    buf.write(path)
+    ok = buf.write(path)
+    if not ok or buf.has_error:
+        err = buf.geterror() or "unknown OIIO write error"
+        raise RuntimeError(f"Failed to write EXR {path!r}: {err}")

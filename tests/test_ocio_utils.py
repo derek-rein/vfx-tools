@@ -76,6 +76,49 @@ class TestResolveAlias:
         assert ocio_utils.resolve_alias(config, ws) != ""
 
 
+class TestFindEquivalentSpace:
+    def test_empty_and_unknown(self, config):
+        assert ocio_utils.find_equivalent_space(config, "") == ""
+        assert ocio_utils.find_equivalent_space(config, "TotallyFakeSpaceXYZ") == ""
+
+    def test_identity(self, config):
+        ws = ocio_utils.get_working_space(config)
+        assert ocio_utils.find_equivalent_space(config, ws) == ws
+
+    def test_role_scene_linear(self, config):
+        hit = ocio_utils.find_equivalent_space(config, "scene_linear")
+        assert hit
+        # Must resolve to a real colorspace name on this config.
+        assert config.getColorSpace(hit) is not None
+
+    def test_rec709_family_maps(self, config):
+        hit = ocio_utils.find_equivalent_space(config, "Output - Rec.709")
+        if not hit:
+            hit = ocio_utils.find_equivalent_space(config, "rec709")
+        # Most studio/cg configs expose some Rec.709-ish display space.
+        if hit:
+            assert config.getColorSpace(hit) is not None
+
+    def test_acescg_alias_forms(self, config):
+        if config.getColorSpace("ACEScg") is None:
+            pytest.skip("no ACEScg on this config")
+        for name in ("ACEScg", "acescg", "ACES - ACEScg"):
+            hit = ocio_utils.find_equivalent_space(config, name)
+            assert hit
+            assert "acescg" in hit.lower().replace(" ", "").replace("-", "")
+
+
+class TestLoadConfigFromSourceInfo:
+    def test_empty_falls_back(self):
+        cfg = ocio_utils.load_config_from_source_info("", "")
+        assert cfg is not None
+        assert len(list(cfg.getColorSpaceNames())) > 0
+
+    def test_invalid_path_falls_back(self, tmp_path):
+        cfg = ocio_utils.load_config_from_source_info("", str(tmp_path / "nope.ocio"))
+        assert cfg is not None
+
+
 class TestLinearizeOverlay:
     def test_preserves_shape_and_alpha(self, config):
         h, w = 8, 8

@@ -13,14 +13,17 @@ import PyOpenColorIO as OCIO_mod
 from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QAction,
+    QCloseEvent,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QFontDatabase,
+    QGuiApplication,
     QIcon,
     QKeySequence,
 )
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -42,7 +45,8 @@ from ..core.constants import APP_NAME, APP_ORG, APP_VERSION, GITHUB_REPO
 from ..core.ocio_utils import color_space_families, config_source_info
 from ..services.presets import delete_preset, list_presets, load_preset, save_preset
 from ..services.worker import ConvertWorker
-from .widgets import ConvertTab, OcioConfigPanel, SizeGrip
+from .size_grip import SizeGrip
+from .widgets import ConvertTab, OcioConfigPanel
 
 
 class _DownloadWorker(QObject):
@@ -146,7 +150,11 @@ class MainWindow(QMainWindow):
         self._settings = QSettings(APP_ORG, APP_NAME)
         self._thread: QThread | None = None
         self._worker: ConvertWorker | None = None
+        self._dl_thread: QThread | None = None
+        self._dl_worker: _DownloadWorker | None = None
         self._ocio_cfg = None
+        # "convert" | "download" | None — keeps progress UI from fighting itself.
+        self._busy: str | None = None
 
         self._build_menu_bar()
 
@@ -183,7 +191,17 @@ class MainWindow(QMainWindow):
         self._progress.setValue(0)
         self._progress.setTextVisible(True)
         self._progress.setFormat("%p%")
+        self._progress.setObjectName("convertProgress")
         prog_row.addWidget(self._progress, 1)
+        # Separate bar for update downloads so convert progress is not overwritten.
+        self._dl_progress = QProgressBar()
+        self._dl_progress.setRange(0, 100)
+        self._dl_progress.setValue(0)
+        self._dl_progress.setTextVisible(True)
+        self._dl_progress.setFormat("Download %p%")
+        self._dl_progress.setVisible(False)
+        self._dl_progress.setMaximumWidth(220)
+        prog_row.addWidget(self._dl_progress)
         self._go = QPushButton("  Convert  ")
         self._go.setObjectName("convertBtn")
         self._cancel_btn = QPushButton("Cancel")
@@ -191,6 +209,33 @@ class MainWindow(QMainWindow):
         prog_row.addWidget(self._go)
         prog_row.addWidget(self._cancel_btn)
         top_layout.addLayout(prog_row)
+
+        # Post-convert actions (persisted).
+        after_row = QHBoxLayout()
+        after_row.setContentsMargins(0, 0, 0, 0)
+        after_row.setSpacing(14)
+        after_lbl = QLabel("When done:")
+        after_lbl.setStyleSheet("color: #888;")
+        after_row.addWidget(after_lbl)
+        self._copy_path_cb = QCheckBox("Copy path")
+        self._copy_path_cb.setToolTip(
+            "Copy the output path to the clipboard (Nuke-style #### pattern for EXR sequences)."
+        )
+        self._copy_path_cb.setChecked(self._settings.value("ui/copy_path_after", True, type=bool))
+        self._copy_path_cb.toggled.connect(
+            lambda v: self._settings.setValue("ui/copy_path_after", v)
+        )
+        after_row.addWidget(self._copy_path_cb)
+        self._open_after_cb = QCheckBox("Open result")
+        self._open_after_cb.setToolTip(
+            "Open the finished video in the system default player "
+            "(or reveal the EXR folder in the file manager)."
+        )
+        self._open_after_cb.setChecked(self._settings.value("ui/open_after", False, type=bool))
+        self._open_after_cb.toggled.connect(lambda v: self._settings.setValue("ui/open_after", v))
+        after_row.addWidget(self._open_after_cb)
+        after_row.addStretch()
+        top_layout.addLayout(after_row)
 
         splitter.addWidget(top)
 
@@ -288,8 +333,22 @@ class MainWindow(QMainWindow):
 
     # -- Updates --
 
+    def _is_convert_running(self) -> bool:
+        return self._thread is not None and self._thread.isRunning()
+
+    def _is_download_running(self) -> bool:
+        return self._dl_thread is not None and self._dl_thread.isRunning()
+
     def _check_for_updates(self) -> None:
         import json
+
+        if self._is_convert_running() or self._is_download_running():
+            QMessageBox.information(
+                self,
+                "Busy",
+                "Finish the current conversion or download before checking for updates.",
+            )
+            return
 
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         try:
@@ -359,12 +418,15 @@ class MainWindow(QMainWindow):
         tmp_dir = Path(tempfile.mkdtemp(prefix="exr_converter_update_"))
         installer_path = tmp_dir / asset_name
 
-        self._progress.setValue(0)
-        self._progress.setFormat("Downloading update… %p%")
+        self._busy = "download"
+        self._dl_progress.setVisible(True)
+        self._dl_progress.setRange(0, 100)
+        self._dl_progress.setValue(0)
+        self._dl_progress.setFormat("Download %p%")
         self._statusbar.showMessage("Downloading update…")
         self._go.setEnabled(False)
 
-        self._dl_thread = QThread()
+        self._dl_thread = QThread(self)
         self._dl_worker = _DownloadWorker(download_url, str(installer_path))
         self._dl_worker.moveToThread(self._dl_thread)
         self._dl_thread.started.connect(self._dl_worker.run)
@@ -374,35 +436,41 @@ class MainWindow(QMainWindow):
         self._dl_worker.finished.connect(self._dl_thread.quit)
         self._dl_worker.failed.connect(self._dl_thread.quit)
         dl_ref = self._dl_worker
+        thr_ref = self._dl_thread
         self._dl_thread.finished.connect(dl_ref.deleteLater)
+        self._dl_thread.finished.connect(thr_ref.deleteLater)
+        self._dl_thread.finished.connect(self._cleanup_download_thread)
         self._dl_thread.start()
 
     def _on_download_progress(self, downloaded: int, total: int) -> None:
         if total > 0:
-            self._progress.setValue(int(100 * downloaded / total))
+            self._dl_progress.setRange(0, 100)
+            self._dl_progress.setValue(int(100 * downloaded / total))
         else:
-            self._progress.setRange(0, 0)
+            self._dl_progress.setRange(0, 0)
 
     def _on_download_finished(self, dest: str) -> None:
-        self._progress.setRange(0, 100)
-        self._progress.setValue(100)
-        self._progress.setFormat("%p%")
+        self._busy = None
+        self._dl_progress.setRange(0, 100)
+        self._dl_progress.setValue(100)
+        self._dl_progress.setVisible(False)
         self._update_go_state()
         name = Path(dest).name
         self._statusbar.showMessage(f"Downloaded {name}", 5000)
         self._run_installer(Path(dest))
-        self._dl_thread = None
-        self._dl_worker = None
 
     def _on_download_failed(self, error: str) -> None:
-        self._progress.setRange(0, 100)
-        self._progress.setValue(0)
-        self._progress.setFormat("%p%")
+        self._busy = None
+        self._dl_progress.setRange(0, 100)
+        self._dl_progress.setValue(0)
+        self._dl_progress.setVisible(False)
         self._update_go_state()
         self._statusbar.clearMessage()
         QMessageBox.warning(self, "Download Failed", error)
-        self._dl_thread = None
+
+    def _cleanup_download_thread(self) -> None:
         self._dl_worker = None
+        self._dl_thread = None
 
     @staticmethod
     def _update_asset_name() -> str:
@@ -434,12 +502,8 @@ class MainWindow(QMainWindow):
 
     # -- Slate menu --
 
-    def _active_tab(self) -> ConvertTab:
-        return self._tabs.currentWidget()
-
     def _open_slate_dialog(self) -> None:
-        tab = self._active_tab()
-        tab._open_slate_dialog()
+        self._active_tab()._open_slate_dialog()
 
     # -- Presets --
 
@@ -479,9 +543,12 @@ class MainWindow(QMainWindow):
 
         name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
         if ok and name.strip():
-            state = self.snapshot_state()
-            save_preset(name.strip(), state)
-            self._append_log(f"Preset saved: {name.strip()}")
+            try:
+                state = self.snapshot_state()
+                save_preset(name.strip(), state)
+                self._append_log(f"Preset saved: {name.strip()}")
+            except ValueError as e:
+                QMessageBox.warning(self, "Save Preset", str(e))
 
     def _load_preset(self, name: str) -> None:
         try:
@@ -530,6 +597,10 @@ class MainWindow(QMainWindow):
     # -- OCIO --
 
     def _reload_ocio(self) -> None:
+        if self._is_convert_running():
+            self._append_log("OCIO reload deferred — conversion in progress")
+            self._statusbar.showMessage("Cannot reload OCIO during conversion", 4000)
+            return
         cfg = self._ocio_panel.load_config()
         if cfg is None:
             self._ocio_cfg = None
@@ -540,7 +611,21 @@ class MainWindow(QMainWindow):
         n_spaces = sum(len(v) for v in families.values())
         self._v2e_tab.populate_spaces(families, ocio_cfg=cfg)
         self._e2v_tab.populate_spaces(families, ocio_cfg=cfg)
-        self._statusbar.showMessage(f"OCIO: {n_spaces} color spaces loaded", 3000)
+        self._update_go_state()
+        # Surface invalid color spaces after a config switch.
+        tab = self._active_tab()
+        bad: list[str] = []
+        if not tab.src_btn.is_valid():
+            bad.append("source")
+        if not tab.dst_btn.is_valid():
+            bad.append("destination")
+        if bad:
+            self._statusbar.showMessage(
+                f"OCIO loaded — pick a new {' & '.join(bad)} color space",
+                6000,
+            )
+        else:
+            self._statusbar.showMessage(f"OCIO: {n_spaces} color spaces loaded", 3000)
         self._append_log(f"OCIO config loaded ({n_spaces} spaces)")
 
     # -- Log --
@@ -554,10 +639,19 @@ class MainWindow(QMainWindow):
         return self._v2e_tab if self._tabs.currentIndex() == 0 else self._e2v_tab
 
     def _update_go_state(self) -> None:
-        """Enable Convert button only when the active tab has valid setup."""
-        self._go.setEnabled(self._active_tab().is_ready())
+        """Enable Convert only when idle and the active tab is ready."""
+        busy = self._is_convert_running() or self._is_download_running() or self._busy is not None
+        self._go.setEnabled(not busy and self._active_tab().is_ready())
 
     def _start(self) -> None:
+        if self._is_convert_running():
+            self._append_log("Conversion already running — ignore start.")
+            return
+        if self._is_download_running() or self._busy == "download":
+            QMessageBox.information(
+                self, "Busy", "Wait for the update download to finish before converting."
+            )
+            return
         if self._ocio_cfg is None:
             QMessageBox.warning(self, "OCIO", "No valid OCIO config loaded.")
             return
@@ -572,13 +666,14 @@ class MainWindow(QMainWindow):
             return
         src = tab.src_btn.current_space()
         dst = tab.dst_btn.current_space()
-        if not src or not dst:
-            QMessageBox.warning(self, "Color spaces", "Select source and destination color spaces.")
+        if not tab.src_btn.is_valid() or not tab.dst_btn.is_valid() or not src or not dst:
+            QMessageBox.warning(
+                self,
+                "Color spaces",
+                "Source and/or destination color space is missing or not in the "
+                "current OCIO config. Pick valid spaces before converting.",
+            )
             return
-
-        self._go.setEnabled(False)
-        self._cancel_btn.setEnabled(True)
-        self._progress.setValue(0)
 
         cs, cp = config_source_info(
             self._ocio_panel.current_source_key(),
@@ -594,8 +689,6 @@ class MainWindow(QMainWindow):
                 frame_set = set(parse_frame_range(frame_range_str))
             except ValueError as e:
                 QMessageBox.warning(self, "Frame range", f"Invalid frame range: {e}")
-                self._update_go_state()
-                self._cancel_btn.setEnabled(False)
                 return
             if not frame_set:
                 frame_set = None
@@ -615,9 +708,14 @@ class MainWindow(QMainWindow):
                     self._append_log("Slate frame rendered successfully")
                 except Exception as e:
                     QMessageBox.warning(self, "Slate Error", f"Failed to render slate: {e}")
-                    self._update_go_state()
-                    self._cancel_btn.setEnabled(False)
                     return
+
+        self._busy = "convert"
+        self._go.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setFormat("%p%")
 
         # -- Burn-in + watermark overlays (EXR→Video only) --
         # Burn-in and watermark are stamped on shot frames only; the slate is
@@ -640,10 +738,10 @@ class MainWindow(QMainWindow):
                 from ..render.slate import SLATE_COLORSPACE
 
                 v2e_slate = self._ocio_transform_slate(v2e_slate, SLATE_COLORSPACE, dst)
+            # ocio_cfg intentionally omitted — worker rebuilds from config_source/path.
             kwargs = dict(
                 video_path=inp,
                 output_dir=Path(out),
-                ocio_cfg=self._ocio_cfg,
                 src_space=src,
                 dst_space=dst,
                 compression=tab.get_compression(),
@@ -654,13 +752,13 @@ class MainWindow(QMainWindow):
                 start_frame=tab.get_start_frame(),
                 frame_set=frame_set,
                 slate_frame=v2e_slate,
+                exr_opts=tab.get_exr_opts() or None,
             )
         else:
             _codec_key, _codec, _pix = tab.get_video_codec_info()
             kwargs = dict(
                 input_spec=inp,
                 output_video=Path(out),
-                ocio_cfg=self._ocio_cfg,
                 src_space=src,
                 dst_space=dst,
                 fps=tab.get_fps(),
@@ -675,51 +773,101 @@ class MainWindow(QMainWindow):
                 burnin_overlay=overlay_np,
                 slate_overlay=slate_overlay_np,
                 overlay_provider=overlay_provider,
+                codec_opts=tab.get_codec_opts() or None,
             )
 
         out_path = Path(out)
         self._output_folder = str(out_path if out_path.is_dir() else out_path.parent)
+        # Paths used by post-convert actions (clipboard / open).
+        self._output_mode = mode
+        self._output_file = str(out_path)  # video file or EXR directory
+        # Prefer the Nuke-style #### pattern shown in the field for sequences.
+        display_out = tab.output_path.text().strip()
+        self._output_clipboard = display_out or str(out_path)
 
         self._append_log(f"--- {mode} ---")
-        self._thread = QThread()
+        self._thread = QThread(self)
         self._worker = ConvertWorker(mode, kwargs)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
         self._worker.log_message.connect(self._append_log)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.finished_ok.connect(self._on_done)
         self._worker.finished_ok.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
-        self._thread.finished.connect(self._cleanup_thread)
+        self._worker.cancelled.connect(self._thread.quit)
         worker_ref = self._worker
+        thr_ref = self._thread
         self._thread.finished.connect(worker_ref.deleteLater)
+        self._thread.finished.connect(thr_ref.deleteLater)
+        self._thread.finished.connect(self._cleanup_thread)
         self._thread.start()
 
     def _on_progress(self, cur: int, total: int) -> None:
+        if self._busy != "convert":
+            return
         if total > 0:
             self._progress.setValue(int(100 * cur / total))
         self._statusbar.showMessage(f"Frame {cur} / {total}")
 
     def _on_failed(self, msg: str) -> None:
+        self._busy = None
         self._progress.setValue(0)
         self._statusbar.showMessage("Conversion failed.")
         QMessageBox.critical(self, "Error", msg)
         self._update_go_state()
         self._cancel_btn.setEnabled(False)
 
-    def _on_done(self) -> None:
-        self._progress.setValue(100)
-        self._statusbar.showMessage("Done.", 5000)
+    def _on_cancelled(self) -> None:
+        """User hit Cancel — quiet UI, no error dialog."""
+        self._busy = None
+        self._progress.setValue(0)
+        self._statusbar.showMessage("Cancelled.", 4000)
         self._update_go_state()
         self._cancel_btn.setEnabled(False)
-        folder = getattr(self, "_output_folder", None)
-        if folder and Path(folder).is_dir():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _on_done(self) -> None:
+        self._busy = None
+        self._progress.setValue(100)
+        self._update_go_state()
+        self._cancel_btn.setEnabled(False)
+
+        notes: list[str] = []
+        clip = getattr(self, "_output_clipboard", "") or ""
+        if self._copy_path_cb.isChecked() and clip:
+            QGuiApplication.clipboard().setText(clip)
+            notes.append("path copied")
+            self._append_log(f"Copied to clipboard: {clip}")
+
+        if self._open_after_cb.isChecked():
+            mode = getattr(self, "_output_mode", "")
+            target = getattr(self, "_output_file", "") or ""
+            if mode == "exr2video" and target and Path(target).is_file():
+                # OS default app for this media type (QuickTime, VLC, etc.).
+                QDesktopServices.openUrl(QUrl.fromLocalFile(target))
+                notes.append("opened in default player")
+                self._append_log(f"Opened: {target}")
+            else:
+                folder = getattr(self, "_output_folder", None)
+                if folder and Path(folder).is_dir():
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+                    notes.append("opened folder")
+                    self._append_log(f"Opened folder: {folder}")
+
+        status = "Done."
+        if notes:
+            status = f"Done — {', '.join(notes)}."
+        self._statusbar.showMessage(status, 6000)
 
     def _cleanup_thread(self) -> None:
         self._worker = None
         self._thread = None
+        if self._busy == "convert":
+            self._busy = None
+        self._cancel_btn.setEnabled(False)
+        self._update_go_state()
 
     def _cancel_run(self) -> None:
         if self._worker:
@@ -970,9 +1118,9 @@ class MainWindow(QMainWindow):
         ".ts",
     }
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         mime = event.mimeData()
-        if mime.hasUrls():
+        if mime is not None and mime.hasUrls():
             for url in mime.urls():
                 if url.isLocalFile():
                     p = Path(url.toLocalFile())
@@ -981,9 +1129,9 @@ class MainWindow(QMainWindow):
                         return
         event.ignore()
 
-    def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+    def dropEvent(self, event: QDropEvent) -> None:
         mime = event.mimeData()
-        if not mime.hasUrls():
+        if mime is None or not mime.hasUrls():
             return
         for url in mime.urls():
             if not url.isLocalFile():
@@ -1002,8 +1150,16 @@ class MainWindow(QMainWindow):
                 event.acceptProposedAction()
                 return
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def closeEvent(self, event: QCloseEvent) -> None:
         self._settings.setValue("ui/geometry", self.saveGeometry())
-        if self._worker:
+        # Stop background work so QApplication tear-down does not race threads.
+        if self._worker is not None:
             self._worker.cancel()
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            if not self._thread.wait(8000):
+                self._append_log("Convert thread did not stop in time; forcing exit.")
+        if self._dl_thread is not None and self._dl_thread.isRunning():
+            self._dl_thread.quit()
+            self._dl_thread.wait(3000)
         super().closeEvent(event)
