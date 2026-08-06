@@ -45,7 +45,8 @@ help:
 	@echo "  make release PART=… PUSH=0             # preferred: bump+commit+tag on release/* branch"
 	@echo "  make release PART=…                    # also pushes (fails if main is protected)"
 	@echo ""
-	@echo "  Docs: docs/releasing.md  (PR + gh CLI; main is protected)"
+	@echo "  Docs: AGENTS.md          (release/deploy + agent context; main is protected)"
+	@echo "        CHANGELOG.md       (user-facing history — update every release)"
 	@echo "        docs/plan-12bit-prores-oxideav.md"
 	@echo "Current tags: git tag -l 'v*' --sort=-v:refname | head"
 

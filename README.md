@@ -137,10 +137,14 @@ All static assets live under `resources/`: icons in `resources/icons/` (`icon.ic
 
 Tags use plain semver: `v1.2.3`. Pushing a tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml) and publishes a GitHub Release with Linux AppImage, macOS DMGs (ARM64 + Intel), and a Windows installer.
 
-**Full process** (protected `main`, PR, Makefile, `gh` CLI): see **[docs/releasing.md](docs/releasing.md)**.
+| Doc | Contents |
+|-----|----------|
+| **[CHANGELOG.md](CHANGELOG.md)** | User-facing history (update with every visible change) |
+| **[AGENTS.md](AGENTS.md#releasing-and-deployment)** | Full release process: protected `main`, PR, Makefile, `gh`, CI gates |
 
 ```bash
 git checkout -b release/X.Y.Z
+# Roll CHANGELOG [Unreleased] → [X.Y.Z] first
 make release PART=minor PUSH=0   # bump + commit + local tag (main is PR-only)
 git push -u origin HEAD
 gh pr create --base main --title "release: X.Y.Z"
