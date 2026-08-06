@@ -52,6 +52,46 @@ def test_list_nuke_configs_empty_without_install(monkeypatch):
     assert list_nuke_configs() == []
 
 
+def test_list_nuke_configs_marks_incompatible(tmp_path, monkeypatch):
+    """Incompatible configs stay listed but are flagged for greying-out in the UI."""
+    from src.core import ocio_utils
+
+    install = _fake_nuke_tree(tmp_path)
+    monkeypatch.setattr(nuke_discover, "_iter_install_roots", lambda: [install])
+
+    def _probe(path):
+        path = Path(path)
+        # Pretend Studio ACES 2.0 is unloadable (real-world BuiltinTransform case).
+        if "studio" in path.name.lower() and "aces-v2" in path.name.lower():
+            return (
+                False,
+                "invalid built-in transform style 'DISPLAY - CIE-XYZ-D65_to_DisplayP3-HDR'",
+            )
+        # Fake tree files are not real OCIO — treat others as loadable for the test.
+        return True, ""
+
+    monkeypatch.setattr(ocio_utils, "is_ocio_config_loadable", _probe)
+
+    listed = list_nuke_configs()
+    assert listed
+    # (key, label, recommended, compatible, detail)
+    studio = [c for c in listed if "studio" in c[0].lower() or "Studio" in c[1]]
+    assert studio, listed
+    assert studio[0][3] is False
+    assert "incompatible" in studio[0][1].lower()
+    assert "DisplayP3-HDR" in studio[0][4]
+    # Recommended star only on a compatible studio entry — none here
+    assert all(not c[2] for c in studio)
+
+
+def test_is_ocio_config_loadable_missing(tmp_path):
+    from src.core.ocio_utils import is_ocio_config_loadable
+
+    ok, err = is_ocio_config_loadable(tmp_path / "nope.ocio")
+    assert ok is False
+    assert "not found" in err.lower()
+
+
 def test_resolve_nuke_source_key(tmp_path, monkeypatch):
     install = _fake_nuke_tree(tmp_path, "16.0v5")
     monkeypatch.setattr(nuke_discover, "_iter_install_roots", lambda: [install])

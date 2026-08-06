@@ -143,6 +143,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --group bundle
 
+      # oiio-python may rewire PyOpenColorIO.so → OCIO 2.4; reinstall 2.5 first.
+      - name: Ensure OpenColorIO 2.5+ linkage
+        run: uv run python scripts/ensure_ocio.py
+
       - name: Inject version from tag
         shell: bash
         run: |
@@ -208,6 +212,18 @@ jobs:
       - name: Rename macOS app bundle
         if: runner.os == 'macOS'
         run: mv dist/main.app "dist/EXR Converter.app"
+
+      # Nuitka often links PyOpenColorIO.so to OIIO’s libOpenColorIO.2.4.0.dylib
+      # and drops the 2.5 dylib. Re-copy 2.5 and rewrite the install name so the
+      # bundled ACES Studio v4 config (profile 2.5) can load.
+      - name: Fix OpenColorIO 2.5 linkage in bundle
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            uv run python scripts/fix_bundle_ocio.py "dist/EXR Converter.app"
+          else
+            uv run python scripts/fix_bundle_ocio.py dist/main.dist
+          fi
 
       - name: Slim macOS bundle
         if: runner.os == 'macOS'

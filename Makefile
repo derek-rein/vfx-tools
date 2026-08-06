@@ -135,6 +135,8 @@ bundle: resources
 		--noinclude-dlls='libssl*' \
 		$(ENTRY)
 	mv dist/main.app "dist/$(MACOS_BUNDLE_NAME).app"
+	# Nuitka rewires PyOpenColorIO → OIIO’s OCIO 2.4; put 2.5 back.
+	$(PYTHON) scripts/fix_bundle_ocio.py "dist/$(MACOS_BUNDLE_NAME).app"
 
 clean:
 	rm -rf dist build *.build *.dist *.onefile-build __pycache__

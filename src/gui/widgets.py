@@ -436,22 +436,39 @@ class OcioConfigPanel(QGroupBox):
             self._source_combo.insertSeparator(self._source_combo.count())
 
         # Local Nuke installs — path references only (never redistributed).
-        for name, label, recommended in self._nuke_configs:
+        # Incompatible with the linked OpenColorIO are listed but greyed out.
+        from ..core.nuke_discover import resolve_nuke_config_path
+
+        for name, label, recommended, compatible, detail in self._nuke_configs:
             short = label
             if recommended:
                 short += "  \u2605"
             self._source_combo.addItem(short, name)
-            # Tooltip shows full on-disk path so users know it's their Nuke install.
-            from ..core.nuke_discover import resolve_nuke_config_path
-
+            idx = self._source_combo.count() - 1
             p = resolve_nuke_config_path(name)
+            tip_lines = [
+                "Uses OCIO from your Nuke install (not redistributed).",
+            ]
             if p is not None:
-                idx = self._source_combo.count() - 1
-                self._source_combo.setItemData(
-                    idx,
-                    f"Uses OCIO from your Nuke install (not redistributed):\n{p}",
-                    Qt.ItemDataRole.ToolTipRole,
+                tip_lines.append(str(p))
+            if not compatible:
+                tip_lines.append("")
+                tip_lines.append(
+                    "Unavailable with this app’s OpenColorIO "
+                    f"({__import__('PyOpenColorIO').GetVersion()})."
                 )
+                if detail:
+                    tip_lines.append(detail)
+                tip_lines.append(
+                    "Use the bundled ACES Studio config, or run make ensure-ocio "
+                    "if OpenColorIO was downgraded by oiio-python."
+                )
+                self._set_combo_item_enabled(idx, False)
+            self._source_combo.setItemData(
+                idx,
+                "\n".join(tip_lines),
+                Qt.ItemDataRole.ToolTipRole,
+            )
         if self._nuke_configs:
             self._source_combo.insertSeparator(self._source_combo.count())
 
@@ -479,6 +496,37 @@ class OcioConfigPanel(QGroupBox):
         else:
             self._source_combo.addItem(label, OCIO_SOURCE_FILE)
 
+    def _set_combo_item_enabled(self, index: int, enabled: bool) -> None:
+        """Grey out a combo row (still visible) when *enabled* is False."""
+        from PySide6.QtGui import QColor, QStandardItemModel
+
+        model = self._source_combo.model()
+        if not isinstance(model, QStandardItemModel):
+            return
+        item = model.item(index)
+        if item is None:
+            return
+        flags = item.flags()
+        if enabled:
+            item.setFlags(flags | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            item.setForeground(
+                self._source_combo.palette().color(self._source_combo.foregroundRole())
+            )
+        else:
+            item.setFlags(flags & ~Qt.ItemFlag.ItemIsEnabled)
+            item.setForeground(QColor("#666666"))
+
+    def _combo_item_is_enabled(self, index: int) -> bool:
+        from PySide6.QtGui import QStandardItemModel
+
+        model = self._source_combo.model()
+        if not isinstance(model, QStandardItemModel):
+            return True
+        item = model.item(index)
+        if item is None:
+            return True
+        return bool(item.flags() & Qt.ItemFlag.ItemIsEnabled)
+
     def _select_saved_source(self) -> None:
         saved = self._settings.value("ocio/source", "")
         if not saved:
@@ -494,6 +542,17 @@ class OcioConfigPanel(QGroupBox):
                     saved = recommended[0][0] if recommended else self._builtin_configs[-1][0]
         for i in range(self._source_combo.count()):
             if self._source_combo.itemData(i) == saved:
+                if self._combo_item_is_enabled(i):
+                    self._source_combo.setCurrentIndex(i)
+                    return
+                # Saved Nuke config is no longer loadable — fall through.
+                break
+        # Prefer first enabled non-env item if saved was incompatible.
+        for i in range(self._source_combo.count()):
+            data = self._source_combo.itemData(i)
+            if data is None:
+                continue
+            if self._combo_item_is_enabled(i) and data != OCIO_SOURCE_ENV:
                 self._source_combo.setCurrentIndex(i)
                 return
         self._source_combo.setCurrentIndex(0)
@@ -532,6 +591,14 @@ class OcioConfigPanel(QGroupBox):
         return cfg
 
     def _on_source_changed(self, _idx: int) -> None:
+        # Disabled (incompatible) rows should not be selectable; if Qt still
+        # delivers the change, bounce back to the previous enabled index.
+        if not self._combo_item_is_enabled(_idx):
+            self._source_combo.blockSignals(True)
+            self._source_combo.setCurrentIndex(self._prev_index)
+            self._source_combo.blockSignals(False)
+            return
+
         source = self.current_source_key()
         if source == OCIO_SOURCE_FILE:
             path, _ = QFileDialog.getOpenFileName(
