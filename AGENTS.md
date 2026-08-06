@@ -149,11 +149,12 @@ feature commits (PR → main)
         │  1. scripts/bump_app_version.py → pyproject + APP_VERSION
         │  2. uv lock
         │  3. commit: "release: X.Y.Z"  (only version files)
-        │  4. tag: vX.Y.Z  (local)
+        │  4. optional local tag vX.Y.Z  (not required for publish)
         ▼
  PR → main → merge
         │
- git push origin vX.Y.Z
+ Auto-tag release workflow (on push to main)
+        │  if pyproject version X.Y.Z has no tag vX.Y.Z → create + push tag
         ▼
  GitHub Actions “Release” on tag v*
         │  lint → test (3 OS) → gate → Nuitka → Cosign → GitHub Release
@@ -164,6 +165,12 @@ feature commits (PR → main)
 
 Tags are plain semver: **`v1.2.3`**. The tag is the published app version
 (workflow also injects `APP_VERSION` from the tag during the Nuitka build).
+
+**Important:** the **Release** workflow only runs on **tag push** (`v*`), not on
+merge alone. Historically the tag was left local (`PUSH=0`) and someone had to
+`git push origin vX.Y.Z` after merge — that is what missed 0.5.0 until fixed by
+hand. **`.github/workflows/auto-tag-release.yml`** now tags automatically when
+`main` advances and the version in `pyproject.toml` has no matching tag yet.
 
 ### Prerequisites
 
@@ -192,16 +199,18 @@ gh pr checks
 gh pr merge --merge          # or --squash per preference
 
 git checkout main && git pull origin main
-# If tag still points at pre-merge SHA, retag the release commit on main when needed:
-git tag -d vX.Y.Z 2>/dev/null || true
-git tag vX.Y.Z
-git push origin vX.Y.Z       # triggers Release workflow
+# Auto-tag release workflow pushes vX.Y.Z if missing → Release workflow runs.
+# Manual fallback if auto-tag is disabled or failed:
+#   git tag vX.Y.Z && git push origin vX.Y.Z
 
+gh run list --workflow="Auto-tag release" --limit 3
+gh run list --workflow=Release --limit 3
 gh run watch
 gh release view vX.Y.Z
 ```
 
-Historical: `release/0.3.0` → PR #1; `release/0.4.0` → PR #2.
+Historical: `release/0.3.0` → PR #1; `release/0.4.0` → PR #2; `release/0.5.0` → PR #3
+(tag was pushed manually after merge; auto-tag added afterward).
 
 ### Make variables
 
@@ -253,8 +262,9 @@ Local package only: `make bundle` (no GitHub Release).
 - [ ] **[CHANGELOG.md](./CHANGELOG.md)** updated: `[Unreleased]` rolled into `[X.Y.Z]`
 - [ ] On branch `release/X.Y.Z` (not direct push to `main`)
 - [ ] Working tree free of unrelated unstaged work
-- [ ] Correct `PART`; `make release … PUSH=0` → PR → merge → `git push origin vX.Y.Z`
-- [ ] `gh run watch` green; `gh release view vX.Y.Z` has artifacts + signatures
+- [ ] Correct `PART`; `make release … PUSH=0` → PR → merge
+- [ ] Auto-tag (or manual `git push origin vX.Y.Z`) fires Release; `gh run watch` green
+- [ ] `gh release view vX.Y.Z` has artifacts + signatures
 
 ### Troubleshooting
 
@@ -286,6 +296,7 @@ xattr -cr "/Applications/EXR Converter.app"
 | Workflow | Trigger | Gate |
 |----------|---------|------|
 | [CI](.github/workflows/ci.yml) | push / PR to `main` | Ruff + full pytest on 3 OS; job **`ci-ok`** requires all green |
+| [Auto-tag release](.github/workflows/auto-tag-release.yml) | push to `main` | If `pyproject` version has no `vX.Y.Z` tag → push tag |
 | [Release](.github/workflows/release.yml) | tag `v*` | Same lint + tests via **`gate`** before Nuitka / publish |
 
 Branch protection on `main` should require `ci-ok`.
