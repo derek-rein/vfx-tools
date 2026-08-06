@@ -14,13 +14,20 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    # Prefer: gh workflow run Release --ref main -f tag=v0.5.1
-    # (runs workflow file from main; builds the given tag commit)
+    # Prefer: gh workflow run Release --ref main -f tag=v0.5.2
+    # Workflow *file* comes from --ref (use main). Source *code* is checked out
+    # from source_ref (default = tag). Re-dispatching an old tag without a new
+    # tag will NOT pick up packaging fixes that only exist on main.
     inputs:
       tag:
-        description: "Tag to release (e.g. v0.5.1). Required for manual / auto-tag dispatch."
+        description: "Release tag name (e.g. v0.5.2). Required for dispatch."
         required: true
         type: string
+      source_ref:
+        description: "Git ref to build (default: same as tag). Set to main only for emergency rebuilds."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -29,8 +36,10 @@ permissions:
 env:
   NUITKA_ASSUME_YES_FOR_DOWNLOADS: "1"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  # Tag push → github.ref_name; workflow_dispatch → inputs.tag
+  # Published version / GitHub Release name
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  # Code to build (must contain packaging scripts for that release)
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && (inputs.source_ref != '' && inputs.source_ref || inputs.tag) || github.ref_name }}
 
 jobs:
   # ── Quality gate (must pass before build / sign / publish) ────────────────
@@ -39,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -68,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -139,7 +148,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -170,7 +179,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${RELEASE_TAG#v}"
-          echo "Building version ${VERSION} (tag ${RELEASE_TAG})"
+          echo "Building version ${VERSION} (tag ${RELEASE_TAG}, source ${RELEASE_REF})"
           sed -i.bak "s/^APP_VERSION = \"[^\"]*\"/APP_VERSION = \"${VERSION}\"/" src/core/constants.py
           rm -f src/core/constants.py.bak
 
