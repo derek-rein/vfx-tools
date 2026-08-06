@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """Ensure the runtime OpenColorIO library is 2.5+ (matches the bundled config).
 
-``oiio-python`` sometimes rewrites ``PyOpenColorIO.so`` to link against the
-OpenColorIO 2.4.0 dylib it vendors under ``OpenImageIO/.dylibs/``.  That makes
-``PyOpenColorIO.GetVersion()`` report 2.4.0 even when the ``opencolorio``
-package metadata says 2.5.x, and the bundled ACES Studio v4 config
-(``ocio_profile_version: 2.5``) then fails to load.
+``oiio-python`` sometimes rewrites ``PyOpenColorIO`` to link against its
+vendored OpenColorIO **2.4** (macOS: ``OpenImageIO/.dylibs/libOpenColorIO.2.4``;
+Windows: ``PyOpenColorIO/OpenColorIO_2_4.dll`` bundled inside the oiio wheel).
+That makes ``PyOpenColorIO.GetVersion()`` report 2.4.0 and the bundled ACES
+Studio v4 config (profile 2.5) fails to load.
 
-This script detects that mismatch and reinstalls ``opencolorio`` so the
-extension links its own ``@loader_path/libOpenColorIO.dylib`` again.
+This script reinstalls ``opencolorio`` so PyOpenColorIO is 2.5+ again.
 
-Version checks after reinstall run in a **fresh subprocess** so a previously
-loaded 2.4 extension module cannot mask a successful repair.
+**Windows caveat:** reinstalling opencolorio overwrites the oiio-shipped
+``PyOpenColorIO/`` tree and **deletes** ``OpenColorIO_2_4.dll``. OpenImageIO's
+native DLL still depends on that 2.4 library, so we preserve/restore it next
+to ``OpenImageIO.pyd`` for packaging and runtime.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 REQUIRED = (2, 5, 0)
 PACKAGE = "opencolorio>=2.5.1"
+OIIO_OCIO24_DLL = "OpenColorIO_2_4.dll"
 
 
 def _parse_version(text: str) -> tuple[int, ...]:
@@ -37,7 +41,6 @@ def _runtime_version_fresh() -> str:
         "print('\\n' + o.__file__, end='')"
     )
     out = subprocess.check_output([sys.executable, "-c", code], text=True)
-    # First line: version; second: path (optional)
     return out.splitlines()[0].strip()
 
 
@@ -51,8 +54,103 @@ def _is_broken() -> tuple[bool, str]:
     return False, ver
 
 
+def _oiio_dir() -> Path | None:
+    try:
+        import OpenImageIO as oiio
+
+        return Path(oiio.__file__).resolve().parent
+    except Exception:
+        return None
+
+
+def _find_oiio_wheel() -> Path | None:
+    """Locate a cached oiio_python wheel (uv/pip) containing the 2.4 OCIO DLL."""
+    roots: list[Path] = []
+    for key in ("UV_CACHE_DIR", "PIP_CACHE_DIR"):
+        v = os.environ.get(key)
+        if v:
+            roots.append(Path(v))
+    roots.extend(
+        [
+            Path.home() / ".cache" / "uv",
+            Path.home() / ".cache" / "pip",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "uv" / "cache",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "pip" / "Cache",
+        ]
+    )
+    hits: list[Path] = []
+    for root in roots:
+        if not root or not root.is_dir():
+            continue
+        try:
+            hits.extend(root.rglob("oiio_python-*.whl"))
+            hits.extend(root.rglob("oiio-python-*.whl"))
+        except OSError:
+            continue
+    if not hits:
+        return None
+    hits.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return hits[0]
+
+
+def _read_ocio24_dll_bytes() -> bytes | None:
+    """Return OpenColorIO_2_4.dll bytes from disk or the oiio wheel cache."""
+    # Any remaining copy under the env
+    for base in {Path(sys.prefix), Path(sys.base_prefix)}:
+        try:
+            for p in base.rglob(OIIO_OCIO24_DLL):
+                if p.is_file():
+                    return p.read_bytes()
+        except OSError:
+            continue
+
+    whl = _find_oiio_wheel()
+    if whl is None:
+        return None
+    try:
+        with zipfile.ZipFile(whl) as zf:
+            for name in zf.namelist():
+                if name.endswith(OIIO_OCIO24_DLL) or name.endswith("/" + OIIO_OCIO24_DLL):
+                    print(f"ensure_ocio: extracting {name} from {whl.name}")
+                    return zf.read(name)
+    except (OSError, zipfile.BadZipFile) as e:
+        print(f"ensure_ocio: could not read {whl}: {e}", file=sys.stderr)
+    return None
+
+
+def _preserve_oiio_ocio24_dll() -> None:
+    """Keep OpenColorIO_2_4.dll next to OpenImageIO for Windows LoadLibrary.
+
+    Safe no-op on platforms / installs that do not need it.
+    """
+    oiio = _oiio_dir()
+    if oiio is None:
+        return
+
+    dest = oiio / OIIO_OCIO24_DLL
+    if dest.is_file():
+        print(f"ensure_ocio: OIIO OCIO 2.4 present at {dest}")
+        return
+
+    data = _read_ocio24_dll_bytes()
+    if not data:
+        # Non-Windows oiio wheels often vendor OCIO under .dylibs instead.
+        if sys.platform == "win32":
+            print(
+                "ensure_ocio: WARNING — could not restore OpenColorIO_2_4.dll; "
+                "Windows OpenImageIO.pyd may fail LoadLibrary in the Nuitka bundle.",
+                file=sys.stderr,
+            )
+        return
+
+    dest.write_bytes(data)
+    print(f"ensure_ocio: wrote {dest} ({len(data)} bytes) for OIIO")
+
+
 def _reinstall() -> int:
-    # Target *this* interpreter's environment (uv run / CI venv).
+    # Snapshot 2.4 DLL before opencolorio clobbers oiio's PyOpenColorIO tree.
+    saved = _read_ocio24_dll_bytes()
+
     cmds = [
         [
             "uv",
@@ -78,6 +176,11 @@ def _reinstall() -> int:
         try:
             print(f"ensure_ocio: running {' '.join(cmd)}")
             subprocess.check_call(cmd)
+            if saved:
+                oiio = _oiio_dir()
+                if oiio is not None:
+                    (oiio / OIIO_OCIO24_DLL).write_bytes(saved)
+                    print(f"ensure_ocio: restored {OIIO_OCIO24_DLL} under {oiio}")
             return 0
         except FileNotFoundError:
             continue
@@ -95,11 +198,12 @@ def main() -> int:
     broken, ver = _is_broken()
     if not broken:
         print(f"ensure_ocio: OK — OpenColorIO {ver}")
+        _preserve_oiio_ocio24_dll()
         return 0
 
     print(
         f"ensure_ocio: OpenColorIO runtime is {ver!r}, need >= {'.'.join(map(str, REQUIRED))}.\n"
-        "  (oiio-python often rewires PyOpenColorIO to its vendored 2.4 dylib.)\n"
+        "  (oiio-python often rewires PyOpenColorIO to its vendored 2.4 library.)\n"
         f"  Reinstalling {PACKAGE} …",
         file=sys.stderr,
     )
@@ -113,7 +217,8 @@ def main() -> int:
         return 2
 
     print(f"ensure_ocio: repaired — OpenColorIO {ver}")
-    # Spot-check the macOS install name when otool is available.
+    _preserve_oiio_ocio24_dll()
+
     try:
         code = "import PyOpenColorIO as o; print(o.__file__)"
         mod = subprocess.check_output([sys.executable, "-c", code], text=True).strip()

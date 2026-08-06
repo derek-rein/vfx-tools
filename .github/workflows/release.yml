@@ -244,6 +244,14 @@ jobs:
           else
             uv run python scripts/fix_bundle_ocio.py dist/main.dist
           fi
+          # Windows: OIIO needs OpenColorIO_2_4.dll on the DLL search path.
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            echo "--- OCIO / OIIO DLLs in dist ---"
+            find dist/main.dist -iname '*OpenColorIO*' -o -iname 'OpenImageIO*' 2>/dev/null | sort || true
+            test -f dist/main.dist/OpenColorIO_2_4.dll \
+              || find dist/main.dist -name 'OpenColorIO_2_4.dll' | grep -q . \
+              || { echo "ERROR: OpenColorIO_2_4.dll missing from Windows bundle" >&2; exit 1; }
+          fi
 
       - name: Slim macOS bundle
         if: runner.os == 'macOS'

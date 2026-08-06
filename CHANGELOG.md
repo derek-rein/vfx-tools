@@ -19,6 +19,11 @@ rolling the `[Unreleased]` section into a versioned heading.
   start other workflows. Auto-tag now **dispatches** the Release workflow
   (`workflow_dispatch` on the tag) after tagging, and re-dispatches if a tag
   exists but no GitHub Release was published yet.
+- **Windows Nuitka / OpenImageIO LoadLibrary:** reinstalling OpenColorIO 2.5
+  removed oiio-python’s `OpenColorIO_2_4.dll`, so `OpenImageIO.pyd` failed with
+  “The specified module could not be found.” `ensure_ocio` and
+  `fix_bundle_ocio` now preserve that 2.4 DLL next to OIIO while keeping app
+  OCIO on 2.5.
 
 ---
 
