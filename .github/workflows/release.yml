@@ -1,5 +1,8 @@
 # Tag format: v1.2.3
-# Push: git tag v1.2.3 && git push origin v1.2.3
+#
+# Triggers:
+#   1. push of tag v* (human / PAT push — GITHUB_TOKEN tag pushes do NOT fire this)
+#   2. workflow_dispatch on a tag ref (used by Auto-tag release after merge to main)
 #
 # Gate: lint + full pytest suite (unit + integration) must pass on all
 # platforms before any Nuitka build or GitHub Release is published.
@@ -10,6 +13,14 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    # Prefer: gh workflow run Release --ref main -f tag=v0.5.1
+    # (runs workflow file from main; builds the given tag commit)
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.5.1). Required for manual / auto-tag dispatch."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -18,6 +29,8 @@ permissions:
 env:
   NUITKA_ASSUME_YES_FOR_DOWNLOADS: "1"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # Tag push → github.ref_name; workflow_dispatch → inputs.tag
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   # ── Quality gate (must pass before build / sign / publish) ────────────────
@@ -25,6 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -52,6 +67,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -121,6 +138,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -150,7 +169,8 @@ jobs:
       - name: Inject version from tag
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
+          echo "Building version ${VERSION} (tag ${RELEASE_TAG})"
           sed -i.bak "s/^APP_VERSION = \"[^\"]*\"/APP_VERSION = \"${VERSION}\"/" src/core/constants.py
           rm -f src/core/constants.py.bak
 
@@ -392,7 +412,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           APPDIR="${{ matrix.artifact }}.AppDir"
           mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
 
@@ -424,7 +444,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".Replace("v","")
+          $version = "${{ env.RELEASE_TAG }}".Replace("v","")
           iscc "/DAppVersion=$version" installer.iss
 
       - name: Upload artifact
@@ -514,8 +534,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2.6.1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "EXR Converter ${{ github.ref_name }}"
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "EXR Converter ${{ env.RELEASE_TAG }}"
           generate_release_notes: true
           files: artifacts/*
           body: |

@@ -154,9 +154,10 @@ feature commits (PR → main)
  PR → main → merge
         │
  Auto-tag release workflow (on push to main)
-        │  if pyproject version X.Y.Z has no tag vX.Y.Z → create + push tag
+        │  if pyproject version X.Y.Z has no tag → create + push tag
+        │  if no GitHub Release for that tag yet → `gh workflow run Release --ref vX.Y.Z`
         ▼
- GitHub Actions “Release” on tag v*
+ GitHub Actions “Release” (tag push **or** workflow_dispatch on the tag)
         │  lint → test (3 OS) → gate → Nuitka → Cosign → GitHub Release
         ▼
  Artifacts: Linux AppImage, macOS DMG (arm64 + x86_64), Windows installer
@@ -166,11 +167,10 @@ feature commits (PR → main)
 Tags are plain semver: **`v1.2.3`**. The tag is the published app version
 (workflow also injects `APP_VERSION` from the tag during the Nuitka build).
 
-**Important:** the **Release** workflow only runs on **tag push** (`v*`), not on
-merge alone. Historically the tag was left local (`PUSH=0`) and someone had to
-`git push origin vX.Y.Z` after merge — that is what missed 0.5.0 until fixed by
-hand. **`.github/workflows/auto-tag-release.yml`** now tags automatically when
-`main` advances and the version in `pyproject.toml` has no matching tag yet.
+**Critical GitHub quirk:** a tag created with the default **`GITHUB_TOKEN` does
+not start other workflows** (recursion guard). Auto-tag therefore **dispatches**
+Release via `workflow_dispatch` after pushing the tag. Human `git push origin v*`
+with a real user/PAT still triggers Release on `push: tags` as usual.
 
 ### Prerequisites
 
