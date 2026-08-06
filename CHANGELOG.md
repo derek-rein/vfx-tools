@@ -13,6 +13,13 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI/CD chain after merge:** tags created by Actions with `GITHUB_TOKEN` do not
+  start other workflows. Auto-tag now **dispatches** the Release workflow
+  (`workflow_dispatch` on the tag) after tagging, and re-dispatches if a tag
+  exists but no GitHub Release was published yet.
+
 ---
 
 ## [0.5.1] — 2026-08-06

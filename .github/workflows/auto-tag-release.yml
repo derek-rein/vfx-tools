@@ -1,10 +1,13 @@
-# After a PR merges to main, if pyproject.toml version X.Y.Z has no matching
-# git tag vX.Y.Z yet, create and push that tag. The existing Release workflow
-# (on: push tags: v*) then builds, signs, and publishes the GitHub Release.
+# After a PR merges to main: if pyproject version X.Y.Z has no tag vX.Y.Z yet,
+# create and push the tag, then *explicitly* start the Release workflow.
 #
-# Why this exists: protected main means tags are not pushed during
-# `make release PUSH=0`. Merging the release PR alone never fired Release
-# until someone remembered `git push origin vX.Y.Z`.
+# Why workflow_dispatch (not “tag push alone”):
+#   Tags created with the default GITHUB_TOKEN do **not** start other workflows
+#   (GitHub recursion guard). So auto-tag must call `gh workflow run Release`
+#   after pushing the tag. That *does* work with GITHUB_TOKEN.
+#
+# Also recovers: if the tag exists but no GitHub Release was published yet,
+# re-trigger Release (e.g. after a failed publish or the 0.5.1 gap).
 
 name: Auto-tag release
 
@@ -12,25 +15,24 @@ on:
   push:
     branches: [main]
 
-# Do not cancel in-flight Release builds if several merges land quickly.
 concurrency:
   group: auto-tag-release
   cancel-in-progress: false
 
 permissions:
   contents: write
+  actions: write # required to `gh workflow run` Release
 
 jobs:
-  tag-if-needed:
+  tag-and-dispatch:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          # Need full history / ability to push tags from GITHUB_TOKEN.
           fetch-depth: 0
 
-      - name: Read version and tag if missing
+      - name: Tag if needed and trigger Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -44,19 +46,36 @@ jobs:
           TAG="v${VERSION}"
           echo "version=${VERSION} tag=${TAG}"
 
+          TAG_EXISTS=false
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists locally — nothing to do."
+            TAG_EXISTS=true
+          elif git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            TAG_EXISTS=true
+          fi
+
+          if [ "$TAG_EXISTS" = false ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "release: ${VERSION}"
+            git push origin "refs/tags/${TAG}"
+            echo "Created and pushed ${TAG}"
+          else
+            echo "Tag ${TAG} already exists"
+          fi
+
+          # Publish if there is no GitHub Release yet (new tag or previous miss).
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "GitHub Release ${TAG} already exists — nothing to dispatch."
             exit 0
           fi
 
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists on origin — nothing to do."
-            exit 0
-          fi
-
-          # Point the tag at the commit that just landed on main (this push).
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${TAG}" -m "release: ${VERSION}"
-          git push origin "refs/tags/${TAG}"
-          echo "Pushed ${TAG} → triggers Release workflow."
+          echo "No GitHub Release for ${TAG} — dispatching Release workflow (workflow file from main)"
+          # workflow_dispatch IS allowed to start new runs with GITHUB_TOKEN
+          # (unlike events from a GITHUB_TOKEN tag push).
+          # Use --ref main so we get the latest Release.yml (with workflow_dispatch
+          # + RELEASE_TAG input). The build checks out the tag via inputs.tag.
+          gh workflow run Release \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f "tag=${TAG}"
+          echo "Dispatched Release for ${TAG}"
