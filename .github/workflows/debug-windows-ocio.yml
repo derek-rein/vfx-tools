@@ -1,0 +1,89 @@
+# One-shot Windows diagnosis for OIIO / OCIO DLL packaging.
+# Run: gh workflow run "Debug Windows OCIO" --ref main
+name: Debug Windows OCIO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install bundle deps
+        run: uv sync --group bundle
+
+      - name: Before ensure_ocio
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== PyOpenColorIO version ==="
+          uv run python -c "import PyOpenColorIO as o; print(o.GetVersion()); print(o.__file__)"
+          echo "=== OpenColorIO DLLs under site-packages ==="
+          find .venv -iname '*opencolorio*' -type f 2>/dev/null | head -50 || true
+          echo "=== OpenImageIO dir ==="
+          uv run python -c "import OpenImageIO as i, pathlib; print(pathlib.Path(i.__file__).parent); import os; print(os.listdir(pathlib.Path(i.__file__).parent)[:30])"
+
+      - name: ensure_ocio
+        run: uv run python scripts/ensure_ocio.py
+
+      - name: After ensure_ocio
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== PyOpenColorIO version ==="
+          uv run python -c "import PyOpenColorIO as o; print(o.GetVersion())"
+          echo "=== OpenColorIO_2_4 search ==="
+          find .venv -iname 'OpenColorIO_2_4.dll' -o -iname 'opencolorio_2_4.dll' 2>/dev/null || true
+          echo "=== materialize via oiio_ocio24 ==="
+          uv run python -c "
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from oiio_ocio24 import materialize_ocio24_dll, read_ocio24_dll_bytes, OIIO_OCIO24_DLL
+          b = read_ocio24_dll_bytes()
+          print('bytes', None if b is None else len(b))
+          p = materialize_ocio24_dll(Path('D:/a/exr-converter/exr-converter/.venv/Lib/site-packages/OpenImageIO'))
+          print('materialized', p)
+          "
+
+      - name: Import OpenImageIO after 2.4 restore
+        run: |
+          uv run python -c "import OpenImageIO as oiio; print('OIIO OK', oiio.VERSION_STRING)"
+
+      - name: Mini fake dist + fix_bundle_ocio
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Simulate Nuitka layout without full build
+          DIST=dist/main.dist
+          mkdir -p "$DIST/OpenImageIO" "$DIST/PyOpenColorIO"
+          # Copy pyds/dlls from venv as Nuitka roughly would
+          SITE=$(uv run python -c "import site; print(site.getsitepackages()[0])")
+          echo "SITE=$SITE"
+          cp -r "$SITE/OpenImageIO/"* "$DIST/OpenImageIO/" || true
+          cp -r "$SITE/PyOpenColorIO/"* "$DIST/PyOpenColorIO/" || true
+          # Flatten like Nuitka sometimes does
+          find "$DIST" -iname '*.dll' -exec cp -n {} "$DIST/" \; 2>/dev/null || true
+          echo "=== before fix_bundle ==="
+          find "$DIST" -iname '*ocio*' -o -iname '*openimage*' 2>/dev/null | sort
+          uv run python scripts/ensure_ocio.py
+          uv run python scripts/fix_bundle_ocio.py "$DIST"
+          echo "=== after fix_bundle ==="
+          find "$DIST" -iname '*ocio*' -o -iname '*openimage*' 2>/dev/null | sort
+          test -f "$DIST/OpenColorIO_2_4.dll" \
+            || find "$DIST" -iname 'OpenColorIO_2_4.dll' | grep -q . \
+            || { echo "FAIL: no 2_4 dll"; exit 1; }
+          echo "PASS: OpenColorIO_2_4.dll present"

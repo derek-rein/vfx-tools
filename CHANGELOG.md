@@ -13,17 +13,19 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+---
+
+## [0.5.2] — 2026-08-06
+
 ### Fixed
 
-- **CI/CD chain after merge:** tags created by Actions with `GITHUB_TOKEN` do not
-  start other workflows. Auto-tag now **dispatches** the Release workflow
-  (`workflow_dispatch` on the tag) after tagging, and re-dispatches if a tag
-  exists but no GitHub Release was published yet.
-- **Windows Nuitka / OpenImageIO LoadLibrary:** reinstalling OpenColorIO 2.5
-  removed oiio-python’s `OpenColorIO_2_4.dll`, so `OpenImageIO.pyd` failed with
-  “The specified module could not be found.” `ensure_ocio` /
-  `fix_bundle_ocio` now restore that DLL (from env, uv cache, or **PyPI
-  oiio-python wheel download**) next to OIIO while keeping app OCIO on 2.5.
+- **Windows Nuitka OpenImageIO LoadLibrary:** ship `OpenColorIO_2_4.dll` for OIIO
+  (from env/cache or PyPI oiio-python wheel) while app OCIO stays on **2.5**.
+  Re-running Release for `v0.5.1` kept failing because that tag predates the fix;
+  packaging scripts live on the **tag commit** that is built.
+- **CI/CD chain after merge:** Auto-tag dispatches Release via `workflow_dispatch`
+  (`GITHUB_TOKEN` tag pushes do not start other workflows).
+- Release dispatch documents `source_ref` for emergency rebuilds from another ref.
 
 ---
 
@@ -41,6 +43,7 @@ rolling the `[Unreleased]` section into a versioned heading.
   the combo but are **greyed out** with a tooltip explaining why.
 - Bundled ACES Studio no longer silently falls back to a library config on version
   mismatch (status matched convert failures).
+- Note: Windows OIIO DLL packaging for this release was incomplete; use **0.5.2+**.
 
 ---
 
@@ -213,7 +216,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/derek-rein/exr-converter/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/derek-rein/exr-converter/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/derek-rein/exr-converter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/derek-rein/exr-converter/compare/v0.3.0...v0.4.0
