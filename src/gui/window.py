@@ -45,6 +45,7 @@ from ..core.constants import APP_NAME, APP_ORG, APP_VERSION, GITHUB_REPO
 from ..core.ocio_utils import color_space_families, config_source_info
 from ..services.presets import delete_preset, list_presets, load_preset, save_preset
 from ..services.worker import ConvertWorker
+from .preferences import PreferencesDialog, open_video_with_player, reveal_in_file_manager
 from .size_grip import SizeGrip
 from .widgets import ConvertTab, OcioConfigPanel
 
@@ -221,6 +222,7 @@ class MainWindow(QMainWindow):
         self._copy_path_cb.setToolTip(
             "Copy the output path to the clipboard (Nuke-style #### pattern for EXR sequences)."
         )
+        # Default ON for new installs; persisted after first toggle.
         self._copy_path_cb.setChecked(self._settings.value("ui/copy_path_after", True, type=bool))
         self._copy_path_cb.toggled.connect(
             lambda v: self._settings.setValue("ui/copy_path_after", v)
@@ -228,12 +230,23 @@ class MainWindow(QMainWindow):
         after_row.addWidget(self._copy_path_cb)
         self._open_after_cb = QCheckBox("Open result")
         self._open_after_cb.setToolTip(
-            "Open the finished video in the system default player "
-            "(or reveal the EXR folder in the file manager)."
+            "Open the finished video in your preferred player "
+            "(File → Preferences). For EXR output this has no effect — use Show in folder."
         )
         self._open_after_cb.setChecked(self._settings.value("ui/open_after", False, type=bool))
         self._open_after_cb.toggled.connect(lambda v: self._settings.setValue("ui/open_after", v))
         after_row.addWidget(self._open_after_cb)
+        self._show_folder_cb = QCheckBox("Show in folder")
+        self._show_folder_cb.setToolTip(
+            "Reveal the output file (or EXR sequence folder) in the system file manager."
+        )
+        self._show_folder_cb.setChecked(
+            self._settings.value("ui/show_folder_after", False, type=bool)
+        )
+        self._show_folder_cb.toggled.connect(
+            lambda v: self._settings.setValue("ui/show_folder_after", v)
+        )
+        after_row.addWidget(self._show_folder_cb)
         after_row.addStretch()
         top_layout.addLayout(after_row)
 
@@ -292,6 +305,11 @@ class MainWindow(QMainWindow):
         mb.setNativeMenuBar(False)
 
         file_menu = mb.addMenu("&File")
+        prefs_action = QAction("&Preferences\u2026", self)
+        prefs_action.setShortcut(QKeySequence.StandardKey.Preferences)
+        prefs_action.triggered.connect(self._open_preferences)
+        file_menu.addAction(prefs_action)
+        file_menu.addSeparator()
         quit_action = QAction("&Quit", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(self.close)
@@ -329,6 +347,10 @@ class MainWindow(QMainWindow):
 
     def _show_about(self) -> None:
         dlg = AboutDialog(self)
+        dlg.exec()
+
+    def _open_preferences(self) -> None:
+        dlg = PreferencesDialog(self._settings, self)
         dlg.exec()
 
     # -- Updates --
@@ -841,20 +863,33 @@ class MainWindow(QMainWindow):
             notes.append("path copied")
             self._append_log(f"Copied to clipboard: {clip}")
 
+        mode = getattr(self, "_output_mode", "")
+        target = getattr(self, "_output_file", "") or ""
+        folder = getattr(self, "_output_folder", None)
+
         if self._open_after_cb.isChecked():
-            mode = getattr(self, "_output_mode", "")
-            target = getattr(self, "_output_file", "") or ""
             if mode == "exr2video" and target and Path(target).is_file():
-                # OS default app for this media type (QuickTime, VLC, etc.).
-                QDesktopServices.openUrl(QUrl.fromLocalFile(target))
-                notes.append("opened in default player")
-                self._append_log(f"Opened: {target}")
-            else:
-                folder = getattr(self, "_output_folder", None)
-                if folder and Path(folder).is_dir():
-                    QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-                    notes.append("opened folder")
-                    self._append_log(f"Opened folder: {folder}")
+                try:
+                    msg = open_video_with_player(target, self._settings)
+                    notes.append(msg)
+                    self._append_log(f"{msg.capitalize()}: {target}")
+                except OSError as e:
+                    self._append_log(f"Could not open player: {e}")
+            elif mode != "exr2video":
+                # Open result is video-oriented; nudge EXR users toward folder.
+                self._append_log(
+                    "Open result applies to video output — use Show in folder for EXR sequences."
+                )
+
+        if self._show_folder_cb.isChecked():
+            reveal_target = target if (target and Path(target).exists()) else folder
+            if reveal_target:
+                try:
+                    msg = reveal_in_file_manager(reveal_target)
+                    notes.append(msg.split(":")[0] if ":" in msg else msg)
+                    self._append_log(msg)
+                except OSError as e:
+                    self._append_log(f"Could not show in folder: {e}")
 
         status = "Done."
         if notes:
