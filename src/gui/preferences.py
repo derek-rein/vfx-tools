@@ -11,9 +11,11 @@ from PySide6.QtCore import QSettings, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -28,9 +30,20 @@ from PySide6.QtWidgets import (
 # QSettings keys
 PLAYER_MODE_KEY = "player/mode"
 PLAYER_PATH_KEY = "player/path"
+THUMBNAIL_FRAME_KEY = "slate/thumbnail_frame"
 
 PLAYER_MODE_SYSTEM = "system"
 PLAYER_MODE_CUSTOM = "custom"
+
+# Integer prefs for which source frame becomes the slate thumbnail.
+THUMBNAIL_FRAME_FIRST = 0
+THUMBNAIL_FRAME_MID = 1
+THUMBNAIL_FRAME_LAST = 2
+THUMBNAIL_FRAME_CHOICES: tuple[tuple[int, str], ...] = (
+    (THUMBNAIL_FRAME_FIRST, "First frame"),
+    (THUMBNAIL_FRAME_MID, "Middle frame"),
+    (THUMBNAIL_FRAME_LAST, "Last frame"),
+)
 
 
 def player_mode(settings: QSettings) -> str:
@@ -47,6 +60,50 @@ def player_path(settings: QSettings) -> str:
 def set_player_prefs(settings: QSettings, mode: str, path: str) -> None:
     settings.setValue(PLAYER_MODE_KEY, mode)
     settings.setValue(PLAYER_PATH_KEY, path.strip())
+
+
+def thumbnail_frame_choice(settings: QSettings) -> int:
+    """Return which frame to use for the slate thumbnail (0=first, 1=mid, 2=last)."""
+    # Prefer typed read; fall back for stringy platforms / older values.
+    try:
+        raw = settings.value(THUMBNAIL_FRAME_KEY, THUMBNAIL_FRAME_MID, type=int)
+    except (TypeError, ValueError):
+        raw = settings.value(THUMBNAIL_FRAME_KEY, THUMBNAIL_FRAME_MID)
+    try:
+        val = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return THUMBNAIL_FRAME_MID
+    if val not in (
+        THUMBNAIL_FRAME_FIRST,
+        THUMBNAIL_FRAME_MID,
+        THUMBNAIL_FRAME_LAST,
+    ):
+        return THUMBNAIL_FRAME_MID
+    return val
+
+
+def set_thumbnail_frame_choice(settings: QSettings, which: int) -> None:
+    which_i = int(which)
+    if which_i not in (
+        THUMBNAIL_FRAME_FIRST,
+        THUMBNAIL_FRAME_MID,
+        THUMBNAIL_FRAME_LAST,
+    ):
+        which_i = THUMBNAIL_FRAME_MID
+    settings.setValue(THUMBNAIL_FRAME_KEY, which_i)
+
+
+def pick_thumbnail_index(count: int, which: int) -> int:
+    """Map a thumbnail preference to an index in ``[0, count)``."""
+    n = int(count)
+    if n <= 0:
+        return 0
+    w = int(which)
+    if w == THUMBNAIL_FRAME_FIRST:
+        return 0
+    if w == THUMBNAIL_FRAME_LAST:
+        return n - 1
+    return n // 2
 
 
 def _is_macos_app_bundle(path: Path) -> bool:
@@ -293,6 +350,21 @@ class PreferencesDialog(QDialog):
 
         root.addWidget(player_box)
 
+        # --- Slate thumbnail frame ---
+        slate_box = QGroupBox("Slate")
+        slate_form = QFormLayout(slate_box)
+        self._thumb_combo = QComboBox()
+        for value, label in THUMBNAIL_FRAME_CHOICES:
+            self._thumb_combo.addItem(label, int(value))
+        self._thumb_combo.setToolTip(
+            "Which frame of the EXR sequence is used for the slate thumbnail "
+            "(EXR → video only). Picked by index from the known frame list — "
+            "first, middle, or last. Converted to the slate authoring space "
+            "(sRGB-like) so colour management matches the rest of the slate."
+        )
+        slate_form.addRow("Thumbnail frame:", self._thumb_combo)
+        root.addWidget(slate_box)
+
         # Load current values
         mode = player_mode(settings)
         if mode == PLAYER_MODE_CUSTOM:
@@ -303,6 +375,12 @@ class PreferencesDialog(QDialog):
         self._sync_custom_enabled()
         self._system_radio.toggled.connect(self._sync_custom_enabled)
         self._custom_radio.toggled.connect(self._sync_custom_enabled)
+
+        which = thumbnail_frame_choice(settings)
+        for i in range(self._thumb_combo.count()):
+            if int(self._thumb_combo.itemData(i)) == which:
+                self._thumb_combo.setCurrentIndex(i)
+                break
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -377,4 +455,9 @@ class PreferencesDialog(QDialog):
                     )
                     return
         set_player_prefs(self._settings, mode, path)
+        thumb_data = self._thumb_combo.currentData()
+        set_thumbnail_frame_choice(
+            self._settings,
+            int(thumb_data) if thumb_data is not None else THUMBNAIL_FRAME_MID,
+        )
         self.accept()

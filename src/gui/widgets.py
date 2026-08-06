@@ -560,6 +560,28 @@ class OcioConfigPanel(QGroupBox):
     def current_source_key(self) -> str:
         return self._source_combo.currentData() or ""
 
+    def set_custom_config_file(self, path: str) -> bool:
+        """Force the custom OCIO file source to *path* (used by GUI launch args / Nuke).
+
+        Returns True if the path exists and was selected.
+        """
+        p = Path(path).expanduser()
+        if not p.is_file():
+            return False
+        self._file_path = str(p)
+        self._settings.setValue("ocio/file_path", str(p))
+        self._settings.setValue("ocio/source", OCIO_SOURCE_FILE)
+        self._update_custom_label()
+        for i in range(self._source_combo.count()):
+            if self._source_combo.itemData(i) == OCIO_SOURCE_FILE:
+                self._source_combo.blockSignals(True)
+                self._source_combo.setCurrentIndex(i)
+                self._source_combo.blockSignals(False)
+                self._prev_index = i
+                break
+        self.config_changed.emit()
+        return True
+
     def load_config(self):  # -> OCIO.Config | None
         source = self.current_source_key()
         file_path = self._file_path
@@ -2584,10 +2606,23 @@ class ConvertTab(QWidget):
         self.src_btn.space_changed.connect(lambda _: self._emit_readiness())
         self.dst_btn.space_changed.connect(lambda _: self._emit_readiness())
 
-        # Validate any saved input path once the event loop starts.
+        # Validate any saved input path once the event loop starts — unless a
+        # GUI launch path (--open / Nuke) already applied input on this tab.
+        self._skip_saved_input_restore = False
         saved = self.input_path.text().strip()
         if saved:
-            QTimer.singleShot(0, self, lambda: self.set_input_async(saved))
+            QTimer.singleShot(0, self, self._restore_saved_input_if_needed)
+
+    def _restore_saved_input_if_needed(self) -> None:
+        if getattr(self, "_skip_saved_input_restore", False):
+            return
+        saved = self.input_path.text().strip()
+        if saved:
+            self.set_input_async(saved)
+
+    def suppress_saved_input_restore(self) -> None:
+        """Cancel deferred QSettings input restore (used by ``--open`` / Nuke)."""
+        self._skip_saved_input_restore = True
 
     def _on_input_text_changed(self, text: str) -> None:
         """React to manual edits (typing / paste) in the input field.

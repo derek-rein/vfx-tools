@@ -57,7 +57,11 @@ Enable the **Prepend slate** checkbox to add a 1-frame slate image before the co
 
 ## CLI
 
-Use the `video2exr` or `exr2video` subcommand.
+**Full reference:** [docs/cli.md](docs/cli.md)  
+**Nuke menu (open Read + session OCIO):** [docs/nuke.md](docs/nuke.md)
+
+Use the `video2exr` or `exr2video` subcommand to convert, or run with **no**
+subcommand to open the GUI (optionally with `--open` / `--gui-ocio`).
 
 **Video → EXR**
 
@@ -68,21 +72,33 @@ uv run python main.py video2exr -i clip.mov -o ./exr_out/
 **EXR → video**
 
 ```bash
-uv run python main.py exr2video -i "./plate.####.exr" -o review.mov --fps 24
+uv run python main.py exr2video -i ./plate -o review.mov --fps 24
+# or any frame file from the sequence:
+uv run python main.py exr2video -i ./plate/plate.1001.exr -o review.mov --fps 24
 ```
 
-Common options:
+**GUI with path pre-loaded** (also used by the Nuke integration)
+
+```bash
+uv run python main.py --open ./plate --gui-ocio "$OCIO" --mode exr2video
+```
+
+Common convert options:
 
 | Option | Applies to | Notes |
 |--------|------------|--------|
-| `--ocio PATH` | both | OCIO config file (overrides `$OCIO`) |
-| `--src` / `--dst` | both | OCIO display / scene color space names |
+| `--ocio PATH` | both convert commands | OCIO config file (overrides `$OCIO`) |
+| `--src` / `--dst` | both | OCIO color space names |
 | `--workers N` | both | `0` = auto, `1` = single-threaded |
 | `--scale FACTOR` | both | e.g. `0.5` for half resolution |
 | `--exr-compression NAME` | `video2exr` | e.g. `dwaa`, `zip`, `none` (see `--help`) |
-| `--codec KEY` | `exr2video` | Full ladder with honest bit depths: ProRes Proxy…XQ (software = 10-bit encode), DNxHR LB…444, CineForm 10/12-bit, HEVC 8/10/12-bit, H.264, FFV1 10/12-bit. **VideoToolbox ProRes** (`prores_vt_*`) is **macOS-only**; VT 4444/XQ are ~12-bit. |
+| `--codec KEY` | `exr2video` | ProRes / DNxHR / CineForm / HEVC / H.264 / FFV1 — see [docs/cli.md](docs/cli.md) for bit-depth notes |
 
-Run `uv run python main.py video2exr --help` or `exr2video --help` for the full list.
+```bash
+uv run python main.py --help
+uv run python main.py video2exr --help
+uv run python main.py exr2video --help
+```
 
 ## Requirements (running from source)
 

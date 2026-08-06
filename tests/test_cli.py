@@ -42,6 +42,31 @@ class TestParserDefaults:
         assert b.output is None
         assert b.src is None and b.dst is None
 
+    def test_gui_launch_flags(self):
+        p = build_parser()
+        a = p.parse_args(
+            [
+                "--open",
+                "/show/plate.####.exr",
+                "--gui-ocio",
+                "/cfg/studio.ocio",
+                "--mode",
+                "exr2video",
+            ]
+        )
+        assert a.command is None
+        assert a.open == "/show/plate.####.exr"
+        assert a.gui_ocio == "/cfg/studio.ocio"
+        assert a.mode == "exr2video"
+
+    def test_workers_before_or_after_subcommand(self):
+        p = build_parser()
+        a = p.parse_args(["--workers", "1", "video2exr", "-i", "a.mov"])
+        assert a.workers_global == 1
+        assert a.workers_local is None
+        b = p.parse_args(["video2exr", "-i", "a.mov", "--workers", "4"])
+        assert b.workers_local == 4
+
     def test_explicit_overrides(self):
         p = build_parser()
         a = p.parse_args(

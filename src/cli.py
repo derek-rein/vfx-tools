@@ -37,19 +37,58 @@ from .core.ocio_utils import find_equivalent_space, resolve_ocio_for_cli
 _CODEC_KEYS = [spec.key for spec in available_video_codecs()]
 
 _EPILOG = """\
-examples:
+usage modes
+  (no subcommand)     Launch the GUI
+  video2exr           Video → OCIO → EXR sequence (CLI convert)
+  exr2video           EXR sequence → OCIO → video (CLI convert)
+
+GUI launch (no subcommand)
+  %(prog)s
+  %(prog)s --open /path/to/plate.####.exr
+  %(prog)s --open /path/to/clip.mov --mode video2exr
+  %(prog)s --open /path/to/exrs --gui-ocio /path/to/config.ocio
+
+CLI convert examples
   %(prog)s video2exr -i plate.mov
       → ./plate/plate.####.exr  (Rec.709-ish → ACEScg, DWAA EXR)
 
   %(prog)s exr2video -i ./plate
-      → ./plate.mov  (scene-linear → Rec.709 display, ProRes)
+      → ./plate.mov  (scene-linear → Rec.709 display, default codec)
 
   %(prog)s video2exr -i plate.mov -o /tmp/out --frame-range 1-100
-  %(prog)s exr2video -i ./plate -o review.mp4 --codec h264
+  %(prog)s exr2video -i ./plate -o review.mp4 --codec h264 --fps 24
 
-Color spaces default to auto (probe + OCIO-aware equivalents). Pass --src / --dst
-only when you need an override. OCIO defaults to the bundled ACES Studio config
-(or $OCIO if set).
+Color / OCIO
+  Defaults: probe + OCIO-aware equivalents for --src/--dst when omitted.
+  Config:   --ocio PATH  (CLI) or --gui-ocio PATH (GUI), else $OCIO, else
+            bundled ACES Studio Config v4.
+
+Full docs: docs/cli.md
+Nuke menu: integrations/nuke/  (see docs/nuke.md)
+"""
+
+_V2E_EPILOG = """\
+examples:
+  %(prog)s -i plate.mov
+  %(prog)s -i plate.mov -o /tmp/exr_out --exr-compression zip
+  %(prog)s -i plate.mov --src "sRGB Encoded Rec.709 (sRGB)" --dst ACEScg
+  %(prog)s -i plate.mov --frame-range 1-100 --deinterlace auto
+  %(prog)s -i plate.mov --ocio /path/to/config.ocio --workers 4
+
+Omit -o to write <input_parent>/<stem>/<stem>.####.exr
+See docs/cli.md for the full option list.
+"""
+
+_E2V_EPILOG = """\
+examples:
+  %(prog)s -i ./plate
+  %(prog)s -i "./plate.####.exr" -o review.mov --fps 24
+  %(prog)s -i ./plate --codec prores --src ACEScg --dst "Output - Rec.709"
+  %(prog)s -i ./plate --codec h264 --crf 18 --preset medium
+  %(prog)s -i ./plate --frame-range 1001-1100 --ocio /path/to/config.ocio
+
+Omit -o to write <parent>/<dirname>.mov (extension follows codec).
+See docs/cli.md for codecs and bit-depth notes.
 """
 
 
@@ -81,7 +120,10 @@ def _resolve_config_source(ocio_arg: str | None) -> tuple[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description=("Convert between video and EXR with OCIO — simpler happy-path than ffmpeg."),
+        description=(
+            "EXR Converter — GUI and CLI for video ↔ OpenEXR with OpenColorIO.\n"
+            "Run with no subcommand to open the GUI; use video2exr / exr2video to convert."
+        ),
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -89,13 +131,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--smoke-test",
         action="store_true",
-        help="Launch the GUI, verify it initializes, then exit.",
+        help="Launch the GUI, verify it initializes, then exit (CI).",
     )
     p.add_argument(
         "--workers",
+        dest="workers_global",
         type=int,
         default=0,
-        help="Parallel workers (0=auto, 1=serial). Default: auto.",
+        help="CLI convert: parallel workers (0=auto, 1=serial). Default: auto. "
+        "May also be passed after the subcommand.",
+    )
+    # GUI-only launch helpers (ignored when a convert subcommand is used).
+    p.add_argument(
+        "--open",
+        metavar="PATH",
+        default=None,
+        help="GUI: open this video / EXR sequence / folder on launch.",
+    )
+    p.add_argument(
+        "--gui-ocio",
+        metavar="PATH",
+        default=None,
+        help="GUI: load this OCIO config file on launch (overrides saved preference).",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["auto", "video2exr", "exr2video"],
+        default="auto",
+        help="GUI: which tab to show (default: auto from --open).",
     )
     sub = p.add_subparsers(dest="command")
 
@@ -104,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Video → OCIO → EXR sequence.",
         description="Decode video, apply OCIO, write an EXR sequence.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Omit -o to write <input_parent>/<stem>/<stem>.####.exr",
+        epilog=_V2E_EPILOG,
     )
     v2e.add_argument("-i", "--input", required=True, help="Input video file")
     v2e.add_argument(
@@ -171,19 +234,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "on", "off"],
         help="Deinterlace (default: auto)",
     )
+    v2e.add_argument(
+        "--workers",
+        dest="workers_local",
+        type=int,
+        default=None,
+        help="Parallel workers (0=auto, 1=serial). Overrides global --workers.",
+    )
 
     e2v = sub.add_parser(
         "exr2video",
         help="EXR sequence → OCIO → video.",
         description="Read an EXR sequence, apply OCIO, encode a video file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Omit -o to write <parent>/<dirname>.mov next to the sequence.",
+        epilog=_E2V_EPILOG,
     )
     e2v.add_argument(
         "-i",
         "--input",
         required=True,
-        help="EXR sequence directory, frame, or pattern",
+        help="EXR sequence directory or any existing frame file from the sequence",
     )
     e2v.add_argument(
         "-o",
@@ -235,6 +305,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--frame-range",
         default="",
         help="Nuke-style range (e.g. 1001-1100). Default: all frames",
+    )
+    e2v.add_argument(
+        "--workers",
+        dest="workers_local",
+        type=int,
+        default=None,
+        help="Parallel workers (0=auto, 1=serial). Overrides global --workers.",
     )
 
     return p
@@ -440,6 +517,14 @@ def run_cli(args: argparse.Namespace) -> int:
     def _log(msg: str) -> None:
         print(msg, file=sys.stderr)
 
+    # Subcommand --workers overrides parent global.
+    workers_local = getattr(args, "workers_local", None)
+    workers = (
+        int(workers_local)
+        if workers_local is not None
+        else int(getattr(args, "workers_global", 0) or 0)
+    )
+
     try:
         cfg = resolve_ocio_for_cli(args.ocio)
         cs, cp = _resolve_config_source(args.ocio)
@@ -475,7 +560,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 progress=_progress,
                 log=_log,
                 compression=args.exr_compression,
-                workers=args.workers,
+                workers=workers,
                 config_source=cs,
                 config_path=cp,
                 scale=args.scale,
@@ -518,7 +603,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 args.fps,
                 progress=_progress,
                 log=_log,
-                workers=args.workers,
+                workers=workers,
                 config_source=cs,
                 config_path=cp,
                 scale=args.scale,
