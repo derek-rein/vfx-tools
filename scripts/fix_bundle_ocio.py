@@ -196,28 +196,93 @@ def _linux_fix(ext: Path, src_ext: Path, src_lib: Path) -> None:
     print(f"fix_bundle_ocio: Linux — ensured {plain}")
 
 
-def _windows_fix(ext: Path, src_ext: Path, src_lib: Path) -> None:
-    ext = _replace_extension(ext, src_ext)
-    # Windows loads DLLs from the pyd directory and the executable directory.
-    targets = [
-        ext.parent / src_lib.name,
-        ext.parent.parent / src_lib.name,
-    ]
-    for root in (ext.parent, *ext.parents[:3]):
-        if (root / "exr_converter.exe").is_file():
-            targets.append(root / src_lib.name)
-        if root.name.endswith(".dist") or root.name == "main.dist":
-            targets.append(root / src_lib.name)
-
+def _windows_copy_dll(src: Path, dests: list[Path]) -> None:
     written: set[Path] = set()
-    for dest in targets:
+    for dest in dests:
         dest = dest.resolve()
         if dest in written:
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_lib, dest)
+        shutil.copy2(src, dest)
         written.add(dest)
         print(f"fix_bundle_ocio: Windows — copied {dest}")
+
+
+def _windows_oiio_ocio24_source() -> Path | None:
+    """Find OpenColorIO_2_4.dll (required by OpenImageIO on Windows)."""
+    name = "OpenColorIO_2_4.dll"
+    try:
+        import OpenImageIO as oiio
+
+        p = Path(oiio.__file__).resolve().parent / name
+        if p.is_file():
+            return p
+    except Exception:
+        pass
+    for base in {Path(sys.prefix), Path(sys.base_prefix)}:
+        try:
+            hits = list(base.rglob(name))
+            if hits:
+                return hits[0]
+        except OSError:
+            continue
+    return None
+
+
+def _windows_dist_root(ext: Path) -> Path:
+    """Best-effort Nuitka dist root (folder with exr_converter.exe or *.dist)."""
+    cur = ext.parent
+    for _ in range(8):
+        if (cur / "exr_converter.exe").is_file() or cur.name.endswith(".dist"):
+            return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return ext.parent.parent
+
+
+def _windows_fix(ext: Path, src_ext: Path, src_lib: Path) -> None:
+    """Restore PyOpenColorIO 2.5 *and* keep OIIO's OpenColorIO 2.4 DLL.
+
+    oiio-python's Windows wheel ships ``OpenColorIO_2_4.dll`` under
+    ``PyOpenColorIO/``. Reinstalling opencolorio 2.5 for the app removes that
+    file; OpenImageIO.pyd then fails with LoadLibraryExW "module not found".
+    """
+    ext = _replace_extension(ext, src_ext)
+    dist_root = _windows_dist_root(ext)
+
+    # App OCIO 2.5 — next to PyOpenColorIO.pyd and dist root.
+    _windows_copy_dll(
+        src_lib,
+        [
+            ext.parent / src_lib.name,
+            dist_root / src_lib.name,
+        ],
+    )
+
+    # OIIO OCIO 2.4 — next to OpenImageIO.pyd and dist root (DLL search path).
+    ocio24 = _windows_oiio_ocio24_source()
+    if ocio24 is None:
+        print(
+            "fix_bundle_ocio: WARNING — OpenColorIO_2_4.dll not found in env; "
+            "OpenImageIO.pyd may fail LoadLibrary on Windows",
+            file=sys.stderr,
+        )
+        return
+
+    dests_24 = [dist_root / ocio24.name]
+    for oiio_pyd in dist_root.rglob("OpenImageIO*.pyd"):
+        dests_24.append(oiio_pyd.parent / ocio24.name)
+    _windows_copy_dll(ocio24, dests_24)
+
+    # Hard fail if OIIO is present but still missing its OCIO DLL.
+    for oiio_pyd in dist_root.rglob("OpenImageIO*.pyd"):
+        need = oiio_pyd.parent / ocio24.name
+        if not need.is_file() and not (dist_root / ocio24.name).is_file():
+            raise SystemExit(
+                f"fix_bundle_ocio: {ocio24.name} missing next to {oiio_pyd} "
+                f"and under {dist_root} — Windows OIIO will not load"
+            )
 
 
 def fix_bundle(root: Path) -> None:
