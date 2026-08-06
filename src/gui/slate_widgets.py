@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import (
     QEvent,
@@ -69,6 +70,9 @@ from ..services.frame_cache import FrameCache
 from .size_grip import SizeGrip
 from .timeline_slider import TimelineSlider
 from .token_line_edit import TokenLineEdit
+
+if TYPE_CHECKING:
+    import numpy as np
 
 log = logging.getLogger(__name__)
 
@@ -322,78 +326,62 @@ class NukeSlider(QWidget):
         self.valueChanged.emit(self._value)
 
 
-def extract_thumbnail_b64(input_path: str, mode: str) -> str:
-    """Extract a JPEG thumbnail from the midpoint of the input as raw base64.
+def extract_thumbnail_b64(
+    input_path: str,
+    mode: str = "exr2video",
+    *,
+    which: int | None = None,
+    ocio_cfg: object | None = None,
+    src_space: str = "",
+) -> str:
+    """Extract a JPEG thumbnail as raw base64 for the slate (sRGB authoring).
 
-    Returns a plain base64 string (no data-URI prefix), or '' on failure.
+    Slate / burn-in only apply to **EXR → video**. The thumbnail is one EXR
+    frame from the known sequence (first / middle / last by frame index — no
+    video seek). Scene-linear pixels are OCIO-transformed
+    ``src → slate authoring (sRGB-like)`` when a config is available so the
+    still matches slate colour management at convert time.
+
+    *which* is ``0`` first / ``1`` middle / ``2`` last
+    (:func:`preferences.thumbnail_frame_choice`). Defaults to middle.
+
+    Returns a plain base64 string (no data-URI prefix), or ``''`` on failure.
+    ``mode`` is accepted for call-site compatibility; non-EXR modes return ``''``.
     """
     import base64
 
+    import numpy as np
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QImage
+
+    from .preferences import THUMBNAIL_FRAME_MID
+
+    if mode and mode != "exr2video":
+        return ""
+
+    if which is None:
+        which = THUMBNAIL_FRAME_MID
+
     try:
-        if mode == "video2exr":
-            import av
+        arr = _thumbnail_rgb_from_exr(
+            input_path,
+            which,
+            ocio_cfg=ocio_cfg,
+            src_space=src_space,
+        )
+        if arr is None or getattr(arr, "size", 0) == 0:
+            return ""
 
-            container = av.open(input_path)
-            stream = container.streams.video[0]
-            total = stream.frames
-            if not total and stream.duration and stream.time_base:
-                fps = float(stream.average_rate) if stream.average_rate else 24.0
-                total = max(1, int(float(stream.duration * stream.time_base) * fps + 0.5))
-            mid = max(0, (total or 1) // 2)
-            fps = float(stream.average_rate) if stream.average_rate else 24.0
-            tb = stream.time_base
-            if tb is not None and float(tb) != 0.0:
-                target_ts = int(mid / fps / float(tb))
-                container.seek(target_ts, stream=stream)
-            frame = None
-            for f in container.decode(video=0):
-                frame = f
-                break
-            container.close()
-            if frame is None:
-                return ""
-            import numpy as np
-
-            arr = frame.to_ndarray(format="rgb24")
-        else:
-            from ..core.sequence import find_exr_sequence_info
-
-            _paths, _name, frames, _pad, seq = find_exr_sequence_info(input_path)
-            if not frames:
-                return ""
-            mid_idx = len(frames) // 2
-            mid_frame = sorted(frames)[mid_idx]
-            mid_path = seq.frame(mid_frame)
-
-            import numpy as np
-            import OpenImageIO as oiio
-
-            img_buf = oiio.ImageBuf(mid_path)
-            if img_buf.has_error:
-                return ""
-            spec = img_buf.spec()
-            if spec.full_width > 0 and spec.full_height > 0:
-                dx, dy = spec.full_x, spec.full_y
-                dw, dh = spec.full_width, spec.full_height
-            else:
-                dx, dy = 0, 0
-                dw, dh = spec.width, spec.height
-            roi = oiio.ROI(dx, dx + dw, dy, dy + dh, 0, 1, 0, min(spec.nchannels, 3))
-            pixels = np.ascontiguousarray(img_buf.get_pixels(oiio.FLOAT, roi), dtype=np.float32)
-            rgb = pixels[..., :3] if pixels.shape[2] >= 3 else np.repeat(pixels, 3, axis=2)
-            rgb = np.clip(rgb, 0, None)
-            srgb = np.where(
-                rgb <= 0.0031308,
-                rgb * 12.92,
-                1.055 * np.power(rgb, 1.0 / 2.4) - 0.055,
-            )
-            arr = np.clip(srgb * 255, 0, 255).astype(np.uint8)
-
-        from PySide6.QtCore import QBuffer, QIODevice
-        from PySide6.QtGui import QImage
-
+        arr = np.ascontiguousarray(arr, dtype=np.uint8)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            return ""
         h, w = arr.shape[:2]
-        qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+        if h < 1 or w < 1:
+            return ""
+        # .copy() so QImage owns the buffer (arr can be freed after this).
+        qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+        if qimg.isNull():
+            return ""
 
         max_w = 640
         if w > max_w:
@@ -401,11 +389,153 @@ def extract_thumbnail_b64(input_path: str, mode: str) -> str:
 
         qbuf = QBuffer()
         qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
-        # PySide6 stubs type ``format`` as bytes-like; pass a real QByteArray name.
-        qimg.save(qbuf, b"JPEG", 85)
-        return base64.b64encode(bytes(qbuf.data().data())).decode("ascii")
+        if not qimg.save(qbuf, "JPEG", 85):
+            log.warning("thumbnail JPEG encode failed for %s", input_path)
+            return ""
+        data = bytes(qbuf.data())
+        if not data:
+            return ""
+        return base64.b64encode(data).decode("ascii")
+    except (FileNotFoundError, NotADirectoryError, OSError) as e:
+        log.debug("thumbnail extract: path error for %s: %s", input_path, e)
+        return ""
     except Exception:
-        log.debug("thumbnail extract failed for %s", input_path, exc_info=True)
+        log.warning("thumbnail extract failed for %s", input_path, exc_info=True)
+        return ""
+
+
+def _thumbnail_rgb_from_exr(
+    input_path: str,
+    which: int,
+    *,
+    ocio_cfg: object | None = None,
+    src_space: str = "",
+) -> object | None:
+    """Return uint8 RGB for one EXR frame in slate authoring (sRGB-like) space.
+
+    Frame list is known from the sequence (no seeking): pick first/mid/last index.
+    """
+    import numpy as np
+    import OpenImageIO as oiio
+
+    from ..core.sequence import find_exr_sequence_info
+    from .preferences import pick_thumbnail_index
+
+    try:
+        _paths, _name, frames, _pad, seq = find_exr_sequence_info(input_path)
+    except (RuntimeError, OSError, ValueError) as e:
+        log.debug("thumbnail EXR resolve failed for %s: %s", input_path, e)
+        return None
+    if not frames:
+        return None
+    ordered = sorted(frames)
+    idx = pick_thumbnail_index(len(ordered), which)
+    frame_no = ordered[idx]
+    frame_path = seq.frame(frame_no)
+
+    img_buf = oiio.ImageBuf(frame_path)
+    if img_buf.has_error:
+        return None
+    spec = img_buf.spec()
+    if spec.full_width > 0 and spec.full_height > 0:
+        dx, dy = spec.full_x, spec.full_y
+        dw, dh = spec.full_width, spec.full_height
+    else:
+        dx, dy = 0, 0
+        dw, dh = spec.width, spec.height
+    roi = oiio.ROI(dx, dx + dw, dy, dy + dh, 0, 1, 0, min(spec.nchannels, 3))
+    pixels = np.ascontiguousarray(img_buf.get_pixels(oiio.FLOAT, roi), dtype=np.float32)
+    if pixels is None or pixels.size == 0:
+        return None
+    rgb = (
+        pixels[..., :3]
+        if pixels.ndim == 3 and pixels.shape[2] >= 3
+        else np.repeat(pixels.reshape(pixels.shape[0], pixels.shape[1], 1), 3, axis=2)
+    )
+    rgb = np.ascontiguousarray(rgb, dtype=np.float32)
+
+    # Prefer OCIO src → slate authoring (display-encoded sRGB), matching how
+    # the slate itself is colour-managed at convert time.
+    display_rgb = _exr_rgb_to_slate_authoring(rgb, ocio_cfg, src_space, frame_path)
+    return np.clip(display_rgb * 255.0, 0, 255).astype(np.uint8)
+
+
+def _exr_rgb_to_slate_authoring(
+    rgb: np.ndarray,
+    ocio_cfg: object | None,
+    src_space: str,
+    frame_path: str,
+) -> np.ndarray:
+    """Convert scene-linear EXR RGB to display-encoded slate authoring space."""
+    import numpy as np
+
+    arr = np.ascontiguousarray(rgb, dtype=np.float32)
+
+    if ocio_cfg is not None:
+        try:
+            import PyOpenColorIO as OCIO
+
+            from ..core.ocio_utils import (
+                find_equivalent_space,
+                get_overlay_authoring_space,
+                get_working_space,
+                make_cpu_processor,
+            )
+
+            # Resolve source: explicit UI space, EXR metadata, then working.
+            src = (src_space or "").strip()
+            if not src:
+                try:
+                    meta = oiio_colorspace_attr(frame_path)
+                    if meta:
+                        src = find_equivalent_space(ocio_cfg, meta) or meta
+                except Exception:
+                    pass
+            if not src:
+                try:
+                    src = get_working_space(ocio_cfg)
+                except Exception:
+                    src = ""
+            if src:
+                # Map aliases so "ACEScg" etc. resolve on ACES Studio configs.
+                resolved = find_equivalent_space(ocio_cfg, src) or src
+                auth = get_overlay_authoring_space(ocio_cfg)
+                if auth and resolved:
+                    cpu = make_cpu_processor(ocio_cfg, resolved, auth)
+                    h, w = arr.shape[:2]
+                    buf = np.ascontiguousarray(arr.copy(), dtype=np.float32)
+                    cpu.apply(OCIO.PackedImageDesc(buf, w, h, 3))
+                    return np.clip(buf, 0.0, 1.0)
+        except Exception:
+            log.warning(
+                "OCIO thumbnail transform failed; using transfer fallback",
+                exc_info=True,
+            )
+
+    # Fallback: assume linear light, apply Rec.709/sRGB OETF (display-ish).
+    lin = np.clip(arr, 0.0, None)
+    srgb = np.where(
+        lin <= 0.0031308,
+        lin * 12.92,
+        1.055 * np.power(lin, 1.0 / 2.4) - 0.055,
+    )
+    return np.clip(srgb, 0.0, 1.0)
+
+
+def oiio_colorspace_attr(path: str) -> str:
+    """Return ``oiio:ColorSpace`` from an EXR if present."""
+    try:
+        import OpenImageIO as oiio
+
+        inp = oiio.ImageInput.open(path)
+        if inp is None:
+            return ""
+        try:
+            cs = inp.spec().getattribute("oiio:ColorSpace")
+            return str(cs) if cs else ""
+        finally:
+            inp.close()
+    except Exception:
         return ""
 
 
@@ -1344,9 +1474,25 @@ class SlateDialog(QDialog):
         self._form = SlateFormPanel(model, input_path=input_path, embed_overlays=False)
 
         if input_path:
-            thumb = extract_thumbnail_b64(input_path, mode)
+            from .preferences import thumbnail_frame_choice
+
+            which = thumbnail_frame_choice(self._model.settings)
+            thumb = extract_thumbnail_b64(
+                input_path,
+                mode,
+                which=which,
+                ocio_cfg=self._ocio_cfg,
+                src_space=self._src_colorspace or "",
+            )
             if thumb:
                 self._form.set_thumbnail_b64(thumb)
+            else:
+                log.warning(
+                    "No slate thumbnail extracted from %s (mode=%s, which=%s)",
+                    input_path,
+                    mode,
+                    which,
+                )
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)

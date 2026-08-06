@@ -15,6 +15,31 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.5.3] — 2026-08-06
+
+### Added
+
+- **CLI / GUI launch docs:** richer `-h` epilog; [docs/cli.md](docs/cli.md);
+  README links.
+- **GUI launch flags:** `--open`, `--gui-ocio`, `--mode` pre-fill media and OCIO
+  when starting the app (no convert subcommand).
+- **Nuke integration:** [integrations/nuke/](integrations/nuke/) menu script to
+  open the selected Read with session OCIO; [docs/nuke.md](docs/nuke.md).
+- **Slate thumbnail frame** preference (first / middle / last), integer in
+  QSettings, editable under File → Preferences.
+
+### Fixed
+
+- **Slate thumbnail extraction (EXR → video only):** pick first/mid/last from the
+  known EXR frame list (no video seek). OCIO ``src → slate authoring (sRGB)`` when
+  a config is available; QImage buffer ownership / JPEG encode fixed. Video → EXR
+  never uses slate/burn-in/watermark.
+- **GUI `--open` / Nuke launch:** no longer overwritten by deferred QSettings
+  input restore.
+- **CLI `--workers`:** works before or after the subcommand.
+
+---
+
 ## [0.5.2] — 2026-08-06
 
 ### Fixed
@@ -216,7 +241,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/derek-rein/exr-converter/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/derek-rein/exr-converter/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/derek-rein/exr-converter/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/derek-rein/exr-converter/compare/v0.4.0...v0.5.0

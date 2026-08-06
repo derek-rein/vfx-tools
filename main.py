@@ -33,6 +33,12 @@ def main() -> int:
     app.setWindowIcon(QIcon(":/icon.png"))
 
     win = MainWindow()
+    # Nuke / shell launch: pre-fill media + OCIO before the event loop runs.
+    open_path = getattr(args, "open", None)
+    gui_ocio = getattr(args, "gui_ocio", None)
+    mode = getattr(args, "mode", None)
+    if open_path or gui_ocio or (mode and mode != "auto"):
+        win.apply_startup(open_path=open_path, ocio_path=gui_ocio, mode=mode)
     win.show()
 
     if args.smoke_test:

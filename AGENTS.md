@@ -308,8 +308,11 @@ Branch protection on `main` should require `ci-ok`.
 | [AGENTS.md](./AGENTS.md) | This file — agent/process context, release & deploy |
 | [CHANGELOG.md](./CHANGELOG.md) | User-facing history (**must update**) |
 | [README.md](./README.md) | Product overview, install, CLI |
+| [docs/cli.md](./docs/cli.md) | CLI + GUI launch flags |
+| [docs/nuke.md](./docs/nuke.md) | Nuke menu integration |
 | [docs/plan-12bit-prores-oxideav.md](./docs/plan-12bit-prores-oxideav.md) | Future 12-bit ProRes plan (not implemented) |
 | [docs/releasing.md](./docs/releasing.md) | Stub pointing here (release process lives in AGENTS.md) |
+| [integrations/nuke/](./integrations/nuke/) | Nuke `menu.py` + helpers |
 
 ## What not to do
 

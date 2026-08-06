@@ -298,6 +298,52 @@ class MainWindow(QMainWindow):
         if geom:
             self.restoreGeometry(geom)
 
+    def apply_startup(
+        self,
+        open_path: str | None = None,
+        ocio_path: str | None = None,
+        mode: str | None = None,
+    ) -> None:
+        """Apply GUI launch options (CLI ``--open`` / ``--gui-ocio`` / ``--mode``).
+
+        Used by the bare ``main.py`` entry and by the Nuke menu integration.
+        """
+        if ocio_path:
+            ok = self._ocio_panel.set_custom_config_file(ocio_path)
+            if ok:
+                self._append_log(f"OCIO config (launch): {ocio_path}")
+                self._reload_ocio()
+            else:
+                self._append_log(f"OCIO config not found (launch ignored): {ocio_path}")
+
+        open_path = (open_path or "").strip()
+        mode_norm = (mode or "auto").strip().lower()
+        if mode_norm in ("video2exr", "v2e", "video"):
+            self._tabs.setCurrentIndex(0)
+        elif mode_norm in ("exr2video", "e2v", "exr"):
+            self._tabs.setCurrentIndex(1)
+        elif open_path:
+            # Prefer extension over filesystem existence (Nuke may pass paths
+            # that are not yet fully visible, or sequence tokens).
+            p = Path(open_path.split()[0] if open_path else "")
+            name = p.name.lower()
+            if p.suffix.lower() in self._VIDEO_EXTS or any(
+                name.endswith(ext) for ext in self._VIDEO_EXTS
+            ):
+                self._tabs.setCurrentIndex(0)
+            else:
+                # Directory, EXR frame, or sequence pattern → EXR tab
+                self._tabs.setCurrentIndex(1)
+
+        if open_path:
+            # Prevent deferred QSettings restore from overwriting --open / Nuke.
+            self._v2e_tab.suppress_saved_input_restore()
+            self._e2v_tab.suppress_saved_input_restore()
+            tab = self._active_tab()
+            # Async probe so large MXFs / sequences don't freeze launch.
+            tab.set_input_async(open_path)
+            self._append_log(f"Opened (launch): {open_path}")
+
     # -- Menu bar --
 
     def _build_menu_bar(self) -> None:
@@ -715,19 +761,43 @@ class MainWindow(QMainWindow):
             if not frame_set:
                 frame_set = None
 
-        # -- Slate (raw sRGB float32 RGBA -- convert.py does the OCIO transit) --
+        # -- Slate / burn-in / watermark: EXR → video only (never video → EXR) --
         slate_np = None
-        if tab.slate_enabled():
+        overlay_np = None
+        slate_overlay_np = None
+        overlay_provider = None
+        if mode == "exr2video" and tab.slate_enabled():
             slate_data = tab.get_slate_data()
             if slate_data is not None:
                 from ..render.slate import render_slate_frame
 
                 sw, sh = self._detect_slate_resolution(mode, inp)
                 thumb_b64 = tab.get_slate_thumbnail_b64()
+                # If the slate dialog was never opened, still extract a thumb
+                # from the known EXR frame list (first / mid / last).
+                if not thumb_b64 and inp:
+                    try:
+                        from .preferences import thumbnail_frame_choice
+                        from .slate_widgets import extract_thumbnail_b64
+
+                        thumb_b64 = extract_thumbnail_b64(
+                            inp,
+                            "exr2video",
+                            which=thumbnail_frame_choice(self._settings),
+                            ocio_cfg=self._ocio_cfg,
+                            src_space=tab.src_btn.current_space() or "",
+                        )
+                        if thumb_b64 and tab._slate_model is not None:
+                            tab._slate_model.set_thumbnail_b64(thumb_b64)
+                    except Exception as e:
+                        self._append_log(f"Slate thumbnail extract skipped: {e}")
                 self._append_log(f"Rendering slate frame ({sw}\u00d7{sh})\u2026")
                 try:
                     slate_np = render_slate_frame(slate_data, sw, sh, thumbnail_b64=thumb_b64)
-                    self._append_log("Slate frame rendered successfully")
+                    if thumb_b64:
+                        self._append_log("Slate frame rendered (with thumbnail)")
+                    else:
+                        self._append_log("Slate frame rendered (no thumbnail)")
                 except Exception as e:
                     QMessageBox.warning(self, "Slate Error", f"Failed to render slate: {e}")
                     return
@@ -739,27 +809,15 @@ class MainWindow(QMainWindow):
         self._progress.setValue(0)
         self._progress.setFormat("%p%")
 
-        # -- Burn-in + watermark overlays (EXR→Video only) --
         # Burn-in and watermark are stamped on shot frames only; the slate is
-        # left clean (matching the live preview).  The overlay stays as an sRGB
-        # uint8 RGBA buffer — convert.py linearises it once and keeps the linear
-        # copy for compositing in working space.
-        overlay_np = None
-        slate_overlay_np = None
-        overlay_provider = None
+        # left clean (matching the live preview). Overlay is sRGB uint8 RGBA —
+        # convert.py linearises once and composites in working space.
         if mode == "exr2video":
             overlay_np, slate_overlay_np, overlay_provider = self._build_overlays(
                 tab, inp, frame_range_str, frame_set
             )
 
         if mode == "video2exr":
-            # v2e still pre-transforms the slate to dst space (no overlays
-            # here) — slate becomes one EXR frame on disk in dst colorspace.
-            v2e_slate = slate_np
-            if v2e_slate is not None:
-                from ..render.slate import SLATE_COLORSPACE
-
-                v2e_slate = self._ocio_transform_slate(v2e_slate, SLATE_COLORSPACE, dst)
             # ocio_cfg intentionally omitted — worker rebuilds from config_source/path.
             kwargs = dict(
                 video_path=inp,
@@ -773,7 +831,6 @@ class MainWindow(QMainWindow):
                 padding=tab.get_padding(),
                 start_frame=tab.get_start_frame(),
                 frame_set=frame_set,
-                slate_frame=v2e_slate,
                 exr_opts=tab.get_exr_opts() or None,
             )
         else:
