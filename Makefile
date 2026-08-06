@@ -42,9 +42,11 @@ help:
 	@echo "  make clean                             # remove build artifacts"
 	@echo ""
 	@echo "  make bump PART=patch|minor|major       # bump version (no git)"
-	@echo "  make release PART=patch                # bump + commit + tag + push (Release workflow)"
+	@echo "  make release PART=patch|minor|major    # bump + commit + tag + push (Release workflow)"
 	@echo "  make release PUSH=0                    # bump + commit + tag only (push manually for CI)"
 	@echo ""
+	@echo "  Docs: docs/releasing.md  (process + gh CLI)"
+	@echo "        docs/plan-12bit-prores-oxideav.md"
 	@echo "Current tags: git tag -l 'v*' --sort=-v:refname | head"
 
 # ── Dependencies ─────────────────────────────────────────────────────────────

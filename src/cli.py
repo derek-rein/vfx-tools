@@ -283,11 +283,11 @@ def default_e2v_output_path(input_path: str, codec_key: str = DEFAULT_VIDEO_CODE
     spec = _by_key(codec_key)
     if spec is not None:
         # Keep container sensible for the codec family.
-        if codec_key in ("h264", "hevc", "hevc_8"):
+        if codec_key in ("h264", "hevc", "hevc_8", "hevc_12"):
             ext = ".mp4"
         elif str(codec_key).startswith("dnxhr"):
             ext = ".mxf"
-        elif codec_key == "ffv1":
+        elif codec_key in ("ffv1", "ffv1_12"):
             ext = ".mkv"
     return base.parent / f"{name}{ext}"
 
