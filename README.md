@@ -145,12 +145,10 @@ Tags use plain semver: `v1.2.3`. Pushing a tag runs [`.github/workflows/release.
 ```bash
 git checkout -b release/X.Y.Z
 # Roll CHANGELOG [Unreleased] → [X.Y.Z] first
-make release PART=minor PUSH=0   # bump + commit + local tag (main is PR-only)
+make release PART=minor PUSH=0   # bump + commit (+ optional local tag; main is PR-only)
 git push -u origin HEAD
 gh pr create --base main --title "release: X.Y.Z"
-# after merge:
-git checkout main && git pull
-git push origin vX.Y.Z           # triggers Release workflow (Nuitka + GitHub Release)
+# after merge: Auto-tag release pushes vX.Y.Z if missing → Release workflow runs
 gh run watch
 gh release list --limit 5
 ```

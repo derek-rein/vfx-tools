@@ -13,6 +13,12 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Auto-tag on merge:** after a version bump lands on `main`, a workflow creates
+  and pushes `vX.Y.Z` if the tag is missing so the Release pipeline runs without
+  a manual `git push origin v…` step (the gap that delayed the 0.5.0 publish).
+
 ---
 
 ## [0.5.0] — 2026-08-06
