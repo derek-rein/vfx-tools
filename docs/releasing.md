@@ -49,7 +49,50 @@ Tags are plain semver: **`v1.2.3`**. The tag is the source of truth for the publ
 
 ## Everyday release (recommended)
 
-From a clean tree with feature work already on `main` (or your release branch merged):
+`main` is **branch-protected**: direct pushes are rejected (required status checks + **changes must be made through a pull request**). Do **not** rely on `make release` with `PUSH=1` while on `main` — the version commit may land locally and the push will fail.
+
+### Protected `main` (current process)
+
+```bash
+# 0. Start from up-to-date main, clean tree
+git checkout main
+git pull origin main
+
+# 1. Feature work (optional separate commits), then cut a release branch
+git checkout -b release/X.Y.Z
+
+# 2. Bump + commit + local tag only (do not push main)
+make release PART=minor PUSH=0    # or patch / major
+# → commit "release: X.Y.Z" + local tag vX.Y.Z
+
+# 3. Push the branch and open a PR into main
+git push -u origin HEAD
+gh pr create --base main --title "release: X.Y.Z" --body "…"
+
+# 4. Wait for CI on the PR
+gh pr checks
+# or: gh run watch
+
+# 5. Merge when green (squash or merge per repo preference)
+gh pr merge --merge          # or --squash
+
+# 6. Update local main, ensure tag points at the release commit on main
+git checkout main
+git pull origin main
+# If the tag still points at the pre-merge commit SHA, move it only if
+# that commit is an ancestor of main (typical for merge commits):
+git tag -d vX.Y.Z 2>/dev/null || true
+git tag vX.Y.Z
+git push origin vX.Y.Z       # triggers Release workflow (Nuitka + GitHub Release)
+
+# 7. Watch publish
+gh run watch
+gh release view vX.Y.Z
+```
+
+Historical example: `release/0.3.0` → PR #1; `release/0.4.0` → PR #2.
+
+### If `main` were unprotected (not our case)
 
 ```bash
 # Optional: see current version
@@ -66,18 +109,18 @@ make release PART=minor          # 0.3.0 → 0.4.0
 make release PART=major          # 0.3.0 → 1.0.0
 ```
 
-Defaults:
+### Make variables
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `PART` | `patch` | Which semver segment to increment |
-| `PUSH` | `1` | Push branch + tag to `origin` |
+| `PUSH` | `1` | Push branch + tag to `origin` — use **`PUSH=0`** under branch protection |
 
 Local-only tag (no push — push yourself when ready):
 
 ```bash
 make release PART=patch PUSH=0
-git push origin HEAD
+git push origin HEAD            # only works if the branch is not protected
 git push origin vX.Y.Z
 ```
 
@@ -191,13 +234,15 @@ Nuitka is also available locally: `make bundle` (does **not** publish a GitHub R
 
 ---
 
-## Checklist before `make release`
+## Checklist before shipping
 
-- [ ] Feature commits are done and tested (`make test` or rely on CI after push)  
+- [ ] Feature commits are done and tested (`make test` or rely on PR CI)  
+- [ ] On a **`release/X.Y.Z` branch** (not a direct push to protected `main`)  
 - [ ] Working tree has no *other* unstaged changes you still need (release only commits version files)  
 - [ ] `PART` chosen correctly (patch / minor / major)  
-- [ ] You intend to trigger a full multi-OS Nuitka build (time + minutes on Actions)  
-- [ ] After push: `gh run watch` until green; confirm `gh release view vX.Y.Z`  
+- [ ] `make release … PUSH=0`, then `gh pr create`  
+- [ ] PR CI green → merge → `git push origin vX.Y.Z`  
+- [ ] `gh run watch` until Release workflow green; confirm `gh release view vX.Y.Z`  
 
 ---
 
@@ -205,11 +250,13 @@ Nuitka is also available locally: `make bundle` (does **not** publish a GitHub R
 
 | Symptom | What to do |
 |---------|------------|
+| `GH013` / *Changes must be made through a pull request* | Expected on protected `main`. Use `release/X.Y.Z` + PR; `make release PUSH=0` |
+| *5 of 5 required status checks are expected* | Push was blocked before CI could run on `main`. Ship via PR so checks run on the PR head |
 | `No changes to commit` from `make release` | Version files already match the bump target, or bump failed; run `python3 scripts/bump_app_version.py show` and check `git status` |
-| Tag already exists | Bump again, or delete local tag only if it was never pushed (`git tag -d vX.Y.Z`) — **never** force-push tags that already built a public release without a deliberate process |
-| Gate red | Fix tests/lint on `main`, push a fix commit, then either retag carefully or cut `PART=patch` again — prefer a new patch version over rewriting history |
+| Tag already exists locally but not on remote | After merge: retag the commit on `main` if needed, then `git push origin vX.Y.Z`. **Never** force-push tags that already built a public release without a deliberate process |
+| Gate red on Release workflow | Fix on a follow-up commit / patch version; prefer a new patch over rewriting a published tag |
 | Wrong version in the GUI binary | Confirm tag is `vX.Y.Z` and the workflow’s “Inject version from tag” step ran; `APP_VERSION` in the tagged commit should match |
-| Need a release without pushing yet | `make release PUSH=0`, then push branch + tag when ready |
+| Need a release without pushing yet | `make release PUSH=0`, then PR + push tag when ready |
 
 ---
 

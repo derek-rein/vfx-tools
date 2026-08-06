@@ -137,14 +137,17 @@ All static assets live under `resources/`: icons in `resources/icons/` (`icon.ic
 
 Tags use plain semver: `v1.2.3`. Pushing a tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml) and publishes a GitHub Release with Linux AppImage, macOS DMGs (ARM64 + Intel), and a Windows installer.
 
-**Full process** (Makefile, `gh` CLI, checklist): see **[docs/releasing.md](docs/releasing.md)**.
+**Full process** (protected `main`, PR, Makefile, `gh` CLI): see **[docs/releasing.md](docs/releasing.md)**.
 
 ```bash
-make help
-make release PART=patch        # bump + commit + tag + push (triggers Release workflow)
-make release PART=minor        # new features / codecs
-make release PUSH=0            # local only; push branch + tag yourself when ready
-gh run watch                   # follow the Release workflow
+git checkout -b release/X.Y.Z
+make release PART=minor PUSH=0   # bump + commit + local tag (main is PR-only)
+git push -u origin HEAD
+gh pr create --base main --title "release: X.Y.Z"
+# after merge:
+git checkout main && git pull
+git push origin vX.Y.Z           # triggers Release workflow (Nuitka + GitHub Release)
+gh run watch
 gh release list --limit 5
 ```
 
