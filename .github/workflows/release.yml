@@ -348,6 +348,16 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          # GitHub's macos-*-intel images sometimes ship third-party taps
+          # (e.g. aws/tap) that Homebrew now refuses without explicit trust.
+          # That prints a scary warning but doesn't affect homebrew-core
+          # formulae — still, drop untrusted taps so logs stay clean.
+          for tap in $(brew tap 2>/dev/null); do
+            case "$tap" in
+              homebrew/*|Homebrew/*) ;;
+              *) brew untap "$tap" 2>/dev/null || true ;;
+            esac
+          done
           brew install create-dmg
           create-dmg \
             --volname "EXR Converter" \

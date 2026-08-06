@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 APP_ORG = "VFXTools"
 APP_NAME = "EXRConverter"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 GITHUB_REPO = "derek-rein/exr-converter"
 
@@ -140,26 +140,33 @@ def _dnxhr(
 
 # Display names include bit depth + chroma. Pipeline: rgb48le → reformat(pix_fmt).
 #
-# FFmpeg notes:
-# - prores_ks profiles 0–3 → 10-bit 4:2:2; 4–5 (4444/XQ) → 12-bit 4:4:4:4 in practice.
+# FFmpeg bit-depth truth (verified with solid-patch mid-bin roundtrips):
+# - prores_ks: only accepts yuv422p10le / yuv444p10le / yuva444p10le.
+#   Profiles 0–5 all encode at 10-bit. 4444/XQ may *probe* as yuva444p12le
+#   after decode (FFmpeg presentation), but +32 mid-bin vs 10-bit lattice
+#   collapses to delta 0 — true encode precision is 10-bit.
+# - prores_videotoolbox 422: 10-bit (p210le). 4444/XQ with ayuv64le preserve
+#   mid-bin steps beyond 10-bit (Apple HW ~12-bit class).
 # - DNxHR LB/SQ/HQ → 8-bit 4:2:2; HQX → 10-bit 4:2:2; 444 → 10-bit 4:4:4.
-# - cfhd: yuv422p10le / gbrp12le.
-# - libx265: 8/10-bit depending on pix_fmt.
-# - prores_videotoolbox: Apple hardware encoder, Darwin only.
+# - cfhd: yuv422p10le (10) / gbrp12le (true 12).
+# - libx265: 8 / 10 / 12 via pix_fmt (Main / Main 10 / Main 12).
+# - ffv1: lossless 10 or 12 via pix_fmt.
+# - libx264: max 10-bit (High 10); no 12-bit.
 VIDEO_CODECS: list[VideoCodecSpec] = [
-    # ── ProRes (software, cross-platform) ─────────────────────────────────
+    # ── ProRes (software, cross-platform) — all 10-bit encode ─────────────
     _prores_ks("prores_proxy", "Apple ProRes 422 Proxy", "0", "yuv422p10le", 10, "4:2:2"),
     _prores_ks("prores_lt", "Apple ProRes 422 LT", "1", "yuv422p10le", 10, "4:2:2"),
     _prores_ks("prores_422", "Apple ProRes 422", "2", "yuv422p10le", 10, "4:2:2"),
     # Legacy key ``prores`` = HQ (presets / CLI compatibility).
     _prores_ks("prores", "Apple ProRes 422 HQ", "3", "yuv422p10le", 10, "4:2:2"),
-    _prores_ks("prores_4444", "Apple ProRes 4444", "4", "yuva444p10le", 12, "4:4:4:4"),
-    _prores_ks("prores_xq", "Apple ProRes 4444 XQ", "5", "yuva444p10le", 12, "4:4:4:4"),
+    _prores_ks("prores_4444", "Apple ProRes 4444", "4", "yuva444p10le", 10, "4:4:4:4"),
+    _prores_ks("prores_xq", "Apple ProRes 4444 XQ", "5", "yuva444p10le", 10, "4:4:4:4"),
     # ── ProRes VideoToolbox (macOS only) ──────────────────────────────────
     _prores_vt("prores_vt_proxy", "Apple ProRes 422 Proxy", "p210le", 10, "4:2:2"),
     _prores_vt("prores_vt_lt", "Apple ProRes 422 LT", "p210le", 10, "4:2:2"),
     _prores_vt("prores_vt_422", "Apple ProRes 422", "p210le", 10, "4:2:2"),
     _prores_vt("prores_vt_hq", "Apple ProRes 422 HQ", "p210le", 10, "4:2:2"),
+    # VT 4444/XQ: ayuv64le intermediate; HW keeps ~12-bit mid-bin (unlike prores_ks).
     _prores_vt("prores_vt_4444", "Apple ProRes 4444", "ayuv64le", 12, "4:4:4:4"),
     _prores_vt("prores_vt_xq", "Apple ProRes 4444 XQ", "ayuv64le", 12, "4:4:4:4"),
     # ── CineForm ──────────────────────────────────────────────────────────
@@ -203,6 +210,14 @@ VIDEO_CODECS: list[VideoCodecSpec] = [
         "4:2:0",
     ),
     VideoCodecSpec(
+        "hevc_12",
+        "H.265 / HEVC · 12-bit 4:2:0",
+        "libx265",
+        "yuv420p12le",
+        12,
+        "4:2:0",
+    ),
+    VideoCodecSpec(
         "hevc_8",
         "H.265 / HEVC · 8-bit 4:2:0",
         "libx265",
@@ -218,7 +233,20 @@ VIDEO_CODECS: list[VideoCodecSpec] = [
         10,
         "4:4:4",
     ),
+    VideoCodecSpec(
+        "ffv1_12",
+        "FFV1 (lossless) · 12-bit 4:4:4",
+        "ffv1",
+        "yuv444p12le",
+        12,
+        "4:4:4",
+    ),
 ]
+
+# Codec key families used by GUI/CLI option routing.
+HEVC_CODEC_KEYS: frozenset[str] = frozenset({"hevc", "hevc_8", "hevc_12"})
+FFV1_CODEC_KEYS: frozenset[str] = frozenset({"ffv1", "ffv1_12"})
+X26X_CODEC_KEYS: frozenset[str] = frozenset({"h264"}) | HEVC_CODEC_KEYS
 DEFAULT_VIDEO_CODEC = "prores"
 
 # prores_ks / prores_videotoolbox profile values keyed by our preset *key*.

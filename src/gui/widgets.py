@@ -1795,7 +1795,14 @@ class VideoBrowserDialog(QDialog):
 
 _EXR_HAS_SETTINGS = {"dwaa", "dwab", "zip", "zips"}
 # Profile is selected via the codec dropdown itself for ProRes / DNxHR ladders.
-_CODEC_HAS_SETTINGS = {"h264", "hevc", "hevc_8", "cineform", "cineform_rgb"}
+_CODEC_HAS_SETTINGS = {
+    "h264",
+    "hevc",
+    "hevc_8",
+    "hevc_12",
+    "cineform",
+    "cineform_rgb",
+}
 
 _EXR_COMPRESSION_HELP: dict[str, str] = {
     "none": "No compression. Fastest write, largest files.",
@@ -1917,26 +1924,40 @@ class ExrCompressionSettingsDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 _CODEC_HELP: dict[str, str] = {
-    "prores_proxy": "ProRes 422 Proxy — lightest ProRes; 10-bit 4:2:2 offline/proxy.",
-    "prores_lt": "ProRes 422 LT — lighter intermediate; 10-bit 4:2:2.",
-    "prores_422": "ProRes 422 (Standard) — balanced intermediate; 10-bit 4:2:2.",
+    "prores_proxy": "ProRes 422 Proxy — lightest ProRes; 10-bit 4:2:2 offline/proxy (prores_ks).",
+    "prores_lt": "ProRes 422 LT — lighter intermediate; 10-bit 4:2:2 (prores_ks).",
+    "prores_422": "ProRes 422 (Standard) — balanced intermediate; 10-bit 4:2:2 (prores_ks).",
     "prores": "ProRes 422 HQ — default finishing intermediate; 10-bit 4:2:2 (prores_ks).",
-    "prores_4444": "ProRes 4444 — 12-bit 4:4:4:4 with alpha; compositing/delivery.",
-    "prores_xq": "ProRes 4444 XQ — highest ProRes tier; 12-bit 4:4:4:4 with alpha.",
+    "prores_4444": (
+        "ProRes 4444 — 4:4:4:4 with alpha (prores_ks). FFmpeg software encodes at "
+        "10-bit only (yuva444p10le); Apple's format can be 12-bit, but prores_ks "
+        "does not. Prefer VideoToolbox 4444 on macOS for ~12-bit precision."
+    ),
+    "prores_xq": (
+        "ProRes 4444 XQ — highest ProRes tier, 4:4:4:4 with alpha (prores_ks). "
+        "Software encode is still 10-bit only; use prores_vt_xq on macOS for "
+        "true 12-bit-class precision."
+    ),
     "prores_vt_proxy": (
         "Hardware ProRes Proxy via Apple VideoToolbox. macOS only; faster, "
-        "quality/controls differ slightly from software prores_ks."
+        "quality/controls differ slightly from software prores_ks. 10-bit 4:2:2."
     ),
-    "prores_vt_lt": "Hardware ProRes LT via VideoToolbox (macOS only).",
-    "prores_vt_422": "Hardware ProRes 422 via VideoToolbox (macOS only).",
-    "prores_vt_hq": "Hardware ProRes HQ via VideoToolbox (macOS only).",
-    "prores_vt_4444": "Hardware ProRes 4444 via VideoToolbox (macOS only).",
-    "prores_vt_xq": "Hardware ProRes 4444 XQ via VideoToolbox (macOS only).",
+    "prores_vt_lt": "Hardware ProRes LT via VideoToolbox (macOS only); 10-bit 4:2:2.",
+    "prores_vt_422": "Hardware ProRes 422 via VideoToolbox (macOS only); 10-bit 4:2:2.",
+    "prores_vt_hq": "Hardware ProRes HQ via VideoToolbox (macOS only); 10-bit 4:2:2.",
+    "prores_vt_4444": (
+        "Hardware ProRes 4444 via VideoToolbox (macOS only). ~12-bit class with "
+        "ayuv64le intermediate — better precision than software prores_ks 4444."
+    ),
+    "prores_vt_xq": (
+        "Hardware ProRes 4444 XQ via VideoToolbox (macOS only). ~12-bit class "
+        "precision; preferred over software XQ when bit depth matters."
+    ),
     "cineform": (
         "GoPro CineForm (cfhd) — 10-bit 4:2:2 wavelet intermediate. "
         "Quality ladder film3+…low in settings."
     ),
-    "cineform_rgb": ("GoPro CineForm RGB — 12-bit planar RGB (gbrp12le) for RGB pipelines."),
+    "cineform_rgb": ("GoPro CineForm RGB — true 12-bit planar RGB (gbrp12le) for RGB pipelines."),
     "dnxhr_lb": "DNxHR LB — lightest Avid/Resolve profile; 8-bit 4:2:2.",
     "dnxhr_sq": "DNxHR SQ — standard quality; 8-bit 4:2:2.",
     "dnxhr_hq": "DNxHR HQ — high quality intermediate; 8-bit 4:2:2 (not 10-bit).",
@@ -1944,11 +1965,19 @@ _CODEC_HELP: dict[str, str] = {
     "dnxhr_444": "DNxHR 444 — 10-bit 4:4:4 for highest chroma fidelity in DNx family.",
     "h264": ("H.264 / AVC — 8-bit 4:2:0 delivery/review. Not a grading intermediate."),
     "hevc": (
-        "H.265 / HEVC — 10-bit 4:2:0 delivery (libx265). Smaller than ProRes; "
+        "H.265 / HEVC — 10-bit 4:2:0 delivery (libx265 Main 10). Smaller than ProRes; "
         "not a scene-linear intermediate."
+    ),
+    "hevc_12": (
+        "H.265 / HEVC — true 12-bit 4:2:0 (libx265 Main 12, yuv420p12le). "
+        "Playback support is rarer than Main 10."
     ),
     "hevc_8": "H.265 / HEVC — 8-bit 4:2:0 delivery for maximum player compatibility.",
     "ffv1": "FFV1 — mathematically lossless 10-bit 4:4:4 archival intermediate.",
+    "ffv1_12": (
+        "FFV1 — mathematically lossless 12-bit 4:4:4 (yuv444p12le). "
+        "Best open archival option when you need true 12-bit YUV."
+    ),
 }
 
 
@@ -2007,10 +2036,10 @@ class VideoCodecSettingsDialog(QDialog):
         self._preset: QComboBox | None = None
         self._cineform_quality: QComboBox | None = None
         self._settings_prefix = "h264"
-        if codec_key in ("hevc", "hevc_8"):
+        if codec_key in ("hevc", "hevc_8", "hevc_12"):
             self._settings_prefix = "hevc"
 
-        if codec_key in ("h264", "hevc", "hevc_8"):
+        if codec_key in ("h264", "hevc", "hevc_8", "hevc_12"):
             crf_key = f"codec_opts/{self._settings_prefix}_crf"
             preset_key = f"codec_opts/{self._settings_prefix}_preset"
             saved_crf = int(settings.value(crf_key, 18))
@@ -2078,7 +2107,7 @@ class VideoCodecSettingsDialog(QDialog):
         return result
 
     def accept(self) -> None:
-        if self._codec_key in ("h264", "hevc", "hevc_8"):
+        if self._codec_key in ("h264", "hevc", "hevc_8", "hevc_12"):
             if self._crf_spin:
                 self._settings.setValue(
                     f"codec_opts/{self._settings_prefix}_crf",
@@ -2685,7 +2714,7 @@ class ConvertTab(QWidget):
             crf = str(int(self._settings.value("codec_opts/h264_crf", 18)))
             preset = self._settings.value("codec_opts/h264_preset", "medium")
             opts.update({"crf": crf, "preset": str(preset)})
-        elif key in ("hevc", "hevc_8"):
+        elif key in ("hevc", "hevc_8", "hevc_12"):
             crf = str(int(self._settings.value("codec_opts/hevc_crf", 18)))
             preset = self._settings.value("codec_opts/hevc_preset", "medium")
             opts.update({"crf": crf, "preset": str(preset)})
@@ -2877,10 +2906,14 @@ class ConvertTab(QWidget):
             codec_key = ""
             if self.codec_combo:
                 codec_key = self.codec_combo.currentData() or ""
-            if codec_key in ("prores", "prores_4444"):
+            if codec_key in ("prores", "prores_4444", "prores_xq") or str(codec_key).startswith(
+                "prores_"
+            ):
                 filt = "Video (*.mov)"
-            elif codec_key == "ffv1":
+            elif codec_key in ("ffv1", "ffv1_12"):
                 filt = "Video (*.mkv *.avi)"
+            elif codec_key in ("h264", "hevc", "hevc_8", "hevc_12"):
+                filt = "Video (*.mp4 *.mov *.mkv)"
             else:
                 filt = "Video (*.mp4 *.mov *.mkv)"
             path, _ = QFileDialog.getSaveFileName(
@@ -2908,9 +2941,9 @@ class ConvertTab(QWidget):
         codec_key = ""
         if self.codec_combo:
             codec_key = self.codec_combo.currentData() or ""
-        if codec_key == "ffv1":
+        if codec_key in ("ffv1", "ffv1_12"):
             return ".mkv"
-        if codec_key in ("h264", "hevc", "hevc_8"):
+        if codec_key in ("h264", "hevc", "hevc_8", "hevc_12"):
             return ".mp4"
         if str(codec_key).startswith("dnxhr"):
             return ".mxf"
@@ -2996,7 +3029,7 @@ class ConvertTab(QWidget):
         if self._mode != "exr2video":
             return
         codec_key = self.codec_combo.currentData() if self.codec_combo else ""
-        if codec_key == "ffv1":
+        if codec_key in ("ffv1", "ffv1_12"):
             candidates = ["scene_linear"]
         else:
             candidates = [

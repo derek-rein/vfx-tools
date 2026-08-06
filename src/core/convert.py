@@ -133,11 +133,11 @@ def _default_codec_opts(codec_key: str) -> dict[str, str]:
         return {"profile": DNXHR_PROFILE[codec_key]}
     if codec_key == "h264":
         return {"crf": "18", "preset": "medium"}
-    if codec_key in ("hevc", "hevc_8"):
+    if codec_key in ("hevc", "hevc_8", "hevc_12"):
         return {"crf": "18", "preset": "medium"}
     if codec_key in ("cineform", "cineform_rgb"):
         return {"quality": DEFAULT_CINEFORM_QUALITY}
-    if codec_key == "ffv1":
+    if codec_key in ("ffv1", "ffv1_12"):
         return {"slicecrc": "1"}
     return {}
 
