@@ -13,11 +13,22 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+---
+
+## [0.5.1] — 2026-08-06
+
 ### Fixed
 
-- **Auto-tag on merge:** after a version bump lands on `main`, a workflow creates
-  and pushes `vX.Y.Z` if the tag is missing so the Release pipeline runs without
-  a manual `git push origin v…` step (the gap that delayed the 0.5.0 publish).
+- **Packaged app OpenColorIO 2.4 bug:** Nuitka was linking `PyOpenColorIO` to
+  oiio-python’s vendored OCIO **2.4** (and could ship a 2.4-ABI extension), so the
+  bundled ACES Studio v4 config (profile **2.5**) failed at convert while the UI
+  could still look green. Release/local bundle now runs
+  `scripts/fix_bundle_ocio.py` (restore 2.5 `.so` + dylib), `ensure_ocio` before
+  Nuitka, and the smoke test loads the bundled config.
+- **Nuke OCIO configs** that the linked OpenColorIO cannot load stay visible in
+  the combo but are **greyed out** with a tooltip explaining why.
+- Bundled ACES Studio no longer silently falls back to a library config on version
+  mismatch (status matched convert failures).
 
 ---
 
@@ -190,7 +201,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/derek-rein/exr-converter/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/derek-rein/exr-converter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/derek-rein/exr-converter/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/derek-rein/exr-converter/compare/v0.2.2...v0.3.0

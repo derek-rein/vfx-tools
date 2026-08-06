@@ -130,21 +130,84 @@ def list_app_configs() -> list[tuple[str, str, bool]]:
     return []
 
 
-def list_nuke_configs() -> list[tuple[str, str, bool]]:
+def is_ocio_config_loadable(path: str | Path) -> tuple[bool, str]:
+    """Return ``(ok, error_message)`` for whether *path* loads with this OCIO.
+
+    Uses the process-linked :mod:`PyOpenColorIO` (normally 2.5+ after
+    ``make ensure-ocio``). Configs that need builtins or profile versions this
+    library lacks — e.g. some Foundry Nuke Studio ACES 2.0 configs when OCIO
+    was rewired to 2.4 — return ``(False, …)``.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return False, f"config file not found: {p}"
+    try:
+        OCIO.Config.CreateFromFile(str(p))
+        return True, ""
+    except Exception as e:
+        return False, str(e).strip() or type(e).__name__
+
+
+def list_nuke_configs() -> list[tuple[str, str, bool, bool, str]]:
     """Local Nuke install configs (path references only — never bundled).
 
-    Returns ``[(key, label, recommended), ...]``.  *recommended* is True for
-    the newest install's Studio ACES 2.0 config when present.
+    Returns ``[(key, label, recommended, compatible, detail), ...]``.
+
+    *recommended* is True for the first **compatible** Studio-kind entry
+    (newest Nuke × preferred kind). *compatible* is False when the current
+    OpenColorIO cannot load the file; the UI should still list those entries
+    greyed-out. *detail* is the load error (or empty when compatible).
     """
     configs = find_nuke_ocio_configs()
     if not configs:
         return []
-    # Mark the first entry (newest Nuke × preferred kind) as recommended.
-    out: list[tuple[str, str, bool]] = []
-    for i, cfg in enumerate(configs):
+
+    # Probe once per unique path (cheap enough for a handful of Nuke configs).
+    loadable: dict[str, tuple[bool, str]] = {}
+    for cfg in configs:
+        key = str(cfg.path)
+        if key not in loadable:
+            loadable[key] = is_ocio_config_loadable(cfg.path)
+
+    out: list[tuple[str, str, bool, bool, str]] = []
+    recommended_set = False
+    for cfg in configs:
+        ok, err = loadable[str(cfg.path)]
         label = f"{cfg.label}  (local)"
-        out.append((cfg.key, label, i == 0 and cfg.kind.startswith("studio")))
+        if not ok:
+            label = f"{cfg.label}  (incompatible)"
+        recommend = False
+        if ok and not recommended_set and cfg.kind.startswith("studio"):
+            recommend = True
+            recommended_set = True
+        out.append((cfg.key, label, recommend, ok, err))
     return out
+
+
+def _is_frozen_app() -> bool:
+    """True when running inside a Nuitka / frozen binary (not a source venv)."""
+    if getattr(sys, "frozen", False):
+        return True
+    # Nuitka sets __compiled__ on compiled modules.
+    return globals().get("__compiled__") is not None
+
+
+def _ocio_version_mismatch_hint(runtime: str) -> str:
+    if _is_frozen_app():
+        return (
+            f"Runtime OpenColorIO is {runtime}; this app build needs 2.5+ to load "
+            f"the bundled ACES Studio config.\n"
+            f"This is a packaging bug (OpenImageIO’s OCIO 2.4 dylib was linked "
+            f"instead of OpenColorIO 2.5). Install a newer EXR Converter release, "
+            f"or run from source with: make ensure-ocio && make run"
+        )
+    return (
+        f"Runtime OpenColorIO is {runtime}; the bundled ACES Studio config "
+        f"needs 2.5+.  oiio-python sometimes rewires PyOpenColorIO to its "
+        f"vendored 2.4 dylib.  Fix with:\n"
+        f"  make ensure-ocio\n"
+        f"  # or: uv pip install --reinstall-package opencolorio 'opencolorio>=2.5.1'"
+    )
 
 
 def _create_from_file(path: str | Path) -> OCIO.Config:
@@ -156,14 +219,7 @@ def _create_from_file(path: str | Path) -> OCIO.Config:
         msg = str(e)
         if "not able to load that config version" in msg or "Maximum minor version" in msg:
             runtime = OCIO.GetVersion()
-            raise RuntimeError(
-                f"{msg}\n\n"
-                f"Runtime OpenColorIO is {runtime}; the bundled ACES Studio config "
-                f"needs 2.5+.  oiio-python sometimes rewires PyOpenColorIO to its "
-                f"vendored 2.4 dylib.  Fix with:\n"
-                f"  make ensure-ocio\n"
-                f"  # or: uv pip install --reinstall-package opencolorio 'opencolorio>=2.5.1'"
-            ) from e
+            raise RuntimeError(f"{msg}\n\n{_ocio_version_mismatch_hint(runtime)}") from e
         raise
 
 
@@ -185,11 +241,11 @@ def resolve_ocio_config(source: str, builtin_name: str = "", file_path: str = ""
     if source == OCIO_SOURCE_BUNDLED or source == BUNDLED_ACES_STUDIO_KEY:
         p = get_bundled_aces_studio_path()
         if p and p.is_file():
-            try:
-                return _create_from_file(p)
-            except Exception:
-                pass  # version too old or corrupt; fall through to library fallback
-        # Graceful fallback to the best available library studio config (the "awesome cameras" one)
+            # Do not silently fall back on version errors — that left the UI green
+            # while convert failed with OCIO 2.4. Only fall back if the file is
+            # missing entirely.
+            return _create_from_file(p)
+        # File missing from the bundle: try library studio configs.
         for candidate in (
             "studio-config-v2.2.0_aces-v1.3_ocio-v2.4",
             "studio-config-v2.1.0_aces-v1.3_ocio-v2.3",
@@ -201,7 +257,8 @@ def resolve_ocio_config(source: str, builtin_name: str = "", file_path: str = ""
                 continue
         raise RuntimeError(
             "Bundled ACES Studio config not found (requires OCIO 2.5+ at runtime) "
-            "and no library fallback available. Run: make ensure-ocio"
+            "and no library fallback available. "
+            + ("Reinstall EXR Converter." if _is_frozen_app() else "Run: make ensure-ocio")
         )
     if is_nuke_source_key(source):
         p = resolve_nuke_config_path(source)

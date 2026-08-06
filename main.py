@@ -36,7 +36,27 @@ def main() -> int:
     win.show()
 
     if args.smoke_test:
+        # Fail the build if the frozen app linked OCIO 2.4 (Nuitka/oiio trap).
+        import PyOpenColorIO as _OCIO
         from PySide6.QtCore import QTimer
+
+        from src.core.ocio_utils import get_bundled_aces_studio_path
+
+        ver = _OCIO.GetVersion()
+        nums = tuple(int(x) for x in ver.split(".")[:3] if x.isdigit())
+        if nums < (2, 5, 0):
+            print(f"SMOKE FAIL: OpenColorIO {ver} (need >= 2.5.0)", file=sys.stderr)
+            return 2
+        cfg_path = get_bundled_aces_studio_path()
+        if cfg_path is not None and cfg_path.is_file():
+            try:
+                _OCIO.Config.CreateFromFile(str(cfg_path))
+            except Exception as e:
+                print(f"SMOKE FAIL: cannot load bundled OCIO config: {e}", file=sys.stderr)
+                return 3
+            print(f"smoke: OpenColorIO {ver} + bundled config OK")
+        else:
+            print(f"smoke: OpenColorIO {ver} OK (no bundled config path)")
 
         QTimer.singleShot(3000, app.quit)
 
