@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 APP_ORG = "VFXTools"
 APP_NAME = "EXRConverter"
-APP_VERSION = "0.5.4"
+APP_VERSION = "0.6.0"
 
 GITHUB_REPO = "derek-rein/exr-converter"
 
