@@ -1,0 +1,44 @@
+{{- /* Rewrite in-repo .md links to Hugo pretty URLs; leave http(s) and anchors alone. */ -}}
+{{- $u := .Destination -}}
+{{- $text := .Text -}}
+{{- $title := .Title -}}
+{{- if or (strings.HasPrefix $u "http://") (strings.HasPrefix $u "https://") (strings.HasPrefix $u "mailto:") (strings.HasPrefix $u "#") -}}
+  <a href="{{ $u | safeURL }}"{{ with $title }} title="{{ . }}"{{ end }}{{ if strings.HasPrefix $u "http" }} rel="noopener"{{ end }}>{{ $text }}</a>
+{{- else if or (strings.HasPrefix $u "../") (strings.Contains $u "AGENTS.md") (strings.Contains $u "CHANGELOG.md") (strings.Contains $u "README.md") (strings.Contains $u "integrations/") -}}
+  {{- /* Point sibling-repo paths at GitHub so they work on Pages. */ -}}
+  {{- $path := strings.TrimPrefix "../" $u -}}
+  {{- $path = strings.TrimPrefix "./" $path -}}
+  {{- /* Preserve #fragments on GitHub blob URLs */ -}}
+  {{- $frag := "" -}}
+  {{- if strings.Contains $path "#" -}}
+    {{- $parts := split $path "#" -}}
+    {{- $path = index $parts 0 -}}
+    {{- $frag = printf "#%s" (index $parts 1) -}}
+  {{- end -}}
+  {{- $gh := printf "%s/blob/main/%s%s" site.Params.github $path $frag -}}
+  <a href="{{ $gh | safeURL }}"{{ with $title }} title="{{ . }}"{{ end }} rel="noopener">{{ $text }}</a>
+{{- else -}}
+  {{- $lookup := strings.TrimPrefix "./" $u -}}
+  {{- $frag := "" -}}
+  {{- if strings.Contains $lookup "#" -}}
+    {{- $parts := split $lookup "#" -}}
+    {{- $lookup = index $parts 0 -}}
+    {{- $frag = printf "#%s" (index $parts 1) -}}
+  {{- end -}}
+  {{- if strings.HasSuffix $lookup ".md" -}}
+    {{- $lookup = strings.TrimSuffix ".md" $lookup -}}
+  {{- end -}}
+  {{- /* Resolve relative to the current section (docs/cli.md → docs/nuke). */ -}}
+  {{- $page := .Page.GetPage $lookup -}}
+  {{- if not $page -}}
+    {{- $page = site.GetPage $lookup -}}
+  {{- end -}}
+  {{- if not $page -}}
+    {{- $page = site.GetPage (printf "docs/%s" $lookup) -}}
+  {{- end -}}
+  {{- if $page -}}
+    <a href="{{ $page.RelPermalink }}{{ $frag }}"{{ with $title }} title="{{ . }}"{{ end }}>{{ $text }}</a>
+  {{- else -}}
+    <a href="{{ $u | safeURL }}"{{ with $title }} title="{{ . }}"{{ end }}>{{ $text }}</a>
+  {{- end -}}
+{{- end -}}

@@ -1,7 +1,14 @@
-# EXR Converter — CLI reference
+---
+title: CLI reference
+weight: 10
+description: video2exr, exr2video, and GUI launch flags
+---
 
 Command-line interface for **video ↔ OpenEXR** conversion with **OpenColorIO**.
 The same entry point launches the **GUI** when no convert subcommand is given.
+
+Slate, burn-in, watermark, and post-convert toggles are **GUI-only** — see
+[GUI](./gui.md).
 
 ```bash
 # From a source checkout
@@ -14,7 +21,7 @@ exr_converter --help
 "/Applications/EXR Converter.app/Contents/MacOS/exr_converter" --help
 ```
 
-Related: [Nuke integration](./nuke.md) · [README](../README.md)
+Related: [GUI](./gui.md) · [Nuke integration](./nuke.md) · [README](../README.md)
 
 ---
 
@@ -26,12 +33,12 @@ Related: [Nuke integration](./nuke.md) · [README](../README.md)
 | `main.py video2exr …` | CLI: video → OCIO → EXR sequence |
 | `main.py exr2video …` | CLI: EXR sequence → OCIO → video |
 
-Global flags (before the subcommand):
+Global flags (before the subcommand; convert flags may also appear after it):
 
 | Flag | Meaning |
 |------|---------|
-| `--workers N` | CLI convert parallelism (`0` = auto, `1` = serial). May appear **before** the subcommand or **after** it. |
-| `--smoke-test` | CI: launch GUI briefly and exit |
+| `--workers N` | CLI convert parallelism (`0` = auto, `1` = serial). May appear **before** the subcommand or **after** it (subcommand value wins). |
+| `--smoke-test` | CI: launch GUI briefly, verify OCIO/ssl, exit |
 | `--open PATH` | **GUI only:** open this media on launch |
 | `--gui-ocio PATH` | **GUI only:** load this OCIO config on launch |
 | `--mode auto\|video2exr\|exr2video` | **GUI only:** which tab (`auto` from `--open`) |
@@ -77,8 +84,8 @@ uv run python main.py video2exr -i plate.mov --frame-range 1-100 --workers 4
 | `-i` / `--input` | *(required)* | Input video file |
 | `-o` / `--output-dir` | `<input_dir>/<stem>/` | Directory for EXR frames |
 | `--ocio` | bundled / `$OCIO` | Config file path |
-| `--src` | auto | Source color space (probe + aliases) |
-| `--dst` | ACEScg / scene_linear | Destination scene space |
+| `--src` | auto | Source color space (probe + aliases; falls back toward Rec.709-ish) |
+| `--dst` | `ACEScg` / scene_linear | Destination scene space |
 | `--exr-compression` | `dwaa` | `none`, `rle`, `zip`, `zips`, `piz`, `pxr24`, `b44`, `b44a`, `dwaa`, `dwab` |
 | `--dwa-level` | library | DWA level for `dwaa`/`dwab` (`0` = lossless) |
 | `--zip-level` | library | ZIP level 1–9 for `zip`/`zips` |
@@ -87,9 +94,10 @@ uv run python main.py video2exr -i plate.mov --frame-range 1-100 --workers 4
 | `--start-frame` | `1001` | First output frame number |
 | `--frame-range` | all | Nuke-style, e.g. `1-100`, `1-50x2` |
 | `--deinterlace` | `auto` | `auto` / `on` / `off` |
+| `--workers` | global | Parallel workers (`0` = auto, `1` = serial); overrides global `--workers` |
 
 **Output naming:** `stem.####.exr` inside the output directory (pad width from
-`--padding`).
+`--padding`). Default directory is `<input_parent>/<stem>/` (same idea as the GUI).
 
 ---
 
@@ -104,34 +112,65 @@ uv run python main.py exr2video -i ./plate --codec h264 --crf 18
 
 | Option | Default | Notes |
 |--------|---------|--------|
-| `-i` / `--input` | *(required)* | Sequence **directory** or any **existing frame** from the sequence (not a literal `####` string) |
-| `-o` / `--output` | next to sequence | Video path; extension follows codec if omitted |
+| `-i` / `--input` | *(required)* | Sequence **directory** or any **existing frame** from the sequence (not a literal `####` path that does not exist on disk) |
+| `-o` / `--output` | next to sequence | Video path; default extension follows codec family (below) |
 | `--fps` | `24` | Frame rate |
 | `--ocio` | bundled / `$OCIO` | Config file path |
 | `--src` | EXR meta / scene_linear | Scene-linear source space |
-| `--dst` | display Rec.709 | Display / delivery space |
+| `--dst` | `Output - Rec.709` | Display / delivery space |
 | `--scale` | `1.0` | Output scale |
-| `--codec` | platform default | See codec ladder below |
+| `--codec` | `prores` | Codec key — see ladder below (default = ProRes 422 HQ, **10-bit** software) |
 | `--crf` | codec default | H.264 / HEVC quality |
-| `--preset` | codec default | x264 / x265 preset |
+| `--preset` | codec default | x264 / x265 preset name |
 | `--frame-range` | all | e.g. `1001-1100` |
+| `--workers` | global | Same meaning as `video2exr` |
+
+**Default output path** when `-o` is omitted: sibling of the sequence folder,
+named after the folder, with a codec-appropriate extension:
+
+| Codec family | Default extension |
+|--------------|-------------------|
+| ProRes / CineForm (default path) | `.mov` |
+| `h264`, `hevc`, `hevc_8`, `hevc_12` | `.mp4` |
+| `dnxhr_*` | `.mxf` |
+| `ffv1`, `ffv1_12` | `.mkv` |
 
 ### Codecs (honest bit depths)
 
-| Key pattern | Notes |
-|-------------|--------|
-| `prores_*` (software) | FFmpeg `prores_ks` — **10-bit** encode (not true 12-bit) |
-| `prores_vt_*` | **macOS only** VideoToolbox; 4444/XQ ~12-bit |
-| `dnxhr_*` | DNxHR LB…444 |
-| CineForm keys | 10 / 12-bit variants |
-| `h264`, `hevc`, `hevc_8`, `hevc_12` | Delivery; CRF/preset apply |
-| `ffv1`, `ffv1_12` | Archival FFV1 |
+Keys match `exr2video --codec`. Software ProRes is **always 10-bit** encode
+(`prores_ks`); do not treat 4444/XQ as true 12-bit on that path. VideoToolbox
+variants are **macOS only**.
 
-List available keys on your build:
+| Key | Encode (this app) | Notes |
+|-----|-------------------|--------|
+| `prores_proxy` | 10-bit 4:2:2 | Software ProRes Proxy |
+| `prores_lt` | 10-bit 4:2:2 | Software ProRes LT |
+| `prores_422` | 10-bit 4:2:2 | Software ProRes 422 |
+| `prores` | 10-bit 4:2:2 | **Default** — software ProRes 422 HQ |
+| `prores_4444` | 10-bit 4:4:4:4 | Software; not true 12-bit |
+| `prores_xq` | 10-bit 4:4:4:4 | Software; not true 12-bit |
+| `prores_vt_proxy` … `prores_vt_hq` | 10-bit 4:2:2 | VideoToolbox (macOS) |
+| `prores_vt_4444`, `prores_vt_xq` | ~12-bit 4:4:4:4 | VideoToolbox (macOS) |
+| `cineform` | 10-bit 4:2:2 | GoPro CineForm |
+| `cineform_rgb` | 12-bit RGB | CineForm RGB |
+| `dnxhr_lb` / `sq` / `hq` | 8-bit 4:2:2 | DNxHR |
+| `dnxhr_hqx` | 10-bit 4:2:2 | DNxHR HQX |
+| `dnxhr_444` | 10-bit 4:4:4 | DNxHR 444 |
+| `h264` | 8-bit 4:2:0 | CRF / preset apply |
+| `hevc` | 10-bit 4:2:0 | Default HEVC key |
+| `hevc_8` | 8-bit 4:2:0 | |
+| `hevc_12` | 12-bit 4:2:0 | |
+| `ffv1` | 10-bit 4:4:4 | Lossless |
+| `ffv1_12` | 12-bit 4:4:4 | Lossless |
+
+List keys on your build (filters macOS-only codecs on other OSes):
 
 ```bash
 uv run python main.py exr2video --help
 ```
+
+Research notes for true cross-platform 12-bit ProRes (not shipped):
+[plan-12bit-prores-oxideav.md](./plan-12bit-prores-oxideav.md).
 
 ---
 
@@ -159,5 +198,6 @@ uv run python main.py exr2video --help
 ## See also
 
 - `main.py --help`, `video2exr --help`, `exr2video --help` (always current)
+- [GUI](./gui.md)
 - [Nuke integration](./nuke.md)
-- [Releasing](../AGENTS.md#releasing-and-deployment)
+- [Releasing](./releasing.md)

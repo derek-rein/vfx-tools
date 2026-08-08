@@ -55,10 +55,27 @@ Common camera source names (when using the default ACES Studio config): "Apple L
 
 Enable the **Prepend slate** checkbox to add a 1-frame slate image before the converted output.
 
+## Documentation
+
+Guides live under [`docs/`](docs/) (Markdown source of truth). The public site is
+built with Hugo from [`site/`](site/) and published to GitHub Pages:
+
+**https://derek-rein.github.io/exr-converter/**
+
+| Guide | |
+|-------|--|
+| [CLI](docs/cli.md) | `video2exr` / `exr2video` / GUI launch flags |
+| [GUI](docs/gui.md) | Tabs, overlays, preferences, post-convert |
+| [Nuke](docs/nuke.md) | Menu: open selected Read + session OCIO |
+
+```bash
+make docs-serve   # local preview → http://127.0.0.1:1313/
+make docs-build   # write site/public/
+```
+
 ## CLI
 
-**Full reference:** [docs/cli.md](docs/cli.md)  
-**Nuke menu (open Read + session OCIO):** [docs/nuke.md](docs/nuke.md)
+**Full reference:** [docs/cli.md](docs/cli.md) · **GUI:** [docs/gui.md](docs/gui.md) · **Nuke:** [docs/nuke.md](docs/nuke.md)
 
 Use the `video2exr` or `exr2video` subcommand to convert, or run with **no**
 subcommand to open the GUI (optionally with `--open` / `--gui-ocio`).
@@ -183,3 +200,5 @@ Enable **branch protection** on `main` and require the `ci-ok` status check so m
 MIT — see [`LICENSE`](LICENSE).
 
 [derekvfx.ca](https://derekvfx.ca)
+
+![](https://umami.derekvfx.ca/p/c3Aaarpz7)

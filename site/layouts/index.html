@@ -1,0 +1,14 @@
+{{ define "main" }}
+<section class="hero">
+  <h1>{{ .Title }}</h1>
+  <div class="content">
+    {{ .Content }}
+  </div>
+  {{ with resources.GetMatch "screenshots/*" }}{{ end }}
+  <figure class="hero-shot">
+    <img src="{{ "screenshots/exr_converter_screenshot.png" | relURL }}"
+         alt="EXR Converter — EXR to Video tab"
+         width="1200" height="750" loading="eager">
+  </figure>
+</section>
+{{ end }}

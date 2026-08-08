@@ -8,7 +8,7 @@
 #   make release PUSH=0                   # … local only; push branch + tag yourself to trigger CI
 
 .PHONY: help run lint typecheck fmt test test-unit resources bundle clean bump release \
-	sync ensure-ocio
+	sync ensure-ocio docs-serve docs-build
 
 APP_NAME := exr_converter
 MACOS_BUNDLE_NAME := EXR Converter
@@ -40,14 +40,15 @@ help:
 	@echo "  make resources                         # regenerate Qt resources"
 	@echo "  make bundle                            # Nuitka standalone build"
 	@echo "  make clean                             # remove build artifacts"
+	@echo "  make docs-serve / docs-build           # Hugo site from docs/ (local / CI)"
 	@echo ""
 	@echo "  make bump PART=patch|minor|major       # bump version (no git)"
 	@echo "  make release PART=… PUSH=0             # preferred: bump+commit+tag on release/* branch"
 	@echo "  make release PART=…                    # also pushes (fails if main is protected)"
 	@echo ""
-	@echo "  Docs: AGENTS.md          (release/deploy + agent context; main is protected)"
+	@echo "  Docs: docs/*.md → Hugo site/ → GitHub Pages (workflow Docs)"
+	@echo "        AGENTS.md          (release/deploy + agent context; main is protected)"
 	@echo "        CHANGELOG.md       (user-facing history — update every release)"
-	@echo "        docs/plan-12bit-prores-oxideav.md"
 	@echo "Current tags: git tag -l 'v*' --sort=-v:refname | head"
 
 # ── Dependencies ─────────────────────────────────────────────────────────────
@@ -131,15 +132,23 @@ bundle: resources
 		--include-package-data=PyOpenColorIO \
 		--include-package=fileseq \
 		--include-data-dir=resources/ocio=resources/ocio \
-	--noinclude-dlls='libcrypto*' \
-		--noinclude-dlls='libssl*' \
+		--include-module=ssl \
 		$(ENTRY)
 	mv dist/main.app "dist/$(MACOS_BUNDLE_NAME).app"
 	# Nuitka rewires PyOpenColorIO → OIIO’s OCIO 2.4; put 2.5 back.
 	$(PYTHON) scripts/fix_bundle_ocio.py "dist/$(MACOS_BUNDLE_NAME).app"
 
+# ── Docs site (Hugo → GitHub Pages) ──────────────────────────────────────────
+# Source of truth: docs/*.md  ·  site config/theme: site/  ·  preview: http://127.0.0.1:1313/
+
+docs-serve:
+	hugo server -s site -D --disableFastRender
+
+docs-build:
+	hugo --minify --gc -s site
+
 clean:
-	rm -rf dist build *.build *.dist *.onefile-build __pycache__
+	rm -rf dist build *.build *.dist *.onefile-build __pycache__ site/public site/resources
 
 # ── Version bump (no git) ────────────────────────────────────────────────────
 

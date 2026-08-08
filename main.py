@@ -18,7 +18,6 @@ def main() -> int:
     if args.headless:
         parser.error("Use: main.py video2exr ... or main.py exr2video ...")
 
-    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     import src.rc_resources  # noqa: F401 — register Qt resources
@@ -30,7 +29,13 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     app.setStyleSheet(load_stylesheet())
-    app.setWindowIcon(QIcon(":/icon.png"))
+    # macOS: do not setWindowIcon — Dock must use the .app bundle's .icns
+    # (CFBundleIconFile). A runtime PNG becomes NSApplication.applicationIconImage
+    # and draws a sharp full-bleed square while the app is running.
+    if sys.platform != "darwin":
+        from PySide6.QtGui import QIcon
+
+        app.setWindowIcon(QIcon(":/icon.png"))
 
     win = MainWindow()
     # Nuke / shell launch: pre-fill media + OCIO before the event loop runs.
@@ -47,6 +52,16 @@ def main() -> int:
         from PySide6.QtCore import QTimer
 
         from src.core.ocio_utils import get_bundled_aces_studio_path
+
+        # HTTPS / Check for Updates needs Python ssl + OpenSSL dylibs in the bundle.
+        try:
+            import ssl as _ssl
+
+            _ssl.create_default_context()
+            print(f"smoke: ssl OK ({_ssl.OPENSSL_VERSION})")
+        except Exception as e:
+            print(f"SMOKE FAIL: Python ssl unavailable (HTTPS broken): {e}", file=sys.stderr)
+            return 4
 
         ver = _OCIO.GetVersion()
         nums = tuple(int(x) for x in ver.split(".")[:3] if x.isdigit())
