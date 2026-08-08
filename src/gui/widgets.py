@@ -866,6 +866,9 @@ def _setup_dir_tree(tree: QTreeView, fs_model: QFileSystemModel, places: _Places
     tree.setDragEnabled(True)
     tree.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
     tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    # Expand/collapse is handled on single-click of the row (see
+    # :func:`_tree_click_toggle_expand`); double-click should not also toggle.
+    tree.setExpandsOnDoubleClick(False)
 
     def _menu(pos) -> None:
         idx = tree.indexAt(pos)
@@ -881,6 +884,21 @@ def _setup_dir_tree(tree: QTreeView, fs_model: QFileSystemModel, places: _Places
         menu.exec(tree.viewport().mapToGlobal(pos))
 
     tree.customContextMenuRequested.connect(_menu)
+
+
+def _tree_click_toggle_expand(tree: QTreeView, fs_model: QFileSystemModel, index) -> None:
+    """Single-click folder: expand if collapsed, collapse if already expanded.
+
+    Branch-indicator clicks are handled by QTreeView itself (and do not emit
+    ``clicked``), so this only runs for row/label clicks — first click opens
+    the folder in the tree, second click closes it.
+    """
+    if not index.isValid() or not fs_model.isDir(index):
+        return
+    if tree.isExpanded(index):
+        tree.collapse(index)
+    else:
+        tree.expand(index)
 
 
 # ---------------------------------------------------------------------------
@@ -1332,6 +1350,9 @@ class SequenceBrowserDialog(QDialog):
         self.resize(1060, 450)
         self._selected_dir: str = ""
         self._selected_name: str = ""
+        # First-frame path of the selected sequence (preferred for set_input so
+        # multi-sequence folders resolve to the chosen basename, not sorted[0]).
+        self._selected_frame_path: str = ""
         self._seq_data: list[dict] = []
         self._auto_select_name = select_name
 
@@ -1452,19 +1473,33 @@ class SequenceBrowserDialog(QDialog):
         layout.addWidget(self._outer_splitter, 1)
         self._tree.clicked.connect(self._on_tree_clicked)
         self._table.itemSelectionChanged.connect(self._on_table_selection)
-        self._table.cellDoubleClicked.connect(lambda _r, _c: self.accept())
+        self._table.cellDoubleClicked.connect(self._on_table_double_clicked)
         self._path_edit.returnPressed.connect(self._on_path_entered)
-        self._inspect_cb.toggled.connect(self._toggle_inspect)
+        # Default Inspect on without relying on toggled side effects for selection.
         self._inspect_cb.setChecked(True)
+        self._toggle_inspect(True)
+        self._inspect_cb.toggled.connect(self._toggle_inspect)
 
         if start_dir and Path(start_dir).is_dir():
             self._navigate_to(start_dir)
 
     def selected_directory(self) -> str:
+        """Directory that was scanned (parent of sequences)."""
         return self._selected_dir
 
     def selected_name(self) -> str:
         return self._selected_name
+
+    def selected_path(self) -> str:
+        """Filesystem path to open as input: first frame of the selected sequence.
+
+        Prefer this over :meth:`selected_directory` — a directory alone always
+        resolves to the first sequence on disk, which is wrong when the folder
+        has several EXR sequences.
+        """
+        if self._selected_frame_path:
+            return self._selected_frame_path
+        return self._selected_dir
 
     def _navigate_to(self, directory: str) -> None:
         idx = self._fs_model.index(directory)
@@ -1479,11 +1514,13 @@ class SequenceBrowserDialog(QDialog):
 
     def _on_tree_clicked(self, index) -> None:
         path = self._fs_model.filePath(index)
-        if path:
-            self._path_edit.setText(path)
-            self._places.set_current_dir(path)
-            self._searchable_tree.set_search_root(path)
-            self._scan_directory(path)
+        if not path:
+            return
+        _tree_click_toggle_expand(self._tree, self._fs_model, index)
+        self._path_edit.setText(path)
+        self._places.set_current_dir(path)
+        self._searchable_tree.set_search_root(path)
+        self._scan_directory(path)
 
     def _on_path_entered(self) -> None:
         path = self._path_edit.text().strip()
@@ -1494,6 +1531,7 @@ class SequenceBrowserDialog(QDialog):
         self._table.setRowCount(0)
         self._selected_dir = directory
         self._selected_name = ""
+        self._selected_frame_path = ""
         self._seq_data = []
         self._ok_btn.setEnabled(False)
         self._meta_text.clear()
@@ -1545,31 +1583,79 @@ class SequenceBrowserDialog(QDialog):
             self._table.setItem(row, 5, comp_item)
             self._table.setItem(row, 6, cs_item)
 
-        selected = False
+        select_row = -1
         if self._auto_select_name:
             for row in range(self._table.rowCount()):
                 item = self._table.item(row, 0)
                 if item and item.data(Qt.ItemDataRole.UserRole) == self._auto_select_name:
-                    self._table.selectRow(row)
-                    selected = True
+                    select_row = row
                     break
-        if not selected and len(seqs) == 1:
-            self._table.selectRow(0)
+        if select_row < 0 and seqs:
+            # Always pick a row so Open is enabled without an extra click / Inspect dance.
+            select_row = 0
+        if select_row >= 0:
+            self._table.selectRow(select_row)
+            # selectRow does not always emit on a freshly rebuilt table — apply explicitly.
+            self._apply_table_selection(select_row)
 
         self._status.setText(f"{len(seqs)} sequence(s) found")
+
+    def _first_frame_for_sequence(self, name: str, directory: str, *, cached: str = "") -> str:
+        """Resolve the first frame path for sequence *name* in *directory*."""
+        if cached and Path(cached).is_file():
+            return cached
+        import fileseq
+
+        for sq in fileseq.findSequencesOnDisk(directory):
+            if (
+                sq.basename().rstrip("._") == name
+                and sq.extension().lower() == ".exr"
+                and sq.frameSet()
+            ):
+                return str(sq.frame(sorted(sq.frameSet())[0]))
+        return ""
+
+    def _apply_table_selection(self, row: int) -> None:
+        """Commit table row *row* as the chosen sequence (name + first frame)."""
+        if row < 0 or row >= len(self._seq_data):
+            self._selected_name = ""
+            self._selected_frame_path = ""
+            self._ok_btn.setEnabled(False)
+            return
+        s = self._seq_data[row]
+        self._selected_name = str(s.get("name") or "")
+        self._selected_dir = str(s.get("path") or self._selected_dir)
+        self._selected_frame_path = self._first_frame_for_sequence(
+            self._selected_name,
+            self._selected_dir,
+            cached=str(s.get("first_frame") or ""),
+        )
+        self._ok_btn.setEnabled(bool(self._selected_name and self._selected_dir))
+        if self._meta_panel.isVisible():
+            self._show_metadata(row)
 
     def _on_table_selection(self) -> None:
         rows = self._table.selectionModel().selectedRows()
         if rows:
-            row = rows[0].row()
-            item = self._table.item(row, 0)
-            self._selected_name = item.data(Qt.ItemDataRole.UserRole) if item else ""
-            self._ok_btn.setEnabled(bool(self._selected_name))
-            if self._meta_panel.isVisible():
-                self._show_metadata(row)
+            self._apply_table_selection(rows[0].row())
         else:
             self._selected_name = ""
+            self._selected_frame_path = ""
             self._ok_btn.setEnabled(False)
+
+    def _on_table_double_clicked(self, row: int, _col: int) -> None:
+        self._apply_table_selection(row)
+        if self._ok_btn.isEnabled():
+            self.accept()
+
+    def accept(self) -> None:
+        # Re-sync selection in case the model lagged (Open with keyboard, etc.).
+        rows = self._table.selectionModel().selectedRows()
+        if rows:
+            self._apply_table_selection(rows[0].row())
+        if not self._selected_name:
+            return
+        super().accept()
 
     def _toggle_inspect(self, checked: bool) -> None:
         sizes = self._outer_splitter.sizes()
@@ -1587,19 +1673,7 @@ class SequenceBrowserDialog(QDialog):
         s = self._seq_data[row]
         directory = s["path"]
         name = s["name"]
-
-        import fileseq
-
-        seqs = fileseq.findSequencesOnDisk(directory)
-        first_path = ""
-        for sq in seqs:
-            if (
-                sq.basename().rstrip("._") == name
-                and sq.extension().lower() == ".exr"
-                and sq.frameSet()
-            ):
-                first_path = sq.frame(sorted(sq.frameSet())[0])
-                break
+        first_path = self._first_frame_for_sequence(name, directory)
         if not first_path:
             self._meta_text.setPlainText("Could not locate first frame.")
             return
@@ -1774,11 +1848,13 @@ class VideoBrowserDialog(QDialog):
 
     def _on_tree_clicked(self, index) -> None:
         path = self._fs_model.filePath(index)
-        if path:
-            self._path_edit.setText(path)
-            self._places.set_current_dir(path)
-            self._searchable_tree.set_search_root(path)
-            self._scan_directory(path)
+        if not path:
+            return
+        _tree_click_toggle_expand(self._tree, self._fs_model, index)
+        self._path_edit.setText(path)
+        self._places.set_current_dir(path)
+        self._searchable_tree.set_search_root(path)
+        self._scan_directory(path)
 
     def _on_path_entered(self) -> None:
         path = self._path_edit.text().strip()
@@ -2306,7 +2382,7 @@ class ConvertTab(QWidget):
             if mode == "video2exr"
             else "Folder with EXRs, or any .exr from the sequence"
         )
-        saved_in = settings.value(f"{mode}/input", "")
+        saved_in = str(settings.value(f"{mode}/input", "") or "").strip()
         if saved_in:
             self.input_path.setText(saved_in)
         self._browse_in = QPushButton("Browse\u2026")
@@ -2608,6 +2684,8 @@ class ConvertTab(QWidget):
 
         # Validate any saved input path once the event loop starts — unless a
         # GUI launch path (--open / Nuke) already applied input on this tab.
+        # The QLineEdit is only a view; readiness gates on _input_seq / _video_info
+        # after a successful probe, so we must re-accept on every cold start.
         self._skip_saved_input_restore = False
         saved = self.input_path.text().strip()
         if saved:
@@ -2616,35 +2694,70 @@ class ConvertTab(QWidget):
     def _restore_saved_input_if_needed(self) -> None:
         if getattr(self, "_skip_saved_input_restore", False):
             return
-        saved = self.input_path.text().strip()
-        if saved:
-            self.set_input_async(saved)
+        saved = str(self.input_path.text() or "").strip()
+        if not saved:
+            return
+        # Already accepted (e.g. browse completed before the deferred slot).
+        if self._path_matches_current_input(saved) and self.is_ready():
+            return
+        self.log_message.emit("Restoring saved input…")
+        self.set_input_async(saved)
 
     def suppress_saved_input_restore(self) -> None:
         """Cancel deferred QSettings input restore (used by ``--open`` / Nuke)."""
         self._skip_saved_input_restore = True
 
+    def _path_matches_current_input(self, text: str) -> bool:
+        """True if *text* is the same source as the validated model (path or #### view)."""
+        text = (text or "").strip()
+        if not text:
+            return False
+        if self._video_info is not None:
+            return text == self._video_info.path
+        if self._input_seq is not None:
+            dirn = self._input_seq.dirname().rstrip("/\\")
+            if text.rstrip("/\\") == dirn:
+                return True
+            pad = "#" * max(1, self._input_seq.zfill())
+            display = (
+                f"{self._input_seq.dirname()}{self._input_seq.basename()}"
+                f"{pad}{self._input_seq.extension()}"
+            )
+            return text == display
+        return False
+
+    def _persist_input_path(self, path: str) -> None:
+        """Write input path to QSettings and flush (survives kill / crash better)."""
+        self._settings.setValue(f"{self._mode}/input", path)
+        self._settings.sync()
+
     def _on_input_text_changed(self, text: str) -> None:
         """React to manual edits (typing / paste) in the input field.
 
-        Clears the model objects and attempts re-validation.  For
-        ``video2exr`` the quick ``Path.is_file()`` + extension check
-        avoids touching the filesystem for partial paths.  For
-        ``exr2video`` the same guard applies to directories / ``.exr``
-        files.  If the text resolves to a valid source, ``set_input``
-        adopts it and updates all dependent fields.
+        Does **not** clear a validated model when the field still shows the
+        same source (real path *or* the Nuke-style ``####`` display string
+        written by :meth:`set_input`).  Clearing first used to drop a loaded
+        sequence the moment anything re-emitted ``textChanged`` with the
+        display pattern, which is not a filesystem path.
         """
-        self._video_info = None
-        self._input_seq = None
-
         text = text.strip()
         if not text:
+            self._video_info = None
+            self._input_seq = None
             self._full_input_range = ""
             self._frame_range_edit.clear()
             self._reset_range_btn.setEnabled(False)
-            self._settings.setValue(f"{self._mode}/input", "")
+            self._persist_input_path("")
             self._emit_readiness()
             return
+
+        if self._path_matches_current_input(text):
+            self._emit_readiness()
+            return
+
+        # Text no longer matches the model — drop model until re-validated.
+        self._video_info = None
+        self._input_seq = None
 
         p = Path(text)
         if self._mode == "video2exr":
@@ -2903,8 +3016,18 @@ class ConvertTab(QWidget):
         if self._slate_model is None:
             return
 
-        locked_w, locked_h = self._detect_input_resolution()
+        # Timeline + shot scrub require a validated EXR sequence. If the field
+        # still shows a path but the model was never accepted (or was cleared),
+        # re-probe before opening so the dialog is not missing the transport.
         inp = self.get_input_path()
+        if not inp and self._mode == "exr2video":
+            raw = self.input_path.text().strip()
+            if raw and self.set_input(raw):
+                inp = self.get_input_path()
+            elif raw:
+                inp = raw
+
+        locked_w, locked_h = self._detect_input_resolution()
         inferred_fps = self._infer_fps_from_input()
         dst_cs = self.dst_btn.current_space()
         src_cs = self.src_btn.current_space()
@@ -2994,8 +3117,12 @@ class ConvertTab(QWidget):
             if self._input_seq is not None:
                 sel_name = self._input_seq.basename().rstrip("._")
             dlg = SequenceBrowserDialog(start, select_name=sel_name, parent=self)
-            if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_directory():
-                self.set_input(dlg.selected_directory())
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                # Prefer first-frame path so multi-sequence folders open the
+                # row the user selected (directory alone always picks sorted[0]).
+                path = dlg.selected_path() or dlg.selected_directory()
+                if path:
+                    self.set_input(path)
 
     def _pick_output(self) -> None:
         if self._mode == "video2exr":
@@ -3217,6 +3344,14 @@ class ConvertTab(QWidget):
             if gen != getattr(self, "_probe_gen", 0):
                 return
             self.log_message.emit(f"Could not open input: {err}")
+            # Sync fallback: directory/file probes are usually fast; try once
+            # on the GUI thread so a restored path is not left "shown but
+            # unaccepted" after a transient async failure.
+            try:
+                if self.set_input(path):
+                    self.log_message.emit(f"Opened (retry): {path}")
+            except Exception:
+                pass
 
         def _cleanup() -> None:
             if getattr(self, "_probe_thread", None) is thr:
@@ -3297,7 +3432,8 @@ class ConvertTab(QWidget):
             self._auto_fill_video_output(exr_dir)
             self._auto_detect_colorspace(exr_dir)
 
-        self._settings.setValue(f"{self._mode}/input", actual)
+        self._persist_input_path(actual)
+        self.log_message.emit(f"Input ready: {display}")
         self._emit_readiness()
 
     def set_input(self, path: str) -> bool:
@@ -3376,9 +3512,10 @@ class ConvertTab(QWidget):
             self._auto_fill_video_output(exr_dir)
             self._auto_detect_colorspace(exr_dir)
 
-        # Persist the real filesystem path (not the display pattern)
+        # Persist the real filesystem path (not the display pattern) and flush
+        # so a hard kill does not leave an empty restore on next launch.
         actual = path if self._video_info is not None else self._input_seq.dirname().rstrip("/")
-        self._settings.setValue(f"{self._mode}/input", actual)
+        self._persist_input_path(actual)
 
         self._emit_readiness()
         return True

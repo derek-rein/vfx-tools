@@ -34,23 +34,32 @@ DEFAULT_MAX_WORKERS = 4
 
 
 def _read_exr_frame(path: str, transform: FrameTransform | None) -> np.ndarray | None:
-    """Worker-thread pipeline: read uint16 RGB and run an optional transform.
+    """Worker-thread pipeline: read **HDR float** RGB and run an optional transform.
 
-    The transform typically applies an OCIO ``src → working`` conversion
-    and returns float16 working-space pixels — keeping the heavy colour
-    transform off the GUI thread on cache hits.
+    Uses :func:`read_exr` (float32, unclamped) — **not** uint16.  Requesting
+    UINT16 from OIIO clamps values above 1.0, which permanently destroys
+    highlight headroom so exposing *down* cannot recover detail (unlike Nuke).
+
+    The transform typically applies OCIO ``src → working`` and returns float16
+    working-space pixels (still HDR-capable) for the RAM cache.
     """
-    from ..core.exr_io import read_exr_uint16
+    import numpy as np
 
-    rgb = read_exr_uint16(path)
+    from ..core.exr_io import read_exr
+
+    try:
+        rgb = read_exr(path)
+    except Exception:
+        return None
     if rgb is None:
         return None
     if transform is None:
-        return rgb
+        # Keep unclamped headroom even without OCIO (float16 can hold >1.0).
+        return np.ascontiguousarray(rgb, dtype=np.float16)
     try:
         return transform(rgb)
     except Exception:
-        return rgb
+        return np.ascontiguousarray(rgb, dtype=np.float16)
 
 
 class ExrPrefetchService(QObject):
@@ -59,7 +68,8 @@ class ExrPrefetchService(QObject):
     Signals
     -------
     frame_loaded(int, object)
-        ``(frame_number, uint16_rgb | None)`` on the main thread.
+        ``(frame_number, float16_rgb | None)`` on the main thread
+        (HDR working-space or source-linear pixels — not uint16).
     """
 
     frame_loaded = Signal(int, object)

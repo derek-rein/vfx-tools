@@ -53,7 +53,7 @@ Available on **EXR → Video** only (checkboxes on that tab).
 |---------|----------|
 | **Prepend slate** | One-frame slate composited before the sequence |
 | **Burn-in** | Per-frame text overlay |
-| **Watermark** | Text watermark (opacity, size, angle, optional tile) |
+| **Watermark** | Text watermark (default **40%** opacity, **tiled** across frame; size/angle editable) |
 
 Overlays are authored in a display/sRGB-oriented space, linearised into a
 scene-linear **compositing space** (prefer ACES2065-1 via `aces_interchange`,
@@ -92,6 +92,34 @@ Checkboxes under the convert actions (persisted in `QSettings`):
 | **Slate thumbnail frame** | First / middle / last frame of the EXR sequence for the slate still |
 
 Settings org/app: `QSettings("VFXTools", "EXRConverter")`.
+
+---
+
+## Slate & overlay editor
+
+Opened from **EXR → Video** when editing slate / burn-in / watermark.
+
+- **Timeline + cache:** shot frames are prefetched into a RAM cache as
+  working-space pixels (when OCIO is configured). Playback is **cache-first**
+  (stalls until the next frame is in RAM).
+- **Display:** prefers **GPU OCIO** (full-resolution texture + GLSL display/view
+  transform). **Gain** is pre-display (exposure stops); **gamma** is Nuke-style
+  post-display ``pow(rgb, 1/γ)`` (1 = identity; not the sRGB/Rec.1886 encode).
+  Falls back to CPU OCIO if OpenGL is unavailable. Export is unchanged.
+- **Overlays:** burn-in and watermark are composited in scene-linear working
+  space so the preview matches the convert path.
+
+---
+
+## Help menu
+
+| Item | Behavior |
+|------|----------|
+| **Check for Updates…** | Opens the [latest GitHub Release](https://github.com/derek-rein/exr-converter/releases/latest) in the system browser (no in-app download) |
+| **About EXR Converter** | Title + version header; deps, links, OCIO notes, and license in a scroll area |
+| **Version X.Y.Z** | Non-clickable; shows the running app version (below a separator) |
+
+Site links stay in **About** only (not on the Help menu).
 
 ---
 

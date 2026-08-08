@@ -746,26 +746,27 @@ def make_viewer_display_processor(
     display: str,
     view: str,
 ) -> tuple[OCIO.CPUProcessor | None, object | None, object | None]:
-    """Build a CPUProcessor for working → display/view with a *dynamic* ExposureContrastTransform.
+    """Build a CPUProcessor for working → display/view with dynamic gain (exposure).
 
-    The returned EC transform is configured for live viewer controls (gain/gamma).
-    Callers can retrieve the dynamic properties and mutate them cheaply without
-    rebuilding the processor — this is the pattern used by RV, xStudio, and other
-    professional OCIO viewers for responsive exposure/gain/gamma adjustments.
+    EC is LINEAR (scene-linear gain as exposure stops) **before** the display
+    transform — matching Nuke's gain → Viewer Process order.
 
-    Returns (cpu_proc, exposure_prop, gamma_prop) or (None, None, None) on failure.
-    The props are obtained via DYNAMIC_PROPERTY_EXPOSURE / DYNAMIC_PROPERTY_GAMMA.
+    Viewer **gamma is not** wired through OCIO EC. Nuke applies
+    ``pow(display, 1/γ)`` *after* the Viewer Process; callers must apply that
+    post-pass themselves (GPU fragment uniform / numpy).
+
+    Returns ``(cpu_proc, exposure_prop, None)`` — third slot kept for call-site
+    compatibility (was formerly a gamma dynamic property).
     """
     group = OCIO.GroupTransform()
 
-    # Viewer adjustment transform — placed *before* the display curve.
-    # LINEAR style is appropriate when working_space is scene-linear.
+    # Gain only — before the display curve. Gamma stays at identity here.
     ec = OCIO.ExposureContrastTransform()
-    ec.setStyle(OCIO.EXPOSURE_CONTRAST_STYLE_LINEAR)
+    ec.setStyle(OCIO.EXPOSURE_CONTRAST_LINEAR)
     ec.setExposure(0.0)
     ec.setGamma(1.0)
     ec.setPivot(0.18)
-    ec.makeDynamic()
+    ec.makeExposureDynamic()
     group.appendTransform(ec)
 
     dvt = OCIO.DisplayViewTransform()
@@ -777,8 +778,7 @@ def make_viewer_display_processor(
     try:
         proc = config.getProcessor(group).getDefaultCPUProcessor()
         exp_prop = proc.getDynamicProperty(OCIO.DYNAMIC_PROPERTY_EXPOSURE)
-        gamma_prop = proc.getDynamicProperty(OCIO.DYNAMIC_PROPERTY_GAMMA)
-        return proc, exp_prop, gamma_prop
+        return proc, exp_prop, None
     except Exception:
         return None, None, None
 

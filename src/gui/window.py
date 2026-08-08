@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import platform
-import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 import PyOpenColorIO as OCIO_mod
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QSettings, Qt, QThread, QUrl
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -50,37 +45,6 @@ from .size_grip import SizeGrip
 from .widgets import ConvertTab, OcioConfigPanel
 
 
-class _DownloadWorker(QObject):
-    progress = Signal(int, int)
-    finished = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, url: str, dest: str) -> None:
-        super().__init__()
-        self._url = url
-        self._dest = dest
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            with urlopen(self._url, timeout=300) as resp:
-                total = int(resp.headers.get("Content-Length", 0))
-                chunk_size = 64 * 1024
-                downloaded = 0
-                chunks: list[bytes] = []
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    downloaded += len(chunk)
-                    self.progress.emit(downloaded, total)
-            Path(self._dest).write_bytes(b"".join(chunks))
-            self.finished.emit(self._dest)
-        except Exception as e:
-            self.failed.emit(str(e))
-
-
 class AboutDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -90,6 +54,7 @@ class AboutDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
+        # Header only outside the scroll area.
         title = QLabel(f"<h2>EXR Converter</h2><p>Version {APP_VERSION}</p>")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
@@ -101,20 +66,18 @@ class AboutDialog(QDialog):
         except Exception:
             oiio_ver = "?"
 
-        info_lines = [
-            f"Python {sys.version.split()[0]}",
-            f"PySide6 {__import__('PySide6').__version__}",
-            f"OpenColorIO {OCIO_mod.GetVersion()}",
-            f"OpenImageIO {oiio_ver}",
-        ]
-
-        info = QLabel("<br>".join(info_lines))
-        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(info)
+        deps = (
+            f"Python {sys.version.split()[0]} · "
+            f"PySide6 {__import__('PySide6').__version__}<br>"
+            f"OpenColorIO {OCIO_mod.GetVersion()} · "
+            f"OpenImageIO {oiio_ver}"
+        )
 
         body = QTextBrowser()
         body.setOpenExternalLinks(True)
         body.setHtml(
+            f"<p style='text-align:center;'>{deps}</p>"
+            "<hr>"
             "<p>by <b>Derek Rein</b></p>"
             '<p><a href="https://derekvfx.ca">derekvfx.ca</a> &nbsp;|&nbsp; '
             '<a href="https://ocio.cc">ocio.cc</a></p>'
@@ -154,10 +117,8 @@ class MainWindow(QMainWindow):
         self._settings = QSettings(APP_ORG, APP_NAME)
         self._thread: QThread | None = None
         self._worker: ConvertWorker | None = None
-        self._dl_thread: QThread | None = None
-        self._dl_worker: _DownloadWorker | None = None
         self._ocio_cfg = None
-        # "convert" | "download" | None — keeps progress UI from fighting itself.
+        # "convert" | None — keeps progress UI from fighting itself.
         self._busy: str | None = None
 
         self._build_menu_bar()
@@ -197,15 +158,6 @@ class MainWindow(QMainWindow):
         self._progress.setFormat("%p%")
         self._progress.setObjectName("convertProgress")
         prog_row.addWidget(self._progress, 1)
-        # Separate bar for update downloads so convert progress is not overwritten.
-        self._dl_progress = QProgressBar()
-        self._dl_progress.setRange(0, 100)
-        self._dl_progress.setValue(0)
-        self._dl_progress.setTextVisible(True)
-        self._dl_progress.setFormat("Download %p%")
-        self._dl_progress.setVisible(False)
-        self._dl_progress.setMaximumWidth(220)
-        prog_row.addWidget(self._dl_progress)
         self._go = QPushButton("  Convert  ")
         self._go.setObjectName("convertBtn")
         self._cancel_btn = QPushButton("Cancel")
@@ -378,21 +330,15 @@ class MainWindow(QMainWindow):
         update_action.triggered.connect(self._check_for_updates)
         help_menu.addAction(update_action)
 
-        help_menu.addSeparator()
-
         about_action = QAction("&About EXR Converter", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
         help_menu.addSeparator()
 
-        site_action = QAction("derekvfx.ca", self)
-        site_action.triggered.connect(lambda: QDesktopServices.openUrl("https://derekvfx.ca"))
-        help_menu.addAction(site_action)
-
-        ocio_action = QAction("ocio.cc", self)
-        ocio_action.triggered.connect(lambda: QDesktopServices.openUrl("https://ocio.cc"))
-        help_menu.addAction(ocio_action)
+        version_action = QAction(f"Version {APP_VERSION}", self)
+        version_action.setEnabled(False)
+        help_menu.addAction(version_action)
 
     def _show_about(self) -> None:
         dlg = AboutDialog(self)
@@ -407,197 +353,10 @@ class MainWindow(QMainWindow):
     def _is_convert_running(self) -> bool:
         return self._thread is not None and self._thread.isRunning()
 
-    def _is_download_running(self) -> bool:
-        return self._dl_thread is not None and self._dl_thread.isRunning()
-
     def _check_for_updates(self) -> None:
-        import json
-
-        if self._is_convert_running() or self._is_download_running():
-            QMessageBox.information(
-                self,
-                "Busy",
-                "Finish the current conversion or download before checking for updates.",
-            )
-            return
-
-        # Keep urllib + Python ssl (do not pull QtNetwork just for updates).
-        # Nuitka must ship ssl/OpenSSL; excluding libssl/libcrypto yields
-        # "unknown url type: https" and breaks this path.
-        releases_url = f"https://github.com/{GITHUB_REPO}/releases"
-
-        def _https_unavailable(detail: str) -> None:
-            QMessageBox.warning(
-                self,
-                "Update Check",
-                "HTTPS is unavailable in this build (Python SSL failed),\n"
-                "so automatic update checks cannot reach GitHub.\n\n"
-                f"{detail}\n\n"
-                "Opening the releases page in your browser instead.",
-            )
-            QDesktopServices.openUrl(QUrl(releases_url))
-
-        try:
-            import ssl as _ssl
-
-            _ssl.create_default_context()
-        except Exception as e:
-            _https_unavailable(str(e))
-            return
-
-        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-        try:
-            req = Request(api_url, headers={"Accept": "application/vnd.github+json"})
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-        except (URLError, OSError, ValueError) as e:
-            err = str(e)
-            if "unknown url type: https" in err.lower():
-                _https_unavailable(err)
-                return
-            QMessageBox.warning(self, "Update Check", f"Could not reach GitHub:\n{e}")
-            return
-
-        tag = data.get("tag_name", "")
-        remote_ver = tag.lstrip("v")
-        if not remote_ver:
-            QMessageBox.information(self, "Update Check", "No releases found.")
-            return
-
-        def _ver_tuple(v: str) -> tuple[int, ...]:
-            return tuple(int(x) for x in v.split(".") if x.isdigit())
-
-        try:
-            if _ver_tuple(remote_ver) <= _ver_tuple(APP_VERSION):
-                QMessageBox.information(
-                    self, "Up to date", f"You're on the latest version ({APP_VERSION})."
-                )
-                return
-        except Exception:
-            pass
-
-        asset_name = self._update_asset_name()
-        if not asset_name:
-            html_url = data.get("html_url", "")
-            QMessageBox.information(
-                self,
-                "Update Available",
-                f"Version {remote_ver} is available (you have {APP_VERSION}).\n"
-                f"No installer found for this platform — visit the release page.",
-            )
-            if html_url:
-                QDesktopServices.openUrl(QUrl(html_url))
-            return
-
-        download_url = ""
-        for asset in data.get("assets", []):
-            if asset.get("name", "") == asset_name:
-                download_url = asset.get("browser_download_url", "")
-                break
-
-        if not download_url:
-            QMessageBox.information(
-                self,
-                "Update Available",
-                f"Version {remote_ver} is available but the expected asset\n"
-                f"'{asset_name}' was not found in the release.",
-            )
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Update Available",
-            f"Version {remote_ver} is available (you have {APP_VERSION}).\n\n"
-            f"Download and run the installer?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        tmp_dir = Path(tempfile.mkdtemp(prefix="exr_converter_update_"))
-        installer_path = tmp_dir / asset_name
-
-        self._busy = "download"
-        self._dl_progress.setVisible(True)
-        self._dl_progress.setRange(0, 100)
-        self._dl_progress.setValue(0)
-        self._dl_progress.setFormat("Download %p%")
-        self._statusbar.showMessage("Downloading update…")
-        self._go.setEnabled(False)
-
-        self._dl_thread = QThread(self)
-        self._dl_worker = _DownloadWorker(download_url, str(installer_path))
-        self._dl_worker.moveToThread(self._dl_thread)
-        self._dl_thread.started.connect(self._dl_worker.run)
-        self._dl_worker.progress.connect(self._on_download_progress)
-        self._dl_worker.finished.connect(self._on_download_finished)
-        self._dl_worker.failed.connect(self._on_download_failed)
-        self._dl_worker.finished.connect(self._dl_thread.quit)
-        self._dl_worker.failed.connect(self._dl_thread.quit)
-        dl_ref = self._dl_worker
-        thr_ref = self._dl_thread
-        self._dl_thread.finished.connect(dl_ref.deleteLater)
-        self._dl_thread.finished.connect(thr_ref.deleteLater)
-        self._dl_thread.finished.connect(self._cleanup_download_thread)
-        self._dl_thread.start()
-
-    def _on_download_progress(self, downloaded: int, total: int) -> None:
-        if total > 0:
-            self._dl_progress.setRange(0, 100)
-            self._dl_progress.setValue(int(100 * downloaded / total))
-        else:
-            self._dl_progress.setRange(0, 0)
-
-    def _on_download_finished(self, dest: str) -> None:
-        self._busy = None
-        self._dl_progress.setRange(0, 100)
-        self._dl_progress.setValue(100)
-        self._dl_progress.setVisible(False)
-        self._update_go_state()
-        name = Path(dest).name
-        self._statusbar.showMessage(f"Downloaded {name}", 5000)
-        self._run_installer(Path(dest))
-
-    def _on_download_failed(self, error: str) -> None:
-        self._busy = None
-        self._dl_progress.setRange(0, 100)
-        self._dl_progress.setValue(0)
-        self._dl_progress.setVisible(False)
-        self._update_go_state()
-        self._statusbar.clearMessage()
-        QMessageBox.warning(self, "Download Failed", error)
-
-    def _cleanup_download_thread(self) -> None:
-        self._dl_worker = None
-        self._dl_thread = None
-
-    @staticmethod
-    def _update_asset_name() -> str:
-        s = sys.platform
-        machine = platform.machine().lower()
-        if s == "darwin":
-            arch = "arm64" if machine == "arm64" else "x86_64"
-            return f"exr_converter-macos-{arch}.dmg"
-        if s == "win32":
-            return "exr_converter-windows-x86_64-setup.exe"
-        if s.startswith("linux"):
-            return "exr_converter-linux-x86_64.AppImage"
-        return ""
-
-    @staticmethod
-    def _run_installer(path: Path) -> None:
-        s = sys.platform
-        if s == "darwin":
-            subprocess.run(
-                ["xattr", "-dr", "com.apple.quarantine", str(path)],
-                check=False,
-            )
-            subprocess.Popen(["open", str(path)])
-        elif s == "win32":
-            subprocess.Popen([str(path)], creationflags=subprocess.DETACHED_PROCESS)
-        else:
-            path.chmod(path.stat().st_mode | 0o755)
-            subprocess.Popen(["xdg-open", str(path)])
+        """Open the latest GitHub release page in the system browser."""
+        url = QUrl(f"https://github.com/{GITHUB_REPO}/releases/latest")
+        QDesktopServices.openUrl(url)
 
     # -- Slate menu --
 
@@ -739,17 +498,12 @@ class MainWindow(QMainWindow):
 
     def _update_go_state(self) -> None:
         """Enable Convert only when idle and the active tab is ready."""
-        busy = self._is_convert_running() or self._is_download_running() or self._busy is not None
+        busy = self._is_convert_running() or self._busy is not None
         self._go.setEnabled(not busy and self._active_tab().is_ready())
 
     def _start(self) -> None:
         if self._is_convert_running():
             self._append_log("Conversion already running — ignore start.")
-            return
-        if self._is_download_running() or self._busy == "download":
-            QMessageBox.information(
-                self, "Busy", "Wait for the update download to finish before converting."
-            )
             return
         if self._ocio_cfg is None:
             QMessageBox.warning(self, "OCIO", "No valid OCIO config loaded.")
@@ -1275,6 +1029,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._settings.setValue("ui/geometry", self.saveGeometry())
+        # Flush prefs (input paths, post-convert toggles, …) before exit so a
+        # subsequent launch restores a validated source without re-browsing.
+        self._settings.sync()
         # Stop background work so QApplication tear-down does not race threads.
         if self._worker is not None:
             self._worker.cancel()
@@ -1282,7 +1039,4 @@ class MainWindow(QMainWindow):
             self._thread.quit()
             if not self._thread.wait(8000):
                 self._append_log("Convert thread did not stop in time; forcing exit.")
-        if self._dl_thread is not None and self._dl_thread.isRunning():
-            self._dl_thread.quit()
-            self._dl_thread.wait(3000)
         super().closeEvent(event)

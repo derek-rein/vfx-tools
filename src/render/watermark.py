@@ -29,10 +29,10 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QImage, Q
 _DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "text": "FOR REVIEW ONLY",
-    "opacity": 35,
+    "opacity": 40,
     "size_pct": 9.0,
     "angle": 30.0,
-    "tiled": False,
+    "tiled": True,
 }
 
 
