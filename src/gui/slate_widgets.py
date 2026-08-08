@@ -1934,9 +1934,7 @@ class SlateDialog(QDialog):
             map_mode="log",
         )
         self._gain_slider.setMinimumWidth(140)
-        self._gain_slider.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
+        self._gain_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         strip.addWidget(self._gain_slider, 1)
 
         strip.addSpacing(8)
@@ -1963,9 +1961,7 @@ class SlateDialog(QDialog):
             map_mode="pivot",
         )
         self._gamma_slider.setMinimumWidth(140)
-        self._gamma_slider.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
+        self._gamma_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         strip.addWidget(self._gamma_slider, 1)
 
         strip.addSpacing(8)

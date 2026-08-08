@@ -68,11 +68,14 @@ void main() {
 }
 """
 
-_GLSL_FRAG_PASSTHROUGH = """#version 410 core
+_GLSL_FRAG_PASSTHROUGH = (
+    """#version 410 core
 uniform sampler2D imageTex;
 uniform sampler2D overlayTex;
 uniform int hasOverlay;
-""" + _GLSL_NUKE_GAMMA + """
+"""
+    + _GLSL_NUKE_GAMMA
+    + """
 in vec2 vert_texCoord;
 out vec4 frag_color;
 
@@ -92,13 +95,17 @@ void main() {
     frag_color = c;
 }
 """
+)
 
 # Placeholder ``@@OCIO_SRC@@`` (not str.format) so OCIO GLSL braces stay intact.
-_GLSL_FRAG_OCIO_FMT = """#version 410 core
+_GLSL_FRAG_OCIO_FMT = (
+    """#version 410 core
 uniform sampler2D imageTex;
 uniform sampler2D overlayTex;
 uniform int hasOverlay;
-""" + _GLSL_NUKE_GAMMA + """
+"""
+    + _GLSL_NUKE_GAMMA
+    + """
 in vec2 vert_texCoord;
 out vec4 frag_color;
 @@OCIO_SRC@@
@@ -121,6 +128,7 @@ void main() {
     frag_color = c;
 }
 """
+)
 
 
 def gpu_ocio_available() -> bool:

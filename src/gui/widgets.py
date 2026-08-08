@@ -886,9 +886,7 @@ def _setup_dir_tree(tree: QTreeView, fs_model: QFileSystemModel, places: _Places
     tree.customContextMenuRequested.connect(_menu)
 
 
-def _tree_click_toggle_expand(
-    tree: QTreeView, fs_model: QFileSystemModel, index
-) -> None:
+def _tree_click_toggle_expand(tree: QTreeView, fs_model: QFileSystemModel, index) -> None:
     """Single-click folder: expand if collapsed, collapse if already expanded.
 
     Branch-indicator clicks are handled by QTreeView itself (and do not emit
