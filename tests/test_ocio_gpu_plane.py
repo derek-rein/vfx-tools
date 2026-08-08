@@ -14,6 +14,17 @@ from src.gui.ocio_gpu_plane import (
 )
 
 
+def _load_bundled_aces_or_skip() -> OCIO.Config:
+    """Load bundled ACES Studio; skip if missing or OCIO lib is too old (2.4)."""
+    path = ocio_utils.get_bundled_aces_studio_path()
+    if path is None or not path.is_file():
+        pytest.skip("bundled ACES Studio config not present")
+    ok, err = ocio_utils.is_ocio_config_loadable(path)
+    if not ok:
+        pytest.skip(f"bundled ACES Studio not loadable: {err}")
+    return OCIO.Config.CreateFromFile(str(path))
+
+
 def test_gpu_ocio_modules_importable() -> None:
     assert gpu_ocio_available() is True
 
@@ -31,11 +42,7 @@ def test_nuke_viewer_gamma_power() -> None:
 
 def test_nuke_gamma_after_display_not_ocio_ec() -> None:
     """At extreme γ, post-display power ≠ pre-display OCIO EC LINEAR gamma."""
-    path = ocio_utils.get_bundled_aces_studio_path()
-    if path is None or not path.is_file():
-        pytest.skip("bundled ACES Studio config not present")
-
-    cfg = OCIO.Config.CreateFromFile(str(path))
+    cfg = _load_bundled_aces_or_skip()
     working = ocio_utils.get_compositing_space(cfg)
     display = cfg.getDefaultDisplay()
     view = cfg.getDefaultView(display)
@@ -78,11 +85,7 @@ def test_rewrite_sampler1d_handles_nested_parens() -> None:
 
 
 def test_viewer_gpu_shader_extracts_from_bundled_aces() -> None:
-    path = ocio_utils.get_bundled_aces_studio_path()
-    if path is None or not path.is_file():
-        pytest.skip("bundled ACES Studio config not present")
-
-    cfg = OCIO.Config.CreateFromFile(str(path))
+    cfg = _load_bundled_aces_or_skip()
     working = ocio_utils.get_compositing_space(cfg)
     display = cfg.getDefaultDisplay()
     view = cfg.getDefaultView(display)

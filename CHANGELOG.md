@@ -15,6 +15,16 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.6.1] — 2026-08-08
+
+### Fixed
+
+- **Release CI:** run ``ensure_ocio`` before the Release workflow test matrix
+  (same as CI). Without it, ``oiio-python`` can leave PyOpenColorIO on 2.4 and
+  the bundled ACES Studio 2.5 config fails to load, aborting the gate.
+
+---
+
 ## [0.6.0] — 2026-08-08
 
 ### Added
@@ -331,7 +341,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/derek-rein/exr-converter/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/derek-rein/exr-converter/compare/v0.5.4...v0.6.0
 [0.5.4]: https://github.com/derek-rein/exr-converter/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/derek-rein/exr-converter/compare/v0.5.2...v0.5.3
