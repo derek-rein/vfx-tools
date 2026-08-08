@@ -36,10 +36,10 @@ _BURNIN_KEYS = (
 _DEFAULT_WATERMARK = {
     "enabled": False,
     "text": "FOR REVIEW ONLY",
-    "opacity": 35,
+    "opacity": 40,
     "size_pct": 9.0,
     "angle": 30.0,
-    "tiled": False,
+    "tiled": True,
 }
 
 # Slate metadata fields persisted under ``slate/...`` settings keys.  Each
@@ -125,7 +125,9 @@ class SlateModel(QObject):
         self._watermark_params["angle"] = float(
             settings.value("slate/wm_angle", _DEFAULT_WATERMARK["angle"])
         )
-        self._watermark_params["tiled"] = bool(int(settings.value("slate/wm_tiled", 0)))
+        self._watermark_params["tiled"] = bool(
+            int(settings.value("slate/wm_tiled", int(_DEFAULT_WATERMARK["tiled"])))
+        )
 
     @property
     def settings(self) -> QSettings:

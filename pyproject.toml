@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2.2.6",
     "opencolorio>=2.5.1",
     "fileseq>=3.1.1",
+    "pyopengl>=3.1.0",
 ]
 requires-python = "==3.13.*"
 readme = "README.md"

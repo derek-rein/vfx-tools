@@ -15,6 +15,68 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.6.0] — 2026-08-08
+
+### Added
+
+- **GPU OCIO slate/shot preview:** playback uses OpenColorIO’s GPU processor
+  (GLSL 4.x via `QOpenGLWidget` + PyOpenGL). Full-resolution working-space
+  frames from the RAM cache are texture-uploaded (float16 when available);
+  burn-in/watermark are a separate cached overlay texture composited in the
+  fragment shader; display/view and live gain/gamma are dynamic uniforms —
+  not per-frame CPU `applyRGB` or full-plate alpha-over. CPU display remains
+  as fallback when OpenGL is unavailable.
+
+### Fixed
+
+- **Slate viewer highlight headroom:** shot frames are read as unclamped
+  float32 EXR (not uint16). UINT16 loads clamp values above 1.0, so exposing
+  *down* could not recover jacket/highlight detail that Nuke still shows.
+  Cache still uses float16 HDR working-space after ``src → working``.
+- **EXR sequence browser Open:** selecting a sequence now opens *that*
+  sequence (via its first frame path). Previously only the parent folder was
+  returned, so multi-sequence folders always loaded sorted ``[0]`` — toggling
+  Inspect could mask a stale/missing table selection. Open is enabled as soon
+  as sequences are listed (first/prior row auto-selected).
+- **Viewer gamma (Nuke-aligned):** slate/shot preview applies Nuke’s post-display
+  power ``pow(rgb, 1/γ)`` *after* the OCIO display/view transform (GPU fragment
+  uniform and CPU numpy). Previously gamma went through OCIO
+  ``ExposureContrastTransform`` *before* display, which crushed mid-grays
+  differently (wrong at extreme γ like 0.01). Gain remains pre-display
+  (exposure stops). Slider still shows Nuke-style γ (1 = neutral).
+- **Input restore on launch:** saved EXR/video path is re-probed into the
+  validated model (not only shown in the field). ``textChanged`` no longer
+  drops a loaded sequence when the field still shows the same source or the
+  ``####`` display pattern. Input prefs are flushed with ``QSettings.sync()``
+  so hard restarts keep the last path.
+- **Submit Notes typing:** form→model updates no longer echo
+  ``setPlainText`` on every keystroke (which reset the caret to the start).
+
+### Changed
+
+- **Viewer gain/gamma sliders:** procedural curves (log gain; asinh pivot-at-1
+  gamma for denser resolution near neutral) with range-driven 1–2–5 nice ticks
+  that thin by track width — no hard-coded tick tables. Numeric readouts turn
+  red when the value is not exactly 1.0 (Nuke-style). Display/view combo width
+  is capped so long OCIO labels no longer crush the tracks.
+- **Slate/shot preview sampling:** nearest-neighbor (raw pixel grid) when zooming
+  — no bilinear filtering on the plate/overlay textures (GPU) or pixmap transform
+  (CPU fallback).
+- **Viewer strip:** removed the decorative f-stop (aperture) control; gain/gamma
+  and display/view remain.
+- **Watermark defaults:** 40% opacity and **Tile across frame** on (was 35% /
+  single stamp). Existing saved watermark prefs are unchanged.
+- **Check for Updates:** opens the latest GitHub Releases page in the system
+  browser (`QDesktopServices`) instead of downloading installers via Python
+  HTTPS (avoids frozen-app SSL/CA issues).
+- **Help menu:** non-clickable **Version X.Y.Z**; no site-link items
+  (derekvfx.ca / ocio.cc remain in About).
+- **About dialog:** dependency versions move into the scroll area; only the
+  title and app version stay in the header.
+- **Dependency:** `PyOpenGL` for GPU OCIO preview.
+
+---
+
 ## [0.5.4] — 2026-08-08
 
 ### Added
@@ -269,7 +331,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/derek-rein/exr-converter/compare/v0.5.4...v0.6.0
 [0.5.4]: https://github.com/derek-rein/exr-converter/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/derek-rein/exr-converter/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/derek-rein/exr-converter/compare/v0.5.1...v0.5.2

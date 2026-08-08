@@ -399,6 +399,9 @@ QCheckBox {
     spacing: 6px;
     color: @FG;
 }
+QCheckBox:disabled {
+    color: @FG_DIM;
+}
 QCheckBox::indicator {
     width: 14px;
     height: 14px;
@@ -411,8 +414,22 @@ QCheckBox::indicator:checked {
     border-color: @ACCENT_DARK;
     image: url(:/check.png);
 }
+QCheckBox::indicator:disabled {
+    background-color: @BG_ALT;
+    border-color: @BORDER;
+}
+QCheckBox::indicator:checked:disabled {
+    /* Mute accent so nested boxes (e.g. Tile under an unchecked Watermark
+       group) do not still look clickable/active. */
+    background-color: @BG_ALT;
+    border-color: @BORDER;
+    image: url(:/check.png);
+}
 QCheckBox::indicator:hover {
     border-color: @ACCENT;
+}
+QCheckBox::indicator:hover:disabled {
+    border-color: @BORDER;
 }
 
 /* ---- Dialog buttons ---- */

@@ -140,6 +140,7 @@ def scan_exr_sequences(directory: str) -> list[dict]:
                 "compression": compression,
                 "colorspace": colorspace,
                 "path": directory,
+                "first_frame": first_path,
             }
         )
     return results

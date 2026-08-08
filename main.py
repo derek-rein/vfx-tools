@@ -21,8 +21,13 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     import src.rc_resources  # noqa: F401 — register Qt resources
+    from src.gui.ocio_gpu_plane import configure_default_gl_format
     from src.gui.style import load_stylesheet
     from src.gui.window import MainWindow
+
+    # Core Profile 4.1 for OCIO GLSL GPU display in the slate viewer.
+    # Must be set before the QApplication (and any GL context) is created.
+    configure_default_gl_format()
 
     app = QApplication(sys.argv)
     app.setOrganizationName(APP_ORG)
@@ -53,14 +58,14 @@ def main() -> int:
 
         from src.core.ocio_utils import get_bundled_aces_studio_path
 
-        # HTTPS / Check for Updates needs Python ssl + OpenSSL dylibs in the bundle.
+        # Keep Python ssl usable in the frozen binary (OpenSSL dylibs not stripped).
         try:
             import ssl as _ssl
 
             _ssl.create_default_context()
             print(f"smoke: ssl OK ({_ssl.OPENSSL_VERSION})")
         except Exception as e:
-            print(f"SMOKE FAIL: Python ssl unavailable (HTTPS broken): {e}", file=sys.stderr)
+            print(f"SMOKE FAIL: Python ssl unavailable: {e}", file=sys.stderr)
             return 4
 
         ver = _OCIO.GetVersion()

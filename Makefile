@@ -131,6 +131,7 @@ bundle: resources
 		--include-package=PyOpenColorIO \
 		--include-package-data=PyOpenColorIO \
 		--include-package=fileseq \
+		--include-package=OpenGL \
 		--include-data-dir=resources/ocio=resources/ocio \
 		--include-module=ssl \
 		$(ENTRY)

@@ -85,7 +85,7 @@ site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
 | Main window / post-convert actions | `src/gui/window.py` |
 | Player prefs / reveal-in-folder | `src/gui/preferences.py` |
 | Convert tabs / codecs UI | `src/gui/widgets.py` |
-| Slate dialog / viewer | `src/gui/slate_widgets.py`, `src/services/slate_model.py` |
+| Slate dialog / viewer | `src/gui/slate_widgets.py`, `src/gui/ocio_gpu_plane.py`, `src/services/slate_model.py` |
 | Background convert | `src/services/worker.py` |
 
 ## Commands (local)
@@ -136,6 +136,9 @@ config version 2.5 cannot load on library 2.4. Fix: `make ensure-ocio` or
    VideoToolbox ProRes (`prores_vt_*`) is **macOS-only**; UI must keep honest
    bit-depth labels.
 4. **Slate is QPainter** — no Qt WebEngine. Do not reintroduce browser-based slate.
+   **Preview display** prefers **GPU OCIO** (`src/gui/ocio_gpu_plane.py`,
+   `QOpenGLWidget` + PyOpenGL + OCIO `getDefaultGPUProcessor`). Do not put
+   full-res CPU `applyRGB` back on the playback hot path. Export remains CPU.
 5. **Generated resources** — edit `resources.qrc` / files under `resources/`, then
    `make resources`. Do not hand-edit `src/rc_resources.py`.
 6. **Presets / settings** — `QSettings` under org `VFXTools` / app `EXRConverter`.
@@ -144,10 +147,11 @@ config version 2.5 cannot load on library 2.4. Fix: `make ensure-ocio` or
 7. **Nuitka** — Release builds strip many Qt modules (WebEngine, Svg, Pdf, …).
    Prefer PySide6-Essentials APIs already used in the tree. Bundle includes
    `resources/ocio` and package data for `av`, OIIO, OCIO, fileseq.
-   **HTTPS / Check for Updates** uses stdlib `urllib` + Python `ssl` — do **not**
-   `--noinclude-dlls=libssl*` / `libcrypto*` (breaks HTTPS in the frozen app).
-   Do not pull `QtNetwork` solely for updates; keep `--include-module=ssl`.
-   Smoke test asserts `ssl.create_default_context()` works in the packaged binary.
+   **Check for Updates** opens the GitHub Releases page via
+   `QDesktopServices` (system browser) — no in-app HTTPS download. Smoke test
+   still checks Python `ssl` is importable in the frozen binary; keep
+   `--include-module=ssl` and do **not** `--noinclude-dlls=libssl*` /
+   `libcrypto*` if you reintroduce app HTTPS later.
 8. **macOS Dock icon** — Do **not** call `setWindowIcon` / set a runtime PNG on
    Darwin. Dock must use the bundle `.icns` (`--macos-app-icon`). A Qt PNG
    override becomes `applicationIconImage` and shows sharp square corners while

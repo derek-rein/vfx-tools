@@ -207,8 +207,8 @@ jobs:
             EXTRA_FLAGS+=(--macos-create-app-bundle "--macos-app-name=EXR Converter" "--macos-app-icon=${{ steps.icon.outputs.path }}")
             EXTRA_FLAGS+=("--macos-target-arch=${{ runner.arch == 'ARM64' && 'arm64' || 'x86_64' }}")
             # Do not --noinclude-dlls libssl/libcrypto: that breaks Python HTTPS
-            # in the frozen app (urlopen "unknown url type: https") and disables
-            # Help → Check for Updates against the GitHub API.
+            # in the frozen app (urlopen "unknown url type: https") if anything
+            # needs TLS later. Check for Updates uses the system browser.
           elif [ "$RUNNER_OS" == "Windows" ]; then
             EXTRA_FLAGS+=("--windows-icon-from-ico=${{ steps.icon.outputs.path }}" --windows-console-mode=disable)
           else
@@ -235,6 +235,7 @@ jobs:
             --include-package=PyOpenColorIO \
             --include-package-data=PyOpenColorIO \
             --include-package=fileseq \
+            --include-package=OpenGL \
             --include-data-dir=resources/ocio=resources/ocio \
             --include-module=ssl \
             --quiet \

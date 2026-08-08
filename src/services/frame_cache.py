@@ -1,9 +1,9 @@
-"""Thread-safe RAM cache for decoded EXR frames (uint16 RGB).
+"""Thread-safe RAM cache for decoded EXR frames (typically float16 HDR RGB).
 
 Adapted from Triton's :class:`FrameCache` pattern: LRU eviction under a byte
-budget, Qt signal for timeline cache-bar updates.  Pixel buffers are stored
-as ``uint16`` RGB (OIIO native read format) to preserve headroom without
-the float32→uint16 round-trip on every cache hit.
+budget, Qt signal for timeline cache-bar updates.  Viewer prefetch stores
+unclamped float16 working-space (or source HDR) so highlight headroom
+survives expose-down — not uint16 (which clamps values above 1.0 at read).
 """
 
 from __future__ import annotations
@@ -23,11 +23,10 @@ _CACHE_CHANGED_COALESCE_MS = 33
 class FrameCache(QObject):
     """LRU cache keyed by frame number → ``(H, W, 3)`` ndarray (RGB).
 
-    The dtype of the cached pixels is whatever the producer wrote — uint16
-    for raw EXR reads, or float16 working-space pixels when an OCIO
-    ``src → working`` transform is applied in the worker.  Storing the
-    working-space buffer means the GUI thread skips the heaviest OCIO pass
-    on cache hits during playback.
+    The dtype is whatever the producer wrote — usually float16 HDR working
+    space after OCIO ``src → working`` in the prefetch worker (or float16
+    source HDR if no OCIO).  Legacy uint16 is still accepted but cannot
+    recover values that were clipped above 1.0 at load.
 
     ``cache_changed`` is *coalesced* — multiple ``put`` / ``clear`` calls in
     quick succession fan in to a single emission ~33ms later, so listeners
