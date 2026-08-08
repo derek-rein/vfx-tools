@@ -1,0 +1,82 @@
+# Hugo site for EXR Converter docs.
+# Source of truth for pages: ../docs/*.md (mounted as content/docs).
+# Build:  make docs-build   (or: hugo -s site)
+# Serve:  make docs-serve
+
+baseURL = "https://derek-rein.github.io/exr-converter/"
+title = "EXR Converter"
+enableRobotsTXT = true
+enableGitInfo = false
+# Disable taxonomy lists we don't use
+disableKinds = ["taxonomy", "term", "RSS"]
+
+[params]
+  description = "Desktop GUI and CLI for converting video ↔ OpenEXR with OpenColorIO."
+  github = "https://github.com/derek-rein/exr-converter"
+  releases = "https://github.com/derek-rein/exr-converter/releases"
+
+[menus]
+  [[menus.main]]
+    name = "Docs"
+    pageRef = "/docs"
+    weight = 10
+  [[menus.main]]
+    name = "CLI"
+    pageRef = "/docs/cli"
+    weight = 20
+  [[menus.main]]
+    name = "GUI"
+    pageRef = "/docs/gui"
+    weight = 25
+  [[menus.main]]
+    name = "Nuke"
+    pageRef = "/docs/nuke"
+    weight = 30
+  [[menus.main]]
+    name = "GitHub"
+    url = "https://github.com/derek-rein/exr-converter"
+    weight = 90
+
+[markup]
+  [markup.goldmark]
+    [markup.goldmark.renderer]
+      unsafe = true
+    [markup.goldmark.extensions]
+      typographer = false
+  [markup.highlight]
+    style = "github-dark"
+    noClasses = false
+    lineNos = false
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
+    ordered = false
+
+# Mount repo docs/ as the docs section. Keep Hugo-only bits under site/.
+[module]
+  [[module.mounts]]
+    source = "content"
+    target = "content"
+  [[module.mounts]]
+    source = "../docs"
+    target = "content/docs"
+  [[module.mounts]]
+    source = "layouts"
+    target = "layouts"
+  [[module.mounts]]
+    source = "static"
+    target = "static"
+  [[module.mounts]]
+    source = "assets"
+    target = "assets"
+  # Screenshots for the home page
+  [[module.mounts]]
+    source = "../resources/screenshots"
+    target = "static/screenshots"
+  # App icon → site favicon (same source as the desktop app)
+  [[module.mounts]]
+    source = "../resources/icons/icon.png"
+    target = "static/favicon.png"
+  [[module.mounts]]
+    source = "../resources/icons/icon.ico"
+    target = "static/favicon.ico"

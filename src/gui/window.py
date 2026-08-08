@@ -145,7 +145,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("EXR Converter")
-        self.setWindowIcon(QIcon(":/icon.png"))
+        # macOS Dock icon comes from the bundle .icns; a runtime PNG override
+        # replaces the system tile and shows sharp square corners while running.
+        if sys.platform != "darwin":
+            self.setWindowIcon(QIcon(":/icon.png"))
         self.setMinimumSize(700, 640)
         self.setAcceptDrops(True)
         self._settings = QSettings(APP_ORG, APP_NAME)
@@ -418,12 +421,40 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Keep urllib + Python ssl (do not pull QtNetwork just for updates).
+        # Nuitka must ship ssl/OpenSSL; excluding libssl/libcrypto yields
+        # "unknown url type: https" and breaks this path.
+        releases_url = f"https://github.com/{GITHUB_REPO}/releases"
+
+        def _https_unavailable(detail: str) -> None:
+            QMessageBox.warning(
+                self,
+                "Update Check",
+                "HTTPS is unavailable in this build (Python SSL failed),\n"
+                "so automatic update checks cannot reach GitHub.\n\n"
+                f"{detail}\n\n"
+                "Opening the releases page in your browser instead.",
+            )
+            QDesktopServices.openUrl(QUrl(releases_url))
+
+        try:
+            import ssl as _ssl
+
+            _ssl.create_default_context()
+        except Exception as e:
+            _https_unavailable(str(e))
+            return
+
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         try:
             req = Request(api_url, headers={"Accept": "application/vnd.github+json"})
             with urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read())
         except (URLError, OSError, ValueError) as e:
+            err = str(e)
+            if "unknown url type: https" in err.lower():
+                _https_unavailable(err)
+                return
             QMessageBox.warning(self, "Update Check", f"Could not reach GitHub:\n{e}")
             return
 

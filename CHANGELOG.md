@@ -15,6 +15,34 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.5.4] — 2026-08-08
+
+### Added
+
+- **Docs site (GitHub Pages):** write Markdown under `docs/`; Hugo builds from
+  `site/` and the **Docs** workflow publishes to
+  `https://derek-rein.github.io/exr-converter/`. Local preview: `make docs-serve`.
+- **GUI docs:** [docs/gui.md](docs/gui.md) covers tabs, slate/burn-in/watermark,
+  preferences, and post-convert actions.
+
+### Changed
+
+- **Docs accuracy:** CLI codec ladder (default `prores`, honest bit depths,
+  default extensions), Nuke “Open EXR Converter only…”, and AGENTS.md now
+  require updating `docs/` with user-visible work (same rule as the changelog).
+
+### Fixed
+
+- **Check for Updates on macOS packages:** Nuitka no longer excludes OpenSSL
+  (`libssl` / `libcrypto`), which left Python without HTTPS and produced
+  `urlopen error unknown url type: https`. If SSL is still unavailable, the app
+  opens the GitHub releases page in the browser instead of only showing an error.
+- **macOS Dock icon corners while running:** stop overriding the Dock tile with
+  `setWindowIcon(:/icon.png)`. The running app now keeps the bundle `.icns` so
+  open and closed Dock tiles match (no sharp square PNG override).
+
+---
+
 ## [0.5.3] — 2026-08-06
 
 ### Added
@@ -241,7 +269,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/derek-rein/exr-converter/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/derek-rein/exr-converter/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/derek-rein/exr-converter/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/derek-rein/exr-converter/compare/v0.5.0...v0.5.1

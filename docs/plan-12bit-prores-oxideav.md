@@ -1,4 +1,8 @@
-# Plan: Cross-platform 12-bit ProRes via oxideav
+---
+title: 12-bit ProRes plan (oxideav)
+weight: 90
+description: Research notes — not implemented
+---
 
 **Status:** research complete · implementation not started  
 **Date:** 2026-08-06  

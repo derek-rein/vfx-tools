@@ -19,3 +19,8 @@ build/
 *.pywz
 *.pyzw
 *.pyzwz
+
+# Hugo docs site
+site/public/
+site/resources/
+site/.hugo_build.lock

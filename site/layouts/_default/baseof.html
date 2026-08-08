@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="{{ site.Language.Lang | default "en" }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ if .IsHome }}{{ site.Title }}{{ else }}{{ .Title }} · {{ site.Title }}{{ end }}</title>
+  <meta name="description" content="{{ with .Description }}{{ . }}{{ else }}{{ site.Params.description }}{{ end }}">
+  <link rel="icon" href="{{ "favicon.ico" | relURL }}" sizes="any">
+  <link rel="icon" href="{{ "favicon.png" | relURL }}" type="image/png" sizes="256x256">
+  <link rel="apple-touch-icon" href="{{ "favicon.png" | relURL }}">
+  {{ $css := resources.Get "css/style.css" | minify | fingerprint }}
+  <link rel="stylesheet" href="{{ $css.RelPermalink }}">
+  <link rel="canonical" href="{{ .Permalink }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="{{ site.Home.RelPermalink }}">{{ site.Title }}</a>
+      <nav class="nav" aria-label="Main">
+        {{ range site.Menus.main }}
+          <a href="{{ .URL }}"
+             {{- if strings.HasPrefix .URL "http" }} rel="noopener" target="_blank"{{ end -}}
+             {{- if or ($.IsMenuCurrent "main" .) ($.HasMenuCurrent "main" .) }} class="active"{{ end -}}
+          >{{ .Name }}</a>
+        {{ end }}
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap main">
+    {{ block "main" . }}{{ end }}
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <span>{{ site.Title }}</span>
+      <span class="sep">·</span>
+      <a href="{{ site.Params.github }}">GitHub</a>
+      <span class="sep">·</span>
+      <a href="{{ site.Params.releases }}">Releases</a>
+    </div>
+  </footer>
+</body>
+</html>

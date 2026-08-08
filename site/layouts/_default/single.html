@@ -1,0 +1,19 @@
+{{ define "main" }}
+<article class="doc">
+  <header class="doc-header">
+    <p class="crumb"><a href="{{ "docs/" | relURL }}">Docs</a></p>
+    <h1>{{ .Title }}</h1>
+  </header>
+  {{ with .TableOfContents }}
+    {{ if gt (len .) 32 }}
+    <aside class="toc" aria-label="On this page">
+      <p class="toc-title">On this page</p>
+      {{ . }}
+    </aside>
+    {{ end }}
+  {{ end }}
+  <div class="content">
+    {{ .Content }}
+  </div>
+</article>
+{{ end }}

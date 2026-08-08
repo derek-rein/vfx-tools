@@ -35,6 +35,28 @@ VFX Reference Platform CY2026-ish stack: PySide6 6.8, OCIO 2.5, OIIO, NumPy 2.x,
 
 Agents: if you implement a feature or fix and forget the changelog, treat that as incomplete work and add the entry before finishing.
 
+## Documentation (required)
+
+**User-facing docs live in [`docs/`](./docs/)** (Markdown source of truth). Hugo
+builds them from [`site/`](./site/) and the **Docs** workflow publishes to
+GitHub Pages: https://derek-rein.github.io/exr-converter/
+
+| Rule | Detail |
+|------|--------|
+| When | Any change that affects how users run or integrate the app: CLI flags, GUI behavior, codecs, OCIO/defaults, install/packaging users notice, Nuke/helpers, post-convert prefs, launch flags |
+| Where | Update the matching file under `docs/` in the **same PR / commit set** as the code (and [CHANGELOG.md](./CHANGELOG.md) when user-visible) |
+| Map | [docs/cli.md](./docs/cli.md) CLI + GUI launch · [docs/gui.md](./docs/gui.md) GUI / prefs / overlays · [docs/nuke.md](./docs/nuke.md) Nuke menu · [docs/releasing.md](./docs/releasing.md) short release pointer · design notes only when the design changes |
+| Local | `make docs-serve` (preview) · `make docs-build` (static `site/public/`) |
+| Do not | Leave docs describing old flags/defaults/codecs. Do not hand-edit generated `site/public/`. Do not put the only copy of user docs solely in chat or PR text. |
+
+Agents: **before finishing work**, check whether `docs/` still matches the
+behavior you shipped. If you changed CLI/GUI/integration surface area and
+skipped docs, treat that as incomplete and update them.
+
+Release process for maintainers stays in this file
+([Releasing and deployment](#releasing-and-deployment)); keep `docs/releasing.md`
+as a short pointer, not a second full copy.
+
 ## Layout (where to edit)
 
 ```text
@@ -48,8 +70,9 @@ src/
 resources/              # icons, style.qss, OCIO config, screenshots
 scripts/                # bump_app_version.py, ensure_ocio.py
 tests/                  # pytest; integration + fixtures under tests/fixtures/
-docs/                   # design notes (e.g. oxideav plan); release process lives here in AGENTS.md
-.github/workflows/      # ci.yml (PR/main), release.yml (tag v*)
+docs/                   # user-facing Markdown (Hugo content source of truth)
+site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
+.github/workflows/      # ci.yml, docs.yml, release.yml, auto-tag-release.yml
 ```
 
 ### Important modules
@@ -76,6 +99,8 @@ make typecheck     # basedpyright
 make test          # full pytest (needs QT_QPA_PLATFORM=offscreen — Makefile sets it)
 make test-unit     # skip @pytest.mark.integration
 make resources     # regenerate src/rc_resources.py after resources.qrc / icons change
+make docs-serve    # Hugo local preview of docs/ (http://127.0.0.1:1313/)
+make docs-build    # Hugo static build → site/public/
 make bundle        # local Nuitka standalone (does not publish a GitHub Release)
 make clean
 ```
@@ -119,6 +144,14 @@ config version 2.5 cannot load on library 2.4. Fix: `make ensure-ocio` or
 7. **Nuitka** — Release builds strip many Qt modules (WebEngine, Svg, Pdf, …).
    Prefer PySide6-Essentials APIs already used in the tree. Bundle includes
    `resources/ocio` and package data for `av`, OIIO, OCIO, fileseq.
+   **HTTPS / Check for Updates** uses stdlib `urllib` + Python `ssl` — do **not**
+   `--noinclude-dlls=libssl*` / `libcrypto*` (breaks HTTPS in the frozen app).
+   Do not pull `QtNetwork` solely for updates; keep `--include-module=ssl`.
+   Smoke test asserts `ssl.create_default_context()` works in the packaged binary.
+8. **macOS Dock icon** — Do **not** call `setWindowIcon` / set a runtime PNG on
+   Darwin. Dock must use the bundle `.icns` (`--macos-app-icon`). A Qt PNG
+   override becomes `applicationIconImage` and shows sharp square corners while
+   running. Windows/Linux still set `:/icon.png`.
 
 ## Coding conventions
 
@@ -296,6 +329,7 @@ xattr -cr "/Applications/EXR Converter.app"
 | Workflow | Trigger | Gate |
 |----------|---------|------|
 | [CI](.github/workflows/ci.yml) | push / PR to `main` | Ruff + full pytest on 3 OS; job **`ci-ok`** requires all green |
+| [Docs](.github/workflows/docs.yml) | push / PR paths under `docs/`, `site/` | Hugo build; deploy to Pages on `main` only |
 | [Auto-tag release](.github/workflows/auto-tag-release.yml) | push to `main` | If `pyproject` version has no `vX.Y.Z` tag → push tag |
 | [Release](.github/workflows/release.yml) | tag `v*` | Same lint + tests via **`gate`** before Nuitka / publish |
 
@@ -305,14 +339,20 @@ Branch protection on `main` should require `ci-ok`.
 
 | Doc | Purpose |
 |-----|---------|
-| [AGENTS.md](./AGENTS.md) | This file — agent/process context, release & deploy |
+| [AGENTS.md](./AGENTS.md) | This file — agent/process context, release & deploy, **docs rules** |
 | [CHANGELOG.md](./CHANGELOG.md) | User-facing history (**must update**) |
-| [README.md](./README.md) | Product overview, install, CLI |
+| [README.md](./README.md) | Product overview, install, short CLI |
+| [docs/](./docs/) | User-facing Markdown (**must update** when behavior changes) |
+| [site/](./site/) | Hugo config + theme; mounts `docs/` → GitHub Pages |
 | [docs/cli.md](./docs/cli.md) | CLI + GUI launch flags |
+| [docs/gui.md](./docs/gui.md) | GUI tabs, overlays, preferences, post-convert |
 | [docs/nuke.md](./docs/nuke.md) | Nuke menu integration |
 | [docs/plan-12bit-prores-oxideav.md](./docs/plan-12bit-prores-oxideav.md) | Future 12-bit ProRes plan (not implemented) |
-| [docs/releasing.md](./docs/releasing.md) | Stub pointing here (release process lives in AGENTS.md) |
+| [docs/releasing.md](./docs/releasing.md) | Short pointer here + docs-site note |
 | [integrations/nuke/](./integrations/nuke/) | Nuke `menu.py` + helpers |
+
+Public site: `make docs-serve` / `make docs-build`; workflow **Docs** deploys to
+`https://derek-rein.github.io/exr-converter/` (Pages source = GitHub Actions).
 
 ## What not to do
 
@@ -321,3 +361,4 @@ Branch protection on `main` should require `ci-ok`.
 - Do not reintroduce Qt WebEngine for slate.
 - Do not push version tags without a changelog section and green Release gate intent.
 - Do not hand-edit `src/rc_resources.py` or force-push published release tags without a deliberate recovery process.
+- Do not finish user-visible work without updating **CHANGELOG.md** and **`docs/`** when the surface area changed.
