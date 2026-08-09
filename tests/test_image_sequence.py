@@ -172,11 +172,12 @@ class TestSequenceDiscovery:
 
     def test_parse_dot_sequence_output(self) -> None:
         d, name, pad = parse_dot_sequence_output("/tmp/out/04_5d-2.####.exr")
-        assert d == "/tmp/out"
+        # Path.parent is OS-native separators on Windows.
+        assert Path(d) == Path("/tmp/out")
         assert name == "04_5d-2"
         assert pad == 4
         d2, name2, pad2 = parse_dot_sequence_output("/tmp/out")
-        assert d2 == "/tmp/out"
+        assert Path(d2) == Path("/tmp/out")
         assert name2 is None
         assert pad2 is None
         with pytest.raises(ValueError, match="dot-separated"):
