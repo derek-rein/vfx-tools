@@ -211,6 +211,54 @@ QToolButton::menu-indicator {
     right: 6px;
 }
 
+/* ---- SegmentedControl (List | Grid, etc.) ----
+   Pill track + exclusive segments. Requires WA_StyledBackground on the host.
+*/
+QWidget#SegmentedControl {
+    background-color: @BG_INPUT;
+    border: 1px solid @BORDER;
+    border-radius: 7px;
+    padding: 0;
+}
+QWidget#SegmentedControl > QPushButton {
+    background-color: transparent;
+    border: none;
+    border-radius: 5px;
+    padding: 3px 12px;
+    margin: 0;
+    min-height: 20px;
+    min-width: 44px;
+    color: @FG_DIM;
+    font-size: 12px;
+    font-weight: normal;
+}
+QWidget#SegmentedControl > QPushButton:hover:!checked {
+    color: @FG;
+    background-color: rgba(255, 255, 255, 0.04);
+}
+QWidget#SegmentedControl > QPushButton:checked {
+    background-color: @BG_BTN;
+    color: @SEL_FG;
+    font-weight: 500;
+    /* subtle inner edge so the selected pill reads as a raised segment */
+    border: 1px solid @BORDER;
+}
+QWidget#SegmentedControl > QPushButton:checked:hover {
+    background-color: @BG_BTN_HOVER;
+    color: @SEL_FG;
+}
+QWidget#SegmentedControl > QPushButton:pressed {
+    background-color: @BG_BTN_PRESSED;
+}
+QWidget#SegmentedControl > QPushButton:disabled {
+    color: @FG_DISABLED;
+}
+/* Focus ring only when keyboard-focused (tab), not on mouse click.
+   Property is set by SegmentedControl.focusInEvent / focusOutEvent. */
+QWidget#SegmentedControl[keyboardFocus="true"] {
+    border-color: @ACCENT;
+}
+
 /* ---- TabWidget ---- */
 QTabWidget::pane {
     border: 1px solid @BORDER;

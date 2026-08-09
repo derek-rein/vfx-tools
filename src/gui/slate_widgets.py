@@ -8,29 +8,17 @@ and a live QPainter-driven preview on the right.
 from __future__ import annotations
 
 import logging
-import math
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import (
     QEvent,
-    QPointF,
-    QRectF,
     QRegularExpression,
     Qt,
     QTimer,
     Signal,
 )
 from PySide6.QtGui import (
-    QBrush,
-    QColor,
-    QFontDatabase,
-    QFontMetricsF,
-    QMouseEvent,
-    QPainter,
-    QPen,
     QRegularExpressionValidator,
-    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -38,44 +26,28 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QFrame,
-    QGraphicsScene,
-    QGraphicsView,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSlider,
     QSpinBox,
     QSplitter,
-    QStackedWidget,
     QStatusBar,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..render.slate import SLATE_COLORSPACE, render_slate_frame
-from ..services.cache_prefs import (
-    cache_budget_bytes,
-    load_cache_budget_pct,
-    save_cache_budget_pct,
-    total_ram_bytes,
-)
-from ..services.exr_prefetch import ExrPrefetchService
-from ..services.frame_cache import FrameCache
-from .ocio_gpu_plane import (
-    OcioGpuImagePlane,
-    gpu_ocio_available,
-    nuke_viewer_gamma_power,
-)
+from .nuke_slider import NukeSlider
+from .player.preview_view import ZOOM_MAX, ZOOM_MIN
+from .player.preview_view import ImagePreviewView as SlatePreviewView
+from .player.sequence_player import OverlayHooks, SequencePlayer
+from .player.shuttle_bar import ShuttleBar as _ShuttleBar
 from .size_grip import SizeGrip
-from .timeline_slider import TimelineSlider
 from .token_line_edit import TokenLineEdit
 
 if TYPE_CHECKING:
@@ -83,456 +55,28 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Playback RAM cache — float16 HDR working RGB; 75% prefetch ahead, 25% lookback.
-_PREFETCH_WORKERS = 4
-
-ZOOM_MIN = 0.05
-ZOOM_MAX = 5.0
-
-
-def _alpha_over_rgb(bg_rgb_f32, overlay_rgba_u8):
-    """Vectorised straight-alpha 'over' composite of an RGBA8 overlay onto an
-    RGB float32 background.  Returns a new float32 RGB array — leaves the
-    input untouched.
-
-    Used by the slate dialog to bake burn-in + watermark on top of the
-    display-space frame, matching what :mod:`convert` does for the final
-    rendered output.
-    """
-    import numpy as np
-
-    if overlay_rgba_u8.shape[2] < 4:
-        return bg_rgb_f32
-    a = overlay_rgba_u8[..., 3:4].astype(np.float32) / 255.0
-    fg = overlay_rgba_u8[..., :3].astype(np.float32) / 255.0
-    return fg * a + bg_rgb_f32 * (1.0 - a)
+# Legacy re-exports (preview / shuttle / NukeSlider live under player / nuke_slider).
+__all__ = [
+    "NukeSlider",
+    "OverlayHooks",
+    "SequencePlayer",
+    "SlateDialog",
+    "SlateFormPanel",
+    "SlatePreviewView",
+    "ZOOM_MAX",
+    "ZOOM_MIN",
+    "_ShuttleBar",
+    "extract_thumbnail_b64",
+]
 
 
 def _alpha_over_linear(bg_rgb_f32, overlay_rgba_lin_f32):
-    """Same as :func:`_alpha_over_rgb` but with an already-linearised RGBA float32
-    overlay — skips the per-frame ``/255`` and OCIO call.
-    """
+    """Straight alpha-over with an already-linearised RGBA float32 overlay."""
     if overlay_rgba_lin_f32 is None or overlay_rgba_lin_f32.shape[2] < 4:
         return bg_rgb_f32
     a = overlay_rgba_lin_f32[..., 3:4]
     fg = overlay_rgba_lin_f32[..., :3]
     return fg * a + bg_rgb_f32 * (1.0 - a)
-
-
-# ---------------------------------------------------------------------------
-# Nuke-style custom-painted slider
-# ---------------------------------------------------------------------------
-
-
-class NukeSlider(QWidget):
-    """QPainter viewer slider with procedural value curves (gain / gamma).
-
-    Mapping is derived only from ``val_min`` / ``val_max`` / ``map_mode``:
-
-    - ``linear`` — uniform in value
-    - ``log`` — uniform in log(value) (gain)
-    - ``pivot`` — 1.0 pinned at mid-track (gamma): each side is a gentle
-      asinh curve so resolution is denser near the pivot (Nuke-style feel)
-
-    Tick candidates are nice numbers from the active range + curve; density
-    and which labels draw scale with track width (no hard-coded tick tables).
-    """
-
-    valueChanged = Signal(float)
-
-    _BG = QColor(0x1E, 0x1E, 0x1E)
-    _GROOVE = QColor(0x3C, 0x3C, 0x3C)
-    _TICK = QColor(0x58, 0x58, 0x58)
-    _LABEL_COLOR = QColor(0x88, 0x88, 0x88)
-    _INDICATOR = QColor(0xC8, 0x78, 0x28)  # Nuke orange
-    _DEFAULT_MARK = QColor(0x50, 0x50, 0x50)
-    _PIVOT = 1.0
-    # asinh steepness: higher → more track budget near the pivot.
-    _PIVOT_K = 1.6
-    # Target horizontal gap between tick marks / labels (px).
-    _MIN_TICK_GAP_PX = 14.0
-    _MIN_LABEL_GAP_PX = 22.0
-
-    def __init__(
-        self,
-        default: float,
-        val_min: float = 0.0,
-        val_max: float = 1.0,
-        *,
-        map_mode: str = "linear",
-        ticks: list[float] | None = None,
-        log_scale: bool = False,
-        nuke_gamma_map: bool = False,
-        parent: QWidget | None = None,
-    ):
-        super().__init__(parent)
-        # Back-compat kwargs from older call sites.
-        if nuke_gamma_map:
-            map_mode = "pivot"
-        elif log_scale:
-            map_mode = "log"
-        mode = map_mode if map_mode in ("linear", "log", "pivot") else "linear"
-
-        self._default = default
-        self._map_mode = mode
-        self._val_min = float(val_min)
-        self._val_max = float(val_max)
-        self._ticks_override = list(ticks) if ticks is not None else None
-        self._value = max(self._val_min, min(self._val_max, float(default)))
-        self._dragging = False
-
-        if self._map_mode == "log":
-            self._log_min = math.log(max(self._val_min, 1e-10))
-            self._log_max = math.log(max(self._val_max, 1e-10))
-        else:
-            self._log_min = 0.0
-            self._log_max = 1.0
-
-        # Precompute asinh denominators for pivot mode (range-driven).
-        k = self._PIVOT_K
-        pivot = self._PIVOT
-        self._pivot_den_lo = math.asinh(k * max(pivot - self._val_min, 0.0))
-        self._pivot_den_hi = math.asinh(k * max(self._val_max - pivot, 0.0))
-
-        self.setMinimumHeight(22)
-        self.setMaximumHeight(22)
-        self.setMinimumWidth(80)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        self._font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-        self._font.setPointSize(8)
-
-    # -- value <-> normalised track position t ∈ [0, 1] --
-
-    def _value_to_t(self, val: float) -> float:
-        val = max(self._val_min, min(self._val_max, val))
-        if self._map_mode == "pivot":
-            return self._pivot_value_to_t(val)
-        if self._map_mode == "log":
-            return (math.log(max(val, 1e-10)) - self._log_min) / max(
-                self._log_max - self._log_min, 1e-10
-            )
-        return (val - self._val_min) / max(self._val_max - self._val_min, 1e-10)
-
-    def _t_to_value(self, t: float) -> float:
-        t = max(0.0, min(1.0, t))
-        if self._map_mode == "pivot":
-            return self._pivot_t_to_value(t)
-        if self._map_mode == "log":
-            return math.exp(self._log_min + t * (self._log_max - self._log_min))
-        return self._val_min + t * (self._val_max - self._val_min)
-
-    def _pivot_value_to_t(self, val: float) -> float:
-        """Map value → t with pivot fixed at 0.5; denser resolution near pivot."""
-        k = self._PIVOT_K
-        pivot = self._PIVOT
-        if val >= pivot:
-            den = self._pivot_den_hi
-            if den <= 1e-12:
-                return 0.5
-            return 0.5 + 0.5 * math.asinh(k * (val - pivot)) / den
-        den = self._pivot_den_lo
-        if den <= 1e-12:
-            return 0.5
-        return 0.5 - 0.5 * math.asinh(k * (pivot - val)) / den
-
-    def _pivot_t_to_value(self, t: float) -> float:
-        k = self._PIVOT_K
-        pivot = self._PIVOT
-        if t >= 0.5:
-            u = (t - 0.5) / 0.5
-            den = self._pivot_den_hi
-            if den <= 1e-12 or k <= 1e-12:
-                return pivot
-            return pivot + math.sinh(u * den) / k
-        u = (0.5 - t) / 0.5
-        den = self._pivot_den_lo
-        if den <= 1e-12 or k <= 1e-12:
-            return pivot
-        return pivot - math.sinh(u * den) / k
-
-    def _margin_left(self) -> int:
-        return 2
-
-    def _margin_right(self) -> int:
-        return 2
-
-    def _track_x(self) -> tuple[int, int]:
-        ml = self._margin_left()
-        return ml, self.width() - self._margin_right() - ml
-
-    def _t_to_x(self, t: float) -> float:
-        ml, track_w = self._track_x()
-        return ml + t * track_w
-
-    def _x_to_t(self, x: float) -> float:
-        ml, track_w = self._track_x()
-        if track_w <= 0:
-            return 0.0
-        return (x - ml) / track_w
-
-    # -- procedural nice ticks (range + width driven) --
-
-    def _target_tick_count(self) -> int:
-        """How many tick candidates fit the current track width."""
-        _, track_w = self._track_x()
-        if track_w <= 0:
-            return 5
-        return max(3, min(24, int(track_w / self._MIN_TICK_GAP_PX)))
-
-    @staticmethod
-    def _nice_step(span: float, target_intervals: int) -> float:
-        """1–2–5 × 10^k step covering *span* in ~*target_intervals* steps."""
-        if span <= 0 or target_intervals <= 0:
-            return 1.0
-        raw = span / max(target_intervals, 1)
-        if raw <= 0:
-            return 1.0
-        exp = math.floor(math.log10(raw))
-        base = 10.0**exp
-        frac = raw / base
-        if frac <= 1.5:
-            nice = 1.0
-        elif frac <= 3.5:
-            nice = 2.0
-        elif frac <= 7.5:
-            nice = 5.0
-        else:
-            nice = 10.0
-        return nice * base
-
-    @classmethod
-    def _nice_linear_ticks(cls, vmin: float, vmax: float, target_n: int) -> list[float]:
-        """Even nice-number ticks on a linear span."""
-        if vmax <= vmin:
-            return [vmin]
-        step = cls._nice_step(vmax - vmin, max(target_n - 1, 1))
-        if step <= 0:
-            return [vmin, vmax]
-        # Align start to a multiple of step at or below vmin.
-        start = math.floor(vmin / step + 1e-12) * step
-        ticks: list[float] = []
-        # Guard against float runaway.
-        v = start
-        for _ in range(512):
-            if v > vmax + step * 0.5:
-                break
-            if v >= vmin - step * 1e-9:
-                ticks.append(round(v, 12))
-            v += step
-        if not ticks or ticks[0] > vmin + 1e-9:
-            ticks.insert(0, vmin)
-        if ticks[-1] < vmax - 1e-9:
-            ticks.append(vmax)
-        # Dedup near-equals
-        out: list[float] = []
-        for t in ticks:
-            if not out or abs(t - out[-1]) > step * 1e-6:
-                out.append(t)
-        return out
-
-    @classmethod
-    def _nice_log_ticks(cls, vmin: float, vmax: float, target_n: int) -> list[float]:
-        """1–2–5 decade ticks, thinned when the range is dense for *target_n*."""
-        if vmax <= vmin:
-            return [max(vmin, 1e-10)]
-        lo = max(vmin, 1e-10)
-        hi = max(vmax, lo * 1.0001)
-        exp0 = math.floor(math.log10(lo))
-        exp1 = math.ceil(math.log10(hi))
-        # Multipliers: full 1-2-5, or thinner 1-5 / decades only when crowded.
-        decades = max(exp1 - exp0, 1)
-        if target_n >= decades * 3:
-            mults = (1.0, 2.0, 5.0)
-        elif target_n >= decades * 1.5:
-            mults = (1.0, 5.0)
-        else:
-            mults = (1.0,)
-        ticks: list[float] = []
-        for e in range(exp0, exp1 + 1):
-            for m in mults:
-                v = m * (10.0**e)
-                if lo <= v <= hi:
-                    ticks.append(v)
-        if not ticks or ticks[0] > lo * 1.01:
-            ticks.insert(0, lo)
-        if ticks[-1] < hi * 0.99:
-            ticks.append(hi)
-        return ticks
-
-    def _generate_ticks(self) -> list[float]:
-        """Build tick values from range + map mode + current width budget."""
-        vmin, vmax = self._val_min, self._val_max
-        if vmax <= vmin:
-            return [vmin]
-        n = self._target_tick_count()
-
-        if self._map_mode == "log":
-            return self._nice_log_ticks(vmin, vmax, n)
-
-        if self._map_mode == "pivot":
-            pivot = self._PIVOT
-            # Split budget proportional to track halves (always 50/50 in t).
-            n_lo = max(2, n // 2)
-            n_hi = max(2, n - n_lo)
-            ticks: list[float] = []
-            if vmin < pivot:
-                ticks.extend(self._nice_linear_ticks(vmin, pivot, n_lo))
-            else:
-                ticks.append(vmin)
-            if vmax > pivot:
-                hi = self._nice_linear_ticks(pivot, vmax, n_hi)
-                # Avoid duplicating the pivot from both halves.
-                ticks.extend(v for v in hi if abs(v - pivot) > 1e-12)
-            else:
-                if abs(ticks[-1] - vmax) > 1e-12:
-                    ticks.append(vmax)
-            return sorted({round(v, 12) for v in ticks})
-
-        return self._nice_linear_ticks(vmin, vmax, n)
-
-    def _ticks_for_paint(self) -> list[float]:
-        if self._ticks_override is not None:
-            return self._ticks_override
-        return self._generate_ticks()
-
-    @staticmethod
-    def _format_tick(tick_val: float) -> str:
-        if abs(tick_val - round(tick_val)) < 1e-9 and abs(tick_val) >= 1.0 - 1e-9:
-            return str(int(round(tick_val)))
-        if abs(tick_val) >= 10:
-            return f"{tick_val:.0f}"
-        if abs(tick_val) >= 1:
-            # Prefer "1" / "2" over "1.0" when close to integers.
-            if abs(tick_val - round(tick_val)) < 1e-6:
-                return str(int(round(tick_val)))
-            return f"{tick_val:.1f}"
-        if abs(tick_val) >= 0.1:
-            return f"{tick_val:.1f}"
-        if abs(tick_val) >= 0.01:
-            return f"{tick_val:.2f}"
-        return f"{tick_val:g}"
-
-    # -- public interface --
-
-    def value(self) -> float:
-        return self._value
-
-    def setValue(self, val: float) -> None:
-        val = max(self._val_min, min(self._val_max, val))
-        if val != self._value:
-            self._value = val
-            self.update()
-
-    # -- painting --
-
-    def paintEvent(self, _event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-
-        # background
-        p.fillRect(0, 0, w, h, self._BG)
-
-        groove_y = h // 2
-        ml, track_w = self._track_x()
-
-        # groove line
-        p.setPen(QPen(self._GROOVE, 1))
-        p.drawLine(ml, groove_y, ml + track_w, groove_y)
-
-        # default-value mark (thin dim vertical line)
-        def_t = self._value_to_t(self._default)
-        def_x = self._t_to_x(def_t)
-        p.setPen(QPen(self._DEFAULT_MARK, 1))
-        p.drawLine(int(def_x), 2, int(def_x), h - 2)
-
-        # Tick marks + labels: candidates from curve/range; labels thinned by width.
-        p.setFont(self._font)
-        fm = QFontMetricsF(self._font)
-        last_label_right = -1e9
-        last_tick_x = -1e9
-        for tick_val in self._ticks_for_paint():
-            t = self._value_to_t(tick_val)
-            tx = self._t_to_x(t)
-            # Cull tick marks that sit on top of each other when narrowed.
-            if tx - last_tick_x < self._MIN_TICK_GAP_PX * 0.55:
-                continue
-            last_tick_x = tx
-            p.setPen(QPen(self._TICK, 1))
-            p.drawLine(int(tx), groove_y - 3, int(tx), groove_y + 3)
-
-            label = self._format_tick(tick_val)
-            lw = fm.horizontalAdvance(label)
-            lx = tx - lw / 2
-            lx = max(0.0, min(float(w) - lw, lx))
-            if lx < last_label_right + self._MIN_LABEL_GAP_PX:
-                continue
-            p.setPen(self._LABEL_COLOR)
-            p.drawText(int(lx), h - 2, label)
-            last_label_right = lx + lw
-
-        # indicator line (current value)
-        cur_t = self._value_to_t(self._value)
-        cur_x = self._t_to_x(cur_t)
-        p.setPen(QPen(self._INDICATOR, 2))
-        p.drawLine(int(cur_x), 1, int(cur_x), h - 1)
-
-        p.end()
-
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        # Tick density / labels reflow from width.
-        super().resizeEvent(event)
-        self.update()
-
-    # -- mouse interaction --
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.RightButton:
-            # Right-click resets to default (common in viewers; complements double-click).
-            if self._value != self._default:
-                self._value = self._default
-                self.update()
-                self.valueChanged.emit(self._value)
-            event.accept()
-            return
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._set_from_x(event.position().x())
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._dragging:
-            self._set_from_x(event.position().x())
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
-            self._dragging = False
-            event.accept()
-        else:
-            super().mouseReleaseEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """Reset to default on double-click."""
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._value = self._default
-            self.update()
-            self.valueChanged.emit(self._value)
-            event.accept()
-        else:
-            super().mouseDoubleClickEvent(event)
-
-    def _set_from_x(self, x: float) -> None:
-        t = self._x_to_t(x)
-        val = self._t_to_value(t)
-        self._value = val
-        self.update()
-        self.valueChanged.emit(self._value)
 
 
 def extract_thumbnail_b64(
@@ -732,18 +276,11 @@ def _exr_rgb_to_slate_authoring(
 
 
 def oiio_colorspace_attr(path: str) -> str:
-    """Return ``oiio:ColorSpace`` from an EXR if present."""
+    """Return the pixel colorspace for *path* (prefers our write attribute)."""
     try:
-        import OpenImageIO as oiio
+        from ..core.sequence import probe_pixel_colorspace
 
-        inp = oiio.ImageInput.open(path)
-        if inp is None:
-            return ""
-        try:
-            cs = inp.spec().getattribute("oiio:ColorSpace")
-            return str(cs) if cs else ""
-        finally:
-            inp.close()
+        return probe_pixel_colorspace(path)
     except Exception:
         return ""
 
@@ -1305,313 +842,37 @@ class SlateFormPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Slate preview (single pan/zoom graphics view for all tabs)
-# ---------------------------------------------------------------------------
-
-
-class SlatePreviewView(QGraphicsView):
-    """Single QGraphicsView with Nuke-style pan/zoom for the slate editor.
-
-    Both the slate HTML proxy and the shot-preview (thumbnail + burn-in)
-    proxy live in the **same** scene.  A tab bar toggles which group is
-    visible — one view, one transform, one background.
-
-    Controls:
-      - MMB drag: pan
-      - Scroll wheel: zoom to cursor
-      - RMB drag: zoom (horizontal, anchored at press position)
-      - F key: fit in view
-    """
-
-    WHEEL_SCALE_FACTOR = 1.0 / 4.0
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._scene = QGraphicsScene(self)
-        self.setScene(self._scene)
-
-        # No SmoothPixmapTransform — nearest/raw pixels when zooming (matches GPU path).
-        self.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setFrameShape(QGraphicsView.Shape.NoFrame)
-        self.setBackgroundBrush(QBrush(QColor("#323232")))
-
-        self._scene.setSceneRect(-1e6, -1e6, 2e6, 2e6)
-
-        self._slate_rect = QRectF(0, 0, 1920, 1080)
-
-        self._panning = False
-        self._zooming = False
-        self._last_pos: QPointF | None = None
-        self._zoom_anchor_view: QPointF | None = None
-
-    def set_slate_size(self, w: int, h: int) -> None:
-        preview_h = 1080
-        preview_w = int(preview_h * w / max(h, 1))
-        self._slate_rect = QRectF(0, 0, preview_w, preview_h)
-
-    def fit_in_view(self) -> None:
-        self.fitInView(self._slate_rect, Qt.AspectRatioMode.KeepAspectRatio)
-
-    def _scale_at(self, factor: float, view_anchor: QPointF) -> None:
-        cur = self.transform().m11()
-        target = max(ZOOM_MIN, min(ZOOM_MAX, cur * factor))
-        s = target / cur
-        if abs(s - 1.0) < 1e-7:
-            return
-        scene_pt = self.mapToScene(view_anchor.toPoint())
-        cx, cy = scene_pt.x(), scene_pt.y()
-        t = self.transform()
-        t.translate(cx, cy)
-        t.scale(s, s)
-        t.translate(-cx, -cy)
-        self.setTransform(t)
-
-    def _translate_view(self, dx: float, dy: float) -> None:
-        t = self.transform()
-        s = t.m11()
-        t.translate(dx / s, dy / s)
-        self.setTransform(t)
-
-    # -- events --
-
-    def mousePressEvent(self, event):
-        btn = event.button()
-        if btn in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
-            self._panning = True
-            self._last_pos = event.position()
-            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
-            event.accept()
-            return
-        if btn == Qt.MouseButton.RightButton:
-            self._zooming = True
-            self._last_pos = event.position()
-            self._zoom_anchor_view = event.position()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        pos = event.position()
-        if self._panning and self._last_pos is not None:
-            delta = pos - self._last_pos
-            self._last_pos = pos
-            self._translate_view(delta.x(), delta.y())
-            event.accept()
-            return
-        if self._zooming and self._last_pos is not None:
-            dx = pos.x() - self._last_pos.x()
-            self._last_pos = pos
-            s = 1.02 ** (dx * 0.5)
-            anchor = self._zoom_anchor_view
-            if anchor is not None:
-                self._scale_at(s, anchor)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        btn = event.button()
-        if btn in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton) and self._panning:
-            self._panning = False
-            self._last_pos = None
-            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
-            event.accept()
-            return
-        if btn == Qt.MouseButton.RightButton and self._zooming:
-            self._zooming = False
-            self._last_pos = None
-            self._zoom_anchor_view = None
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def wheelEvent(self, event: QWheelEvent):
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-        s = 1.02 ** (delta * self.WHEEL_SCALE_FACTOR)
-        self._scale_at(s, event.position())
-        event.accept()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_F and not event.modifiers():
-            self.fit_in_view()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-
-
-# ---------------------------------------------------------------------------
-# Transport / shuttle bar
-# ---------------------------------------------------------------------------
-
-
-_SHUTTLE_BTN_STYLE = (
-    "QPushButton { background: #2a2a2a; color: #e0e0e0;"
-    " border: 1px solid #3c3c3c; border-radius: 3px;"
-    " font-size: 12px; padding: 0; }"
-    "QPushButton:hover { background: #3c3c3c; }"
-    "QPushButton:pressed { background: #c87828; }"
-    "QPushButton:checked { background: #c87828; color: #fff; }"
-)
-
-
-class _ShuttleBar(QWidget):
-    """Tiny transport strip: first / step-back / play-pause / step-forward / last.
-
-    Drives a :class:`TimelineSlider` directly — give it the timeline and it
-    handles all wiring including a :class:`QTimer` for playback at *fps*.
-    """
-
-    def __init__(
-        self,
-        timeline: TimelineSlider,
-        fps: float = 24.0,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._timeline = timeline
-        self._fps = max(1.0, fps)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(2)
-
-        self._btn_first = self._make_btn("\u23ee", "Go to first frame")
-        self._btn_back = self._make_btn("\u23ea", "Step back one frame")
-        self._btn_play = self._make_btn("\u25b6", "Play / pause")
-        self._btn_play.setCheckable(True)
-        self._btn_fwd = self._make_btn("\u23e9", "Step forward one frame")
-        self._btn_last = self._make_btn("\u23ed", "Go to last frame")
-
-        for btn in (
-            self._btn_first,
-            self._btn_back,
-            self._btn_play,
-            self._btn_fwd,
-            self._btn_last,
-        ):
-            layout.addWidget(btn)
-
-        self._btn_first.clicked.connect(self._on_first)
-        self._btn_back.clicked.connect(self._on_back)
-        self._btn_play.toggled.connect(self._on_play_toggled)
-        self._btn_fwd.clicked.connect(self._on_fwd)
-        self._btn_last.clicked.connect(self._on_last)
-
-        self._timer = QTimer(self)
-        self._advance_cb: Callable[[], None] | None = None
-        self._timer.timeout.connect(self._on_timer_tick)
-        self._refresh_timer_interval()
-
-        # If the user grabs the playhead, stop playback so the timer doesn't
-        # fight their drag.
-        self._timeline.value_changed.connect(self._on_user_scrubbed)
-
-    def set_advance_callback(self, callback: Callable[[], None] | None) -> None:
-        """Replace the default per-tick advance with a custom callback.
-
-        Used by the slate dialog for cache-first playback (stall until the next
-        frame is in RAM).  Pass ``None`` to restore the default step-forward.
-        """
-        self._advance_cb = callback
-
-    def is_timer_active(self) -> bool:
-        return self._timer.isActive()
-
-    def stop_timer(self) -> None:
-        self._timer.stop()
-
-    def start_timer(self) -> None:
-        self._timer.start()
-
-    @staticmethod
-    def _make_btn(text: str, tooltip: str) -> QPushButton:
-        b = QPushButton(text)
-        b.setStyleSheet(_SHUTTLE_BTN_STYLE)
-        b.setFixedSize(26, 22)
-        b.setToolTip(tooltip)
-        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        return b
-
-    def set_fps(self, fps: float) -> None:
-        self._fps = max(1.0, fps)
-        self._refresh_timer_interval()
-
-    def _refresh_timer_interval(self) -> None:
-        self._timer.setInterval(max(10, int(round(1000.0 / self._fps))))
-
-    def _on_first(self) -> None:
-        self._timeline.set_value(self._timeline._first)
-        self._timeline.value_changed.emit(self._timeline.value())
-
-    def _on_last(self) -> None:
-        self._timeline.set_value(self._timeline._last)
-        self._timeline.value_changed.emit(self._timeline.value())
-
-    def _on_back(self) -> None:
-        self._timeline.set_value(self._timeline.value() - 1)
-        self._timeline.value_changed.emit(self._timeline.value())
-
-    def _on_fwd(self) -> None:
-        self._timeline.set_value(self._timeline.value() + 1)
-        self._timeline.value_changed.emit(self._timeline.value())
-
-    def _on_play_toggled(self, checked: bool) -> None:
-        self._btn_play.setText("\u23f8" if checked else "\u25b6")
-        if checked:
-            self._timer.start()
-        else:
-            self._timer.stop()
-
-    def _on_user_scrubbed(self, _frame: int) -> None:
-        # Only stop playback when the user drags the head, not when the
-        # play timer itself fired set_value → value_changed.
-        if self._btn_play.isChecked() and self._timeline._dragging_playhead:
-            self._btn_play.setChecked(False)
-
-    def _on_timer_tick(self) -> None:
-        if self._advance_cb is not None:
-            self._advance_cb()
-        else:
-            self._advance()
-
-    def _advance(self) -> None:
-        cur = self._timeline.value()
-        nxt = cur + 1
-        if nxt > self._timeline._last:
-            nxt = self._timeline._first
-        self._timeline.set_value(nxt)
-        self._timeline.value_changed.emit(nxt)
-
-
-# ---------------------------------------------------------------------------
 # Slate dialog
 # ---------------------------------------------------------------------------
+
+
+class _SlateOverlayHooks:
+    """OverlayHooks adapter: synthetic slate frame + burn-in/watermark layers."""
+
+    def __init__(self, dialog: SlateDialog) -> None:
+        self._d = dialog
+
+    def is_synthetic_frame(self, frame: int) -> bool:
+        return frame == self._d._slate_frame and self._d._slate_frame_active()
+
+    def render_synthetic_frame(self, frame: int) -> tuple[object, str] | None:
+        return self._d._render_slate_pixels()
+
+    def gpu_overlay_rgba(self, w: int, h: int, frame: int) -> tuple[object | None, object]:
+        return self._d._gpu_overlay_layer(w, h)
+
+    def cpu_composite_overlays(self, working_f32: object, frame: int) -> object:
+        return self._d._composite_overlays_working_space(working_f32, is_shot=True)
+
+    def invalidate(self) -> None:
+        self._d._invalidate_overlay_cache()
 
 
 class SlateDialog(QDialog):
     """Modal dialog for editing slate + burn-in overlay data with live preview.
 
-    Left side: :class:`SlateFormPanel` in a scroll area.
-    Right side: preview + Nuke-style :class:`TimelineSlider`.  Frame
-    ``first - 1`` shows the slate; frames ``first .. last`` show the actual
-    EXR shot frames with burn-in / watermark composited on top.
-
-    Shot frames are decoded into a :class:`~src.services.frame_cache.FrameCache`
-    (float16 working-space when OCIO is available) and prefetched ahead of the
-    playhead.  Display is preferably **GPU OCIO** (:class:`OcioGpuImagePlane`):
-    a cache hit is texture upload + GLSL display transform — not a full-res
-    CPU ``applyRGB``.  CPU display is the fallback when OpenGL is unavailable.
+    Left: :class:`SlateFormPanel`. Center: :class:`SequencePlayer` (shot frames
+    + optional slate marker). Right: burn-in / watermark controls.
     """
 
     def __init__(
@@ -1639,13 +900,7 @@ class SlateDialog(QDialog):
         self._src_colorspace = src_colorspace
         self._dst_colorspace = dst_colorspace
 
-        # Cache of OCIO CPUProcessors keyed by transform direction/spaces.
-        # Populated lazily by the various ``_get_*_proc`` helpers, several of
-        # which run during ``__init__`` (e.g. via ``_build_worker_frame_transform``).
-        self._ocio_proc_cache: dict[tuple, object] = {}
-
-        # Output metadata (resolution, fps, frame range, colorspace) comes from
-        # the conversion tab — seed the model once when the dialog opens.
+        # Output metadata seeds the model once when the dialog opens.
         init_fields: dict[str, str] = {}
         if frame_range:
             init_fields["frame_range"] = frame_range
@@ -1658,81 +913,15 @@ class SlateDialog(QDialog):
                 resolution=init_res,
             )
 
-        # Preview pipeline (working-space comp + live viewer controls):
-        #
-        #   FrameCache (float16 working when prefetch transform is on)
-        #     │  main thread: float16→float32 + alpha-over overlays
-        #     ▼
-        #   _composed_working_f32
-        #     │  GPU: upload texture → OCIO GLSL display/view (+ dynamic EC)
-        #     │  CPU fallback: applyRGB → QImage → QGraphicsView
-        #     ▼
-        #   preview
-        #
-        # Gain/gamma are OCIO dynamic ExposureContrast properties (uniforms on
-        # GPU; dynamic CPU props on fallback). Display/view rebuilds the processor
-        # only when the combo changes.
-        self._comp_f32 = None
-        self._comp_src_space = ""
-        self._working_f32 = None
-        self._working_space: str = ""
-        self._display_f32 = None
-        self._composed_working_f32 = None
-        self._preview_pixmap_item = None
-        self._gpu_plane: OcioGpuImagePlane | None = None
-        self._use_gpu = False
-
-        # Cache of linearised burn-in / watermark RGBA overlays, keyed by a
-        # signature of (size + content). Rebuilt only when the overlay content
-        # or frame size changes; read on every composite pass.
+        # Overlay linearisation cache (burn-in / watermark).
         self._overlay_lin_cache: dict[str, object] = {}
+        self._working_space: str = ""
 
-        # Dynamic working→display viewer processor + its live EC properties
-        # (rebuilt on display/view/working-space change). Read on the first
-        # composite pass, so must exist before any render helper runs.
-        self._viewer_display_proc = None
-        self._ec_exposure_prop = None
-        self._ec_gamma_prop = None
-        self._last_viewer_display: tuple[str, str, str] | None = None
-
-        # Shot frame cache + parallel prefetch (EXR → uint16 RGB in RAM)
-        self._exr_seq = None
-        self._shot_frames: list[int] = []
-        self._shot_frames_set: set[int] = set()
+        # Shot range bookkeeping for markers / tokens (filled after load).
         self._first_shot: int | None = None
         self._last_shot: int | None = None
         self._slate_frame: int = 0
-        self._current_frame: int = 0
-        self._shot_cache = FrameCache(
-            cache_budget_bytes(self._model.settings),
-            self,
-        )
-        self._prefetch: ExrPrefetchService | None = None
-        self._playback_wait_frame: int | None = None
-        self._cache_paused = False
-        # Optional cache-status widgets (only built when EXR shot frames exist).
-        self._cache_pct_slider: QSlider | None = None
-        self._cache_pct_label: QLabel | None = None
-        self._cache_bar: QProgressBar | None = None
-        self._cache_pause_btn: QToolButton | None = None
-        self._cache_clear_btn: QToolButton | None = None
-
-        # Resolve EXR frame range (only available for exr2video mode)
-        if input_path and mode == "exr2video":
-            try:
-                from ..core.sequence import find_exr_sequence_info
-
-                _paths, _name, frames, _pad, seq = find_exr_sequence_info(input_path)
-                if frames:
-                    self._shot_frames = sorted(frames)
-                    self._shot_frames_set = set(self._shot_frames)
-                    self._first_shot = self._shot_frames[0]
-                    self._last_shot = self._shot_frames[-1]
-                    self._exr_seq = seq
-                    self._slate_frame = self._first_shot - 1
-                    self._current_frame = self._slate_frame
-            except Exception:
-                log.exception("Could not resolve EXR sequence for slate preview: %s", input_path)
+        self._has_sequence = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1740,7 +929,7 @@ class SlateDialog(QDialog):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # --- Left: slate metadata form (burn-in / watermark hosted separately) ---
+        # --- Left: slate metadata form ---
         self._form = SlateFormPanel(model, input_path=input_path, embed_overlays=False)
 
         if input_path:
@@ -1771,76 +960,47 @@ class SlateDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         splitter.addWidget(scroll)
 
-        # --- Center: viewer controls + preview + timeline ---
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
-
-        # Preview surface first so viewer-control wiring can push GPU view state.
-        self._preview = SlatePreviewView()
-        self._preview_stack = QStackedWidget()
-        self._preview_stack.addWidget(self._preview)
-        if gpu_ocio_available():
-            try:
-                self._gpu_plane = OcioGpuImagePlane()
-                self._gpu_plane.gpu_failed.connect(self._on_gpu_failed)
-                self._preview_stack.addWidget(self._gpu_plane)
-                self._use_gpu = True
-                self._preview_stack.setCurrentWidget(self._gpu_plane)
-                log.info("Slate preview: GPU OCIO display enabled")
-            except Exception:
-                log.exception("GPU OCIO preview init failed; using CPU path")
-                self._gpu_plane = None
-                self._use_gpu = False
-
-        self._build_viewer_controls(right_layout)
-        right_layout.addWidget(self._preview_stack, 1)
+        # --- Center: reusable sequence player ---
+        self._player = SequencePlayer(
+            settings=self._model.settings,
+            show_cache_ui=True,
+        )
+        self._overlay_hooks = _SlateOverlayHooks(self)
+        self._player.set_overlay_hooks(self._overlay_hooks)
 
         w, h = self.resolution()
-        self._preview.set_slate_size(w, h)
+        self._player.set_resolution(w, h)
+        fps = self.fps()
+        if fps > 0:
+            self._player.set_fps(fps)
 
-        # Timeline scrubber + shuttle controls (only meaningful when there
-        # are shot frames to scrub through).
-        self._timeline: TimelineSlider | None = None
-        self._shuttle: _ShuttleBar | None = None
-        if self._exr_seq is not None and self._shot_frames:
-            self._timeline = TimelineSlider()
-            ideal_h = self._timeline._ideal_height()
-            self._timeline.setFixedHeight(ideal_h)
-            last = self._last_shot if self._last_shot is not None else self._slate_frame
-            self._timeline.set_range(self._slate_frame, last)
-            self._timeline.set_marker_frames({self._slate_frame: "SLATE"})
-            self._timeline.set_value(self._slate_frame)
-            self._timeline.value_changed.connect(self._on_timeline_changed)
-
-            self._shuttle = _ShuttleBar(self._timeline, fps=self.fps())
-            self._shuttle.setFixedHeight(ideal_h)
-            # Cache-first playback: stall until the next frame is in RAM.
-            self._shuttle.set_advance_callback(self._playback_tick)
-
-            self._prefetch = ExrPrefetchService(
-                self._exr_seq,
-                self._shot_cache,
-                self._shot_frames,
-                max_workers=_PREFETCH_WORKERS,
-                frame_transform=self._build_worker_frame_transform(),
-                parent=self,
+        if input_path and mode == "exr2video":
+            ok = self._player.load_sequence(
+                input_path,
+                fps=fps if fps > 0 else 24.0,
+                ocio_cfg=self._ocio_cfg,
+                src_colorspace=self._src_colorspace or "",
+                resolution=(w, h),
             )
-            self._prefetch.frame_loaded.connect(self._on_prefetch_frame_loaded)
-            self._shot_cache.cache_changed.connect(self._on_shot_cache_changed)
-            self._shuttle._btn_play.toggled.connect(self._on_shuttle_play_toggled)
+            if ok:
+                self._has_sequence = True
+                self._first_shot = self._player.first_shot_frame()
+                self._last_shot = self._player.last_shot_frame()
+                if self._first_shot is not None:
+                    self._slate_frame = self._first_shot - 1
+        else:
+            # Still pass OCIO so slate-only preview gets a proper display transform.
+            self._player.load_sequence(
+                "",
+                fps=fps if fps > 0 else 24.0,
+                ocio_cfg=self._ocio_cfg,
+                src_colorspace=self._src_colorspace or "",
+                resolution=(w, h),
+            )
 
-            transport_row = QHBoxLayout()
-            transport_row.setContentsMargins(0, 0, 0, 0)
-            transport_row.setSpacing(0)
-            transport_row.addWidget(self._shuttle)
-            transport_row.addWidget(self._timeline, 1)
-            right_layout.addLayout(transport_row)
+        splitter.addWidget(self._player)
 
-        splitter.addWidget(right_panel)
-
-        # --- Right: burn-in + watermark overlay controls ---
+        # --- Right: burn-in + watermark ---
         overlay_panel = QWidget()
         overlay_layout = QVBoxLayout(overlay_panel)
         overlay_layout.setContentsMargins(12, 12, 12, 12)
@@ -1867,16 +1027,10 @@ class SlateDialog(QDialog):
         layout.addWidget(splitter, 1)
 
         # --- Bottom: status bar ---
-        # Left: hover/status tips (the message area). Right (permanent): a compact
-        # cache cluster, then OK / Cancel. The size grip stays in the corner.
         self._status_bar = QStatusBar()
-        # The native size grip renders blank under our QSS stylesheet, so we
-        # disable it and add a self-painted grip in the corner instead.
         self._status_bar.setSizeGripEnabled(False)
         self._status_bar.setContentsMargins(8, 0, 0, 0)
         self._status_bar.setStyleSheet("QStatusBar::item { border: 0; }")
-        if self._exr_seq is not None and self._shot_frames:
-            self._build_cache_status_bar()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -1887,247 +1041,27 @@ class SlateDialog(QDialog):
         layout.addWidget(self._status_bar)
 
         # --- Live preview wiring ---
-        # Form changes (slate metadata + burn-in fields) → invalidate cached
-        # composites and re-render whatever frame the user is currently on.
         self._refresh_timer = QTimer()
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(120)
-        self._refresh_timer.timeout.connect(self._refresh_current_frame)
+        self._refresh_timer.timeout.connect(self._on_form_refresh)
 
         self._form.data_changed.connect(lambda _: self._refresh_timer.start())
-        # React to the slate being enabled/disabled so the timeline can add or
-        # remove the slate frame from the scrubbable range live.
         self._model.changed.connect(self._on_model_section_changed)
 
         QTimer.singleShot(0, self._apply_slate_visibility)
-        QTimer.singleShot(0, self._refresh_current_frame)
-        QTimer.singleShot(0, self._sync_prefetch)
-        QTimer.singleShot(0, self._preview.fit_in_view)
+        QTimer.singleShot(0, self._on_form_refresh)
+        QTimer.singleShot(0, self._player.fit_in_view)
 
-    # -- Viewer controls (Nuke-style) --
+    def _slate_frame_active(self) -> bool:
+        """True when a synthetic slate frame is part of the scrub range."""
+        if not self._has_sequence:
+            return True
+        return self._model is None or self._model.slate_enabled
 
-    def _build_viewer_controls(self, parent_layout: QVBoxLayout) -> None:
-        """Build Nuke-style gain/gamma sliders + display colorspace combo.
-
-        Sliders take the flexible width; the display/view combo is capped so long
-        ACES labels cannot crush the tracks.
-        """
-        strip = QHBoxLayout()
-        strip.setContentsMargins(4, 1, 4, 1)
-        strip.setSpacing(6)
-
-        # --- Gain value label + slider ---
-        # Nuke: numeric readout goes red when ≠ default (1.0).
-        self._gain_value_label = QLabel("1.0")
-        self._gain_value_label.setFixedWidth(28)
-        self._gain_value_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._style_viewer_value_label(self._gain_value_label, 1.0)
-        strip.addWidget(self._gain_value_label)
-
-        # Log curve + procedural 1–2–5 decade ticks (range-driven).
-        self._gain_slider = NukeSlider(
-            default=1.0,
-            val_min=0.01,
-            val_max=64.0,
-            map_mode="log",
-        )
-        self._gain_slider.setMinimumWidth(140)
-        self._gain_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        strip.addWidget(self._gain_slider, 1)
-
-        strip.addSpacing(8)
-
-        # --- Gamma label + slider ---
-        gamma_lbl = QLabel("\u03b3")
-        gamma_lbl.setFixedWidth(10)
-        gamma_lbl.setStyleSheet("font-size: 10px; color: #888;")
-        strip.addWidget(gamma_lbl)
-
-        self._gamma_value_label = QLabel("1.0")
-        self._gamma_value_label.setFixedWidth(22)
-        self._gamma_value_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._style_viewer_value_label(self._gamma_value_label, 1.0)
-        strip.addWidget(self._gamma_value_label)
-
-        # Pivot-at-1 curve: half track for [0,1], half for [1,max]; ticks auto.
-        self._gamma_slider = NukeSlider(
-            default=1.0,
-            val_min=0.0,
-            val_max=4.0,
-            map_mode="pivot",
-        )
-        self._gamma_slider.setMinimumWidth(140)
-        self._gamma_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        strip.addWidget(self._gamma_slider, 1)
-
-        strip.addSpacing(8)
-
-        # --- Display/view combo: fixed budget so long labels don't steal track width ---
-        self._display_view_combo = QComboBox()
-        self._display_view_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
-        self._display_view_combo.setMinimumContentsLength(12)
-        self._display_view_combo.setMinimumWidth(100)
-        self._display_view_combo.setMaximumWidth(168)
-        self._display_view_combo.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
-        )
-        # Full name still visible in the popup; closed field may elide.
-        self._display_view_combo.setToolTip("OCIO display / view")
-        strip.addWidget(self._display_view_combo, 0)
-
-        parent_layout.addLayout(strip)
-
-        # Populate display/view from OCIO config
-        self._display_view_pairs: list[tuple[str, str]] = []
-        if self._ocio_cfg is not None:
-            self._populate_display_view_combo()
-        else:
-            self._display_view_pairs.append(("sRGB", "Raw"))
-            self._display_view_combo.addItem("sRGB")
-
-        # Gain/gamma: dynamic EC on GPU (uniforms) or CPU processor; display/view
-        # rebuilds the OCIO display leg only.
-        self._gain_slider.valueChanged.connect(self._on_gain_changed)
-        self._gamma_slider.valueChanged.connect(self._on_gamma_changed)
-        self._display_view_combo.currentIndexChanged.connect(
-            lambda _: self._invalidate_display_cache()
-        )
-
-        self._gain = 1.0
-        self._gamma = 1.0
-        self._sync_gpu_view_settings()
-
-    def _populate_display_view_combo(self) -> None:
-        from ..core.ocio_utils import list_displays, list_views
-
-        self._display_view_combo.blockSignals(True)
-        self._display_view_combo.clear()
-        self._display_view_pairs.clear()
-
-        default_display = ""
-        default_view = ""
-        default_idx = 0
-        try:
-            default_display = self._ocio_cfg.getDefaultDisplay()
-            default_view = self._ocio_cfg.getDefaultView(default_display)
-        except Exception:
-            pass
-
-        try:
-            displays = list_displays(self._ocio_cfg)
-            idx = 0
-            for display in displays:
-                views = list_views(self._ocio_cfg, display)
-                for view in views:
-                    self._display_view_pairs.append((display, view))
-                    if len(displays) == 1:
-                        label = view
-                    else:
-                        label = f"{display} / {view}"
-                    self._display_view_combo.addItem(label)
-                    if display == default_display and view == default_view:
-                        default_idx = idx
-                    idx += 1
-        except Exception:
-            pass
-
-        if self._display_view_combo.count() > 0:
-            self._display_view_combo.setCurrentIndex(default_idx)
-        self._display_view_combo.blockSignals(False)
-
-    def _exposure_stops(self) -> float:
-        return math.log2(max(float(getattr(self, "_gain", 1.0)), 1e-10))
-
-    def _on_gpu_failed(self, reason: str) -> None:
-        """Permanent GPU failure — switch preview to the CPU QGraphicsView path."""
-        log.error("Falling back to CPU OCIO preview: %s", reason)
-        self._use_gpu = False
-        if self._preview_stack is not None:
-            self._preview_stack.setCurrentWidget(self._preview)
-        # Re-show current frame on the CPU path.
-        self._apply_display_transform()
-
-    def _sync_gpu_view_settings(self) -> None:
-        """Push display/view + EC state to the GPU plane (no-op if GPU off).
-
-        ``set_ocio_view`` is cheap when the display/view is unchanged (no shader
-        rebuild). Call this on display/view changes and once before first paint —
-        not as a per-frame rebuild.
-        """
-        if self._gpu_plane is None or not self._use_gpu:
-            return
-        if not self._gpu_plane.is_alive():
-            self._use_gpu = False
-            return
-        working = self._resolve_working_space() or self._comp_src_space
-        display, view = "", ""
-        idx = self._display_view_combo.currentIndex()
-        if 0 <= idx < len(self._display_view_pairs):
-            display, view = self._display_view_pairs[idx]
-        self._gpu_plane.set_ocio_view(self._ocio_cfg, working, display, view)
-        self._gpu_plane.set_exposure_stops(self._exposure_stops())
-        self._gpu_plane.set_gamma(float(getattr(self, "_gamma", 1.0)))
-
-    @staticmethod
-    def _style_viewer_value_label(label: QLabel, value: float, *, default: float = 1.0) -> None:
-        """Nuke-style: red readout when value is not exactly the default (1.0)."""
-        is_default = abs(float(value) - default) < 1e-6
-        color = "#d4d4d4" if is_default else "#e05030"
-        label.setStyleSheet(f"font-size: 10px; color: {color};")
-
-    def _on_gain_changed(self, gain: float) -> None:
-        self._gain = gain
-        if abs(gain - 1.0) < 1e-6:
-            txt = "1.0"
-        elif gain >= 10:
-            txt = f"{gain:.0f}"
-        elif gain >= 1:
-            txt = f"{gain:.1f}"
-        elif gain >= 0.1:
-            txt = f"{gain:.2f}"
-        else:
-            txt = f"{gain:.3f}"
-        self._gain_value_label.setText(txt)
-        self._style_viewer_value_label(self._gain_value_label, gain)
-
-        stops = self._exposure_stops()
-        if self._use_gpu and self._gpu_plane is not None and self._gpu_plane.is_alive():
-            self._gpu_plane.set_exposure_stops(stops)
-            return
-        if self._ec_exposure_prop is not None:
-            self._ec_exposure_prop.setDouble(stops)
-            self._reapply_display_with_ec()
-            return
-        self._refresh_gain_gamma()
-
-    def _on_gamma_changed(self, gamma: float) -> None:
-        self._gamma = gamma
-        if abs(gamma - 1.0) < 1e-6:
-            txt = "1.0"
-        elif gamma >= 1:
-            txt = f"{gamma:.1f}"
-        else:
-            txt = f"{gamma:.2f}"
-        self._gamma_value_label.setText(txt)
-        self._style_viewer_value_label(self._gamma_value_label, gamma)
-
-        if self._use_gpu and self._gpu_plane is not None and self._gpu_plane.is_alive():
-            # Post-display pow(x, 1/γ) uniform — no OCIO rebuild.
-            self._gpu_plane.set_gamma(gamma)
-            return
-        # CPU: gamma is a cheap post-display power on the cached buffer.
-        if self._display_f32 is not None:
-            self._paint_display_with_viewer_gamma(self._display_f32)
-            return
-        self._refresh_gain_gamma()
-
-    # -- Tab switching --
+    def _on_form_refresh(self) -> None:
+        self._overlay_hooks.invalidate()
+        self._player.refresh()
 
     def event(self, ev: QEvent) -> bool:
         if ev.type() == QEvent.Type.StatusTip:
@@ -2138,245 +1072,47 @@ class SlateDialog(QDialog):
                 return True
         return super().event(ev)
 
-    # -- Frame routing --
-
-    def _on_timeline_changed(self, frame: int) -> None:
-        """Timeline playhead moved (scrub or shuttle step)."""
-        self._goto_frame(frame)
-
-    def _is_playing(self) -> bool:
-        return self._shuttle is not None and self._shuttle._btn_play.isChecked()
-
-    def _on_shuttle_play_toggled(self, playing: bool) -> None:
-        if not playing:
-            self._playback_wait_frame = None
-            if self._shuttle is not None:
-                self._shuttle.stop_timer()
-        self._shot_cache.set_batch_mode(playing)
-        self._sync_prefetch()
-        if playing:
-            self._playback_tick()
-
-    def _next_playback_frame(self, frame: int) -> int:
-        nxt = frame + 1
-        if self._timeline is not None and nxt > self._timeline._last:
-            nxt = self._timeline._first
-        return nxt
-
-    def _needs_exr_cache(self, frame: int) -> bool:
-        return frame != self._slate_frame and frame in self._shot_frames_set
-
     def _on_model_section_changed(self, section: str) -> None:
-        """Dialog-level reaction to model changes (the form handles its own)."""
         if section == "slate_enabled":
             self._apply_slate_visibility()
 
     def _apply_slate_visibility(self) -> None:
-        """Add or remove the slate frame from the scrubbable timeline.
-
-        When the slate is disabled it shouldn't be reachable in the preview, so
-        we shrink the timeline range to the shot frames and drop the SLATE
-        marker. If the playhead is parked on the slate we move it onto the first
-        shot frame.
-        """
-        if self._timeline is None:
+        """Add or remove the slate frame from the scrubbable timeline."""
+        if not self._has_sequence:
+            # Slate-only: single synthetic frame.
+            self._slate_frame = 0
+            self._player.set_range(0, 0)
+            self._player.set_markers({0: "SLATE"} if self._slate_frame_active() else {})
+            self._player.set_frame(0)
+            self._player.refresh()
             return
-        slate_on = self._model is None or self._model.slate_enabled
+
         first = self._first_shot
         last = self._last_shot
         if first is None or last is None:
             return
+        slate_on = self._slate_frame_active()
         if slate_on:
-            self._timeline.set_range(self._slate_frame, last)
-            self._timeline.set_marker_frames({self._slate_frame: "SLATE"})
+            self._player.set_range(self._slate_frame, last)
+            self._player.set_markers({self._slate_frame: "SLATE"})
+            # Park on the slate frame when first opening (or re-enabling).
+            if self._player.frame() < first:
+                self._player.set_frame(self._slate_frame)
         else:
-            self._timeline.set_range(first, last)
-            self._timeline.set_marker_frames({})
-            if self._current_frame == self._slate_frame:
-                self._goto_frame(first)
+            self._player.set_range(first, last)
+            self._player.set_markers({})
+            if self._player.frame() == self._slate_frame or self._player.frame() < first:
+                self._player.set_frame(first)
+        self._player.refresh()
 
-    def _goto_frame(self, frame: int) -> None:
-        """Move playhead to *frame* and refresh the preview."""
-        if self._timeline is not None:
-            frame = max(self._timeline._first, min(frame, self._timeline._last))
-        if frame == self._current_frame:
-            self._refresh_current_frame()
-            return
-        self._current_frame = frame
-        self._playback_wait_frame = None
-        if self._timeline is not None:
-            self._timeline.set_value(frame)
-        self._sync_prefetch()
-        self._refresh_current_frame()
+    def done(self, result: int) -> None:
+        self._player.shutdown()
+        super().done(result)
 
-    def _sync_prefetch(self) -> None:
-        if self._prefetch is not None and not self._cache_paused:
-            self._prefetch.set_context(
-                self._current_frame,
-                playing=self._is_playing(),
-            )
+    # -- Synthetic slate -----------------------------------------------------
 
-    def _build_cache_status_bar(self) -> None:
-        """Compact RAM-cache cluster pinned to the right of the status bar.
-
-        Layout: [ | ] Cache [slider] 42%  [====usage====] ⏸ ✕
-        Added without stretch so the message area keeps room for hover tips.
-        """
-        muted = "color: #8a8a8a;"
-        cache_host = QWidget()
-        row = QHBoxLayout(cache_host)
-        row.setContentsMargins(0, 0, 6, 0)
-        row.setSpacing(6)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setFrameShadow(QFrame.Shadow.Plain)
-        sep.setStyleSheet("color: #3a3a3a;")
-        row.addWidget(sep)
-
-        cache_lbl = QLabel("Cache")
-        cache_lbl.setStyleSheet(muted)
-        row.addWidget(cache_lbl)
-
-        self._cache_pct_slider = QSlider(Qt.Orientation.Horizontal)
-        self._cache_pct_slider.setRange(1, 90)
-        self._cache_pct_slider.setValue(load_cache_budget_pct(self._model.settings))
-        self._cache_pct_slider.setFixedWidth(80)
-        self._cache_pct_slider.setToolTip("Playback RAM cache as % of system memory")
-        row.addWidget(self._cache_pct_slider)
-
-        # Single label: percentage on the bar, full GB breakdown in its tooltip.
-        self._cache_pct_label = QLabel()
-        self._cache_pct_label.setMinimumWidth(30)
-        self._cache_pct_label.setStyleSheet(muted)
-        row.addWidget(self._cache_pct_label)
-
-        self._cache_bar = QProgressBar()
-        self._cache_bar.setMaximum(1000)
-        self._cache_bar.setFixedWidth(150)
-        self._cache_bar.setFixedHeight(16)
-        self._cache_bar.setTextVisible(True)
-        self._cache_bar.setToolTip("Playback cache memory in use")
-        row.addWidget(self._cache_bar)
-
-        self._cache_pause_btn = QToolButton()
-        self._cache_pause_btn.setText("\u23f8")
-        self._cache_pause_btn.setCheckable(True)
-        self._cache_pause_btn.setAutoRaise(True)
-        self._cache_pause_btn.setFixedSize(24, 22)
-        self._cache_pause_btn.setToolTip("Pause background prefetch")
-        row.addWidget(self._cache_pause_btn)
-
-        self._cache_clear_btn = QToolButton()
-        self._cache_clear_btn.setText("\u2715")
-        self._cache_clear_btn.setAutoRaise(True)
-        self._cache_clear_btn.setFixedSize(24, 22)
-        self._cache_clear_btn.setToolTip("Clear playback cache")
-        row.addWidget(self._cache_clear_btn)
-
-        self._status_bar.addPermanentWidget(cache_host)
-
-        self._cache_pct_slider.valueChanged.connect(self._on_cache_pct_changed)
-        self._cache_pause_btn.toggled.connect(self._on_cache_pause_toggled)
-        self._cache_clear_btn.clicked.connect(self._on_cache_clear)
-        self._update_cache_labels(self._cache_pct_slider.value())
-        self._update_cache_usage_bar()
-
-    def _update_cache_labels(self, pct: int) -> None:
-        budget_gb = total_ram_bytes() * pct / 100 / (1024**3)
-        total_gb = total_ram_bytes() / (1024**3)
-        self._cache_pct_label.setText(f"{pct}%")
-        tip = f"Playback RAM cache: {budget_gb:.1f} of {total_gb:.1f} GB ({pct}%)"
-        self._cache_pct_label.setToolTip(tip)
-        self._cache_pct_slider.setToolTip(tip)
-
-    def _update_cache_usage_bar(self) -> None:
-        used = self._shot_cache.current_bytes
-        budget = self._shot_cache.budget_bytes
-        if budget > 0:
-            self._cache_bar.setValue(min(1000, int(used * 1000 / budget)))
-        else:
-            self._cache_bar.setValue(0)
-        used_mb = used / (1024 * 1024)
-        budget_mb = budget / (1024 * 1024)
-        self._cache_bar.setFormat(f"{used_mb:.0f}/{budget_mb:.0f} MB")
-
-    def _on_cache_pct_changed(self, pct: int) -> None:
-        save_cache_budget_pct(self._model.settings, pct)
-        self._shot_cache.budget_bytes = cache_budget_bytes(self._model.settings)
-        self._update_cache_labels(pct)
-        self._update_cache_usage_bar()
-        self._sync_prefetch()
-
-    def _on_cache_pause_toggled(self, paused: bool) -> None:
-        self._cache_paused = paused
-        self._cache_pause_btn.setText("\u25b6" if paused else "\u23f8")
-        if self._prefetch is not None:
-            self._prefetch.set_paused(paused)
-        if not paused:
-            self._sync_prefetch()
-
-    def _on_cache_clear(self) -> None:
-        self._shot_cache.clear()
-        self._status_bar.showMessage("Playback cache cleared", 2000)
-
-    def _on_shot_cache_changed(self) -> None:
-        self._update_timeline_cache_bar()
-        self._update_cache_usage_bar()
-
-    def _update_timeline_cache_bar(self) -> None:
-        if self._timeline is not None:
-            self._timeline.set_cached_frames(self._shot_cache.cached_frames())
-
-    def _playback_tick(self) -> None:
-        """Shuttle timer: advance playhead; pause until the next shot is cached."""
-        if self._timeline is None or self._shuttle is None or not self._is_playing():
-            return
-
-        cur = self._timeline.value()
-        nxt = self._next_playback_frame(cur)
-
-        if self._needs_exr_cache(nxt) and not self._shot_cache.contains(nxt):
-            self._playback_wait_frame = nxt
-            self._shuttle.stop_timer()
-            if self._prefetch is not None:
-                self._prefetch.request_immediate(nxt)
-            return
-
-        self._goto_frame(nxt)
-
-    def _on_prefetch_frame_loaded(self, frame: int, rgb) -> None:
-        if rgb is None:
-            if frame == self._playback_wait_frame and self._is_playing():
-                # Failed read — skip past the bad frame so playback does not stall.
-                self._playback_wait_frame = None
-                skip = self._next_playback_frame(frame)
-                self._goto_frame(skip)
-                if self._shuttle is not None and not self._shuttle.is_timer_active():
-                    self._shuttle.start_timer()
-            return
-
-        if frame == self._current_frame:
-            self._composite_shot_with_pixels(frame, rgb)
-
-        if frame == self._playback_wait_frame and self._is_playing():
-            self._goto_frame(frame)
-            if self._shuttle is not None and not self._shuttle.is_timer_active():
-                self._shuttle.start_timer()
-
-        self._sync_prefetch()
-
-    def _refresh_current_frame(self) -> None:
-        """Render whichever frame the timeline points at (slate or a shot frame)."""
-        if self._current_frame == self._slate_frame:
-            self._composite_slate()
-        else:
-            self._composite_shot(self._current_frame)
-
-    # -- Slate path --
-
-    def _composite_slate(self) -> None:
-        """Render the slate at preview resolution and feed it into the OCIO pass."""
+    def _render_slate_pixels(self) -> tuple[object, str] | None:
+        """Render slate at preview resolution; return (RGB float32, src colorspace)."""
         import numpy as np
 
         w_full, h_full = self.resolution()
@@ -2391,79 +1127,14 @@ class SlateDialog(QDialog):
             )
         except Exception:
             log.exception("Slate preview render failed")
-            return
+            return None
 
-        self._comp_f32 = np.ascontiguousarray(rgba[..., :3].copy(), dtype=np.float32)
-        # The slate is QPainter-rendered in sRGB.  Tag it with the config's
-        # *resolved* sRGB authoring space (e.g. "sRGB Encoded Rec.709 (sRGB)")
-        # rather than the literal "sRGB", which doesn't exist in ACES configs.
-        # Otherwise src→working silently no-ops and working→display double-
-        # encodes the slate — it would then only look right with a Raw view.
-        self._comp_src_space = self._resolve_overlay_auth_space()
-        self._working_f32 = None
-        self._composed_working_f32 = None
-        self._display_f32 = None
-        self._apply_display_transform()
+        rgb = np.ascontiguousarray(rgba[..., :3].copy(), dtype=np.float32)
+        return rgb, self._resolve_overlay_auth_space()
 
-    # -- Shot path --
-
-    def _composite_shot(self, frame: int) -> None:
-        """Composite burn-in onto shot ``frame`` and feed into the OCIO pass.
-
-        If the frame is cached, runs synchronously.  Otherwise, queues a
-        background load and waits for ``_on_frame_loaded`` to call us again.
-        """
-        rgb = self._shot_cache.get(frame)
-        if rgb is None:
-            if self._prefetch is not None:
-                self._prefetch.request_immediate(frame)
-            return
-        self._composite_shot_with_pixels(frame, rgb)
-
-    def _composite_shot_with_pixels(self, frame: int, rgb) -> None:
-        """Run the OCIO display pass on a cached shot frame and paint it.
-
-        Prefetch stores **unclamped** float16 HDR (working-space when OCIO
-        ran in the worker).  Legacy uint16 cache entries (if any) are still
-        accepted but cannot recover values that were clipped at read time.
-
-        Burn-in and watermark are composited in working space inside
-        :meth:`_apply_display_transform` (GPU overlay texture / CPU path).
-        """
-        import numpy as np
-
-        if rgb.dtype == np.uint16:
-            # Legacy path only — uint16 reads clamp >1.0 at load.
-            self._comp_f32 = rgb.astype(np.float32) / 65535.0
-            self._comp_src_space = self._src_colorspace or ""
-            self._working_f32 = None
-            self._composed_working_f32 = None
-        else:
-            # float16/32 HDR working (or source HDR if no OCIO). Keep float16
-            # for GPU upload — no per-frame widen.
-            self._comp_f32 = None
-            self._comp_src_space = ""
-            self._working_f32 = rgb
-            self._composed_working_f32 = None
-        self._display_f32 = None
-        self._apply_display_transform()
-
-    def done(self, result: int) -> None:
-        """Stop background prefetch workers before the dialog closes."""
-        if self._prefetch is not None:
-            self._prefetch.shutdown()
-            self._prefetch = None
-        super().done(result)
-
-    # -- Working-space comp pipeline --
+    # -- Working-space overlay composite -------------------------------------
 
     def _resolve_working_space(self) -> str:
-        """Return the OCIO compositing colorspace, or '' if unavailable.
-
-        Matches the export pipeline: overlays are composited in a wide-gamut
-        scene-linear space (ACES2065-1 / AP0 when available) so the live
-        preview is colour-accurate to the rendered output.
-        """
         if self._ocio_cfg is None:
             return ""
         if self._working_space:
@@ -2477,50 +1148,7 @@ class SlateDialog(QDialog):
             self._working_space = ""
         return self._working_space
 
-    def _build_worker_frame_transform(self):
-        """Return a worker-thread callable: ``float32 HDR RGB → float16 working RGB``.
-
-        Input is unclamped scene values from :func:`read_exr` (not uint16 —
-        UINT16 reads clamp at 1.0 and kill highlight recovery when exposing
-        down).  OCIO ``src → working`` runs here so cache hits only pay
-        ``working → display`` + gain/gamma on the GUI/GPU path.
-
-        Returns ``None`` if OCIO isn't configured — the cache then stores
-        float16 source HDR (still unclamped).
-        """
-        if self._ocio_cfg is None:
-            return None
-        src_space = self._src_colorspace or ""
-        cpu = self._get_src_to_working_proc(src_space)
-        if cpu is None:
-            return None
-
-        import PyOpenColorIO as OCIO
-
-        def _transform(rgb_f32):
-            # Runs on a prefetch worker thread.  OCIO CPUProcessor.apply()
-            # is documented as thread-safe.
-            import numpy as np
-
-            buf = np.ascontiguousarray(rgb_f32, dtype=np.float32)
-            h, w = buf.shape[:2]
-            try:
-                cpu.apply(OCIO.PackedImageDesc(buf, w, h, 3))
-            except Exception:
-                log.exception("Worker src→working OCIO apply failed")
-                return np.ascontiguousarray(rgb_f32, dtype=np.float16)
-            # float16 preserves working-space headroom (>1.0) for expose-down.
-            return buf.astype(np.float16)
-
-        return _transform
-
     def _resolve_overlay_auth_space(self) -> str:
-        """Resolve the sRGB authoring space for QPainter overlays (slate / burn-in
-        / watermark), matching :func:`convert.run_exr_to_video`.
-
-        Falls back to the literal :data:`SLATE_COLORSPACE` only when no OCIO
-        config is active (the no-colour-management path).
-        """
         if self._ocio_cfg is None:
             return SLATE_COLORSPACE
         try:
@@ -2531,333 +1159,7 @@ class SlateDialog(QDialog):
             log.exception("Could not resolve overlay authoring space")
             return SLATE_COLORSPACE
 
-    def _get_src_to_working_proc(self, src_space: str):
-        """Return a cached OCIO ``src → working`` CPUProcessor (or ``None``)."""
-        if not src_space or self._ocio_cfg is None:
-            return None
-        working_space = self._resolve_working_space()
-        if not working_space:
-            return None
-        key = ("src->work", src_space, working_space)
-        proc = self._ocio_proc_cache.get(key)
-        if proc is not None:
-            return proc
-        try:
-            from ..core.ocio_utils import make_cpu_processor
-
-            proc = make_cpu_processor(self._ocio_cfg, src_space, working_space)
-        except Exception:
-            log.exception(
-                "Failed to build src→working processor (%s → %s)", src_space, working_space
-            )
-            proc = None
-        self._ocio_proc_cache[key] = proc
-        return proc
-
-    def _get_working_to_display_proc(self, display: str, view: str):
-        """Return a cached OCIO ``working → display/view`` CPUProcessor (or ``None``).
-
-        This is the *static* path (no live viewer EC).  The slate preview primarily
-        uses the dynamic viewer processor (see :meth:`_ensure_viewer_display_proc`).
-        """
-        if not display or self._ocio_cfg is None:
-            return None
-        working_space = self._resolve_working_space() or self._comp_src_space
-        if not working_space:
-            return None
-        key = ("work->disp", working_space, display, view)
-        proc = self._ocio_proc_cache.get(key)
-        if proc is not None:
-            return proc
-        try:
-            from ..core.ocio_utils import make_display_processor
-
-            proc = make_display_processor(
-                self._ocio_cfg, working_space, display, view, exposure=0.0, gamma=1.0
-            )
-        except Exception:
-            proc = None
-        self._ocio_proc_cache[key] = proc
-        return proc
-
-    def _ensure_viewer_display_proc(self, display: str, view: str) -> object | None:
-        """Ensure a working→display processor with dynamic gain (exposure).
-
-        Exposure prop is on ``self._ec_exposure_prop``.  Viewer gamma is *not*
-        part of this processor — it is applied post-display (Nuke order).
-        """
-        if not display or self._ocio_cfg is None:
-            self._viewer_display_proc = None
-            self._ec_exposure_prop = None
-            self._ec_gamma_prop = None
-            return None
-
-        working_space = self._resolve_working_space() or self._comp_src_space
-        if not working_space:
-            self._viewer_display_proc = None
-            self._ec_exposure_prop = None
-            self._ec_gamma_prop = None
-            return None
-
-        # Rebuild only when display/view (or working space) actually changed.
-        if self._viewer_display_proc is not None and getattr(
-            self, "_last_viewer_display", None
-        ) == (working_space, display, view):
-            return self._viewer_display_proc
-
-        try:
-            from ..core.ocio_utils import make_viewer_display_processor
-
-            proc, exp_prop, _gamma_unused = make_viewer_display_processor(
-                self._ocio_cfg, working_space, display, view
-            )
-        except Exception:
-            proc, exp_prop = None, None
-
-        self._viewer_display_proc = proc
-        self._ec_exposure_prop = exp_prop
-        self._ec_gamma_prop = None
-        self._last_viewer_display = (working_space, display, view)
-
-        if self._ec_exposure_prop is not None:
-            self._ec_exposure_prop.setDouble(self._exposure_stops())
-
-        return self._viewer_display_proc
-
-    def _build_working_f32(self):
-        """src → working (scene-linear).  Cached; rebuilds only on frame change.
-
-        Returns the existing ``_working_f32`` immediately if a worker
-        transform already produced it — that's the fast playback path.
-        """
-        import numpy as np
-
-        if self._working_f32 is not None:
-            return self._working_f32
-        if self._comp_f32 is None:
-            return None
-
-        cpu = self._get_src_to_working_proc(self._comp_src_space)
-        if cpu is None:
-            self._working_f32 = self._comp_f32
-            return self._working_f32
-
-        try:
-            import PyOpenColorIO as OCIO
-
-            h, w = self._comp_f32.shape[:2]
-            buf = np.ascontiguousarray(self._comp_f32.copy(), dtype=np.float32)
-            cpu.apply(OCIO.PackedImageDesc(buf, w, h, 3))
-            self._working_f32 = buf
-        except Exception:
-            log.exception("GUI-thread src→working OCIO apply failed")
-            self._working_f32 = self._comp_f32
-        return self._working_f32
-
-    def _apply_display_transform(self) -> None:
-        """Working-space composite → display (GPU OCIO preferred).
-
-        GPU path (pyociodisplay-style):
-          plate texture (float16 OK) + cached overlay texture + GLSL OCIO/EC.
-        CPU path: alpha-over overlays then ``applyRGB`` + QImage.
-        """
-        import numpy as np
-
-        working = self._build_working_f32()
-        if working is None:
-            return
-
-        is_shot = self._current_frame != self._slate_frame
-
-        if self._use_gpu and self._gpu_plane is not None and self._gpu_plane.is_alive():
-            # pyociodisplay pattern: plate texture + overlay texture + GPU OCIO.
-            # No full-plate CPU alpha-over; no float16→float32 widen; gain/gamma
-            # are uniforms only (handled in set_exposure/set_gamma).
-            h, w = int(working.shape[0]), int(working.shape[1])
-            if is_shot:
-                ov, ov_key = self._gpu_overlay_layer(w, h)
-                self._gpu_plane.set_overlay_rgba(ov, key=ov_key)
-            else:
-                self._gpu_plane.set_overlay_rgba(None)
-            self._gpu_plane.set_working_image(working)
-            self._composed_working_f32 = None
-            self._display_f32 = None
-            return
-
-        # ---- CPU fallback ----
-        if working.dtype != np.float32:
-            working = np.ascontiguousarray(working, dtype=np.float32)
-        composed = self._composite_overlays_working_space(working, is_shot)
-        self._composed_working_f32 = composed
-        if self._ocio_cfg is None:
-            self._display_f32 = composed
-            self._refresh_gain_gamma()
-            return
-
-        idx = self._display_view_combo.currentIndex()
-        if not (0 <= idx < len(self._display_view_pairs)):
-            self._display_f32 = composed
-            self._refresh_gain_gamma()
-            return
-
-        display, view = self._display_view_pairs[idx]
-        cpu = self._ensure_viewer_display_proc(display, view)
-        if cpu is None:
-            cpu = self._get_working_to_display_proc(display, view)
-            if cpu is None:
-                self._display_f32 = composed
-                self._refresh_gain_gamma()
-                return
-            try:
-                h, w = composed.shape[:2]
-                pixels = np.ascontiguousarray(composed.reshape(-1, 3).copy())
-                cpu.applyRGB(pixels)
-                self._display_f32 = pixels.reshape(h, w, 3)
-            except Exception:
-                log.exception("Static working→display OCIO apply failed")
-                self._display_f32 = composed
-            self._refresh_gain_gamma()
-            return
-
-        try:
-            h, w = composed.shape[:2]
-            pixels = np.ascontiguousarray(composed.reshape(-1, 3).copy())
-            cpu.applyRGB(pixels)
-            self._display_f32 = pixels.reshape(h, w, 3)
-        except Exception:
-            log.exception("Viewer EC working→display OCIO apply failed")
-            self._display_f32 = composed
-
-        # Nuke order: display first, then pow(display, 1/γ).
-        self._paint_display_with_viewer_gamma(self._display_f32)
-
-    def _invalidate_display_cache(self) -> None:
-        """Display/view combo changed — rebuild display leg and re-show current frame."""
-        self._viewer_display_proc = None
-        self._ec_exposure_prop = None
-        self._ec_gamma_prop = None
-        self._last_viewer_display = None
-        self._display_f32 = None
-        self._sync_gpu_view_settings()
-        self._apply_display_transform()
-
-    def _refresh_gain_gamma(self) -> None:
-        """CPU viewer gain/gamma when dynamic EC is unavailable (or gamma-only)."""
-        if self._use_gpu and self._gpu_plane is not None:
-            self._gpu_plane.set_exposure_stops(self._exposure_stops())
-            self._gpu_plane.set_gamma(float(getattr(self, "_gamma", 1.0)))
-            return
-
-        if self._display_f32 is None:
-            return
-
-        out = self._display_f32
-        # Gain via EC when available; otherwise multiply post-display (fallback).
-        if self._ec_exposure_prop is None:
-            gain = float(getattr(self, "_gain", 1.0))
-            if gain != 1.0:
-                out = out * gain
-        self._paint_display_with_viewer_gamma(out)
-
-    def _paint_display_with_viewer_gamma(self, rgb_f32) -> None:
-        """Apply Nuke post-display gamma then paint: ``pow(max(0, rgb), 1/γ)``."""
-        import numpy as np
-
-        gamma = float(getattr(self, "_gamma", 1.0))
-        out = rgb_f32
-        if abs(gamma - 1.0) > 1e-6:
-            exp = nuke_viewer_gamma_power(gamma)
-            # Negatives left alone (Nuke); non-negative channels powered.
-            pos = np.maximum(out, 0.0)
-            powered = np.power(pos, exp)
-            out = np.where(out >= 0.0, powered, out)
-        self._paint_display_buffer(out)
-
-    def _paint_display_buffer(self, rgb_f32) -> None:
-        """Take a float32 RGB buffer (0-1 range) and paint it to the preview view."""
-        import numpy as np
-        from PySide6.QtGui import QImage, QPixmap
-
-        comp_u8 = np.ascontiguousarray((np.clip(rgb_f32, 0.0, 1.0) * 255 + 0.5).astype(np.uint8))
-
-        fh, fw = comp_u8.shape[:2]
-        # 4-byte-aligned bytesPerLine for RGB888 (required by some backends).
-        bpl = (fw * 3 + 3) & ~3
-        if bpl == fw * 3:
-            buf = comp_u8
-        else:
-            buf = np.zeros((fh, bpl), dtype=np.uint8)
-            flat = comp_u8.reshape(fh, -1)
-            buf[:, : fw * 3] = flat
-        # .copy() so QImage owns its memory (external buffer would dangle).
-        qimg = QImage(buf.data, fw, fh, bpl, QImage.Format.Format_RGB888).copy()
-        del buf
-        # HiDPI: nearest-neighbor upscale (raw pixel grid, not bilinear).
-        dpr = float(self.devicePixelRatioF() or 1.0)
-        if dpr > 1.01:
-            qimg = qimg.scaled(
-                int(fw * dpr + 0.5),
-                int(fh * dpr + 0.5),
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
-            qimg.setDevicePixelRatio(dpr)
-        pix = QPixmap.fromImage(qimg)
-        if dpr > 1.01:
-            pix.setDevicePixelRatio(dpr)
-
-        scene = self._preview._scene
-        if self._preview_pixmap_item is not None:
-            scene.removeItem(self._preview_pixmap_item)
-        self._preview_pixmap_item = scene.addPixmap(pix)
-        self._preview_pixmap_item.setZValue(0)
-
-        w, h = self.resolution()
-        preview_h = 1080
-        preview_w = int(preview_h * w / max(h, 1))
-        # Logical pixmap size (device pixels / dpr).
-        lw = max(1, int(round(pix.width() / max(dpr, 1.0))))
-        lh = max(1, int(round(pix.height() / max(dpr, 1.0))))
-        if lw > 0 and lh > 0:
-            sx = preview_w / lw
-            sy = preview_h / lh
-            s = min(sx, sy)
-            self._preview_pixmap_item.setScale(s)
-            self._preview_pixmap_item.setPos(
-                (preview_w - lw * s) / 2,
-                (preview_h - lh * s) / 2,
-            )
-
-    def _reapply_display_with_ec(self) -> None:
-        """Fast path for live gain on the CPU EC processor (+ post-display gamma).
-
-        GPU path never reaches here (uniforms update in ``_on_gain/gamma_changed``).
-        """
-        import numpy as np
-
-        if self._use_gpu and self._gpu_plane is not None:
-            self._gpu_plane.set_exposure_stops(self._exposure_stops())
-            self._gpu_plane.set_gamma(float(getattr(self, "_gamma", 1.0)))
-            return
-
-        if self._composed_working_f32 is None or self._viewer_display_proc is None:
-            self._apply_display_transform()
-            return
-
-        try:
-            h, w = self._composed_working_f32.shape[:2]
-            pixels = np.ascontiguousarray(self._composed_working_f32.reshape(-1, 3).copy())
-            self._viewer_display_proc.applyRGB(pixels)
-            self._display_f32 = pixels.reshape(h, w, 3)
-        except Exception:
-            self._display_f32 = self._composed_working_f32
-
-        self._paint_display_with_viewer_gamma(self._display_f32)
-
-    # -- Working-space overlay composite (burn-in + watermark) --
-
     def _alpha_over_rgba(self, bg_rgba, fg_rgba):
-        """Straight alpha-over for two float32 RGBA buffers."""
         import numpy as np
 
         if fg_rgba is None:
@@ -2869,13 +1171,6 @@ class SlateDialog(QDialog):
         return out
 
     def _gpu_overlay_layer(self, w: int, h: int):
-        """Return (combined lin RGBA overlay or None, cache key).
-
-        Burn-in + watermark are rasterised + linearised once per content change
-        (signature includes substituted tokens, so ``<frame>`` still updates).
-        The combined layer is uploaded as a *separate* GPU texture — not
-        alpha-over'd onto the plate on the CPU every frame.
-        """
         import numpy as np
 
         burnin_lin = self._cached_burnin_lin_rgba(w, h)
@@ -2900,22 +1195,8 @@ class SlateDialog(QDialog):
         return comb, key
 
     def _composite_overlays_working_space(self, working_f32, is_shot: bool):
-        """Alpha-over burn-in + watermark (shot frames only) on the working-space frame.
-
-        Overlays are authored in display-encoded sRGB (QPainter-rendered)
-        and need to be linearised into the working colorspace before
-        compositing — otherwise white text would read as ``1.0`` linear,
-        which is way too hot.  Mirrors :mod:`convert.run_exr_to_video`.
-
-        The linearised RGBA buffers are *cached* and only rebuilt when the
-        burn-in fields, watermark settings, frame size, or working space
-        change — re-linearising every frame was eating the event loop.
-        """
         h, w = working_f32.shape[:2]
         out = working_f32
-
-        # Burn-in and watermark apply to shot frames only — the slate is its own
-        # designed frame and shouldn't be stamped over.
         if is_shot:
             burnin_lin = self._cached_burnin_lin_rgba(w, h)
             if burnin_lin is not None:
@@ -2924,11 +1205,9 @@ class SlateDialog(QDialog):
             wm_lin = self._cached_watermark_lin_rgba(w, h)
             if wm_lin is not None:
                 out = _alpha_over_linear(out, wm_lin)
-
         return out
 
     def _linearise_overlay_cached(self, rgba_u8):
-        """sRGB RGBA8 → working-space float32 RGBA, with safe fallback."""
         import numpy as np
 
         if rgba_u8 is None:
@@ -2944,7 +1223,6 @@ class SlateDialog(QDialog):
             return rgba_u8.astype(np.float32) / 255.0
 
     def _cached_burnin_lin_rgba(self, w: int, h: int):
-        """Return cached linearised burn-in overlay (RGBA float32) or ``None``."""
         from ..render import tokens as tok
         from ..render.burnin import render_burnin_overlay
 
@@ -2971,7 +1249,6 @@ class SlateDialog(QDialog):
         return lin
 
     def _cached_watermark_lin_rgba(self, w: int, h: int):
-        """Return cached linearised watermark overlay (RGBA float32) or ``None``."""
         from ..render import tokens as tok
         from ..render.watermark import render_watermark_overlay
 
@@ -2999,11 +1276,9 @@ class SlateDialog(QDialog):
         return lin
 
     def _invalidate_overlay_cache(self) -> None:
-        """Drop linearised overlay buffers (form / watermark / display changed)."""
         self._overlay_lin_cache.clear()
 
     def _effective_burnin_fields(self) -> dict[str, str]:
-        """Return the burn-in cells to render — manual entry first, slate-derived fallback."""
         from ..render.burnin import burnin_fields_from_slate
 
         manual = self._model.burnin_fields if self._model is not None else {}
@@ -3012,11 +1287,6 @@ class SlateDialog(QDialog):
         return burnin_fields_from_slate(self._form.slate_data(), self._input_path)
 
     def _token_values(self) -> dict[str, str]:
-        """Resolve overlay tokens for the frame currently shown in the preview.
-
-        ``<frame>`` reflects the scrubbed frame so the burn-in counter updates
-        live as the timeline moves; the rest come from the slate metadata.
-        """
         from pathlib import Path
 
         from ..render import tokens as tok
@@ -3030,14 +1300,14 @@ class SlateDialog(QDialog):
         return tok.build_values(
             slate_render,
             input_name=input_name,
-            frame=self._current_frame,
+            frame=self._player.frame(),
             frame_pad=pad,
             start_frame=start_f,
             end_frame=end_f,
             resolution=f"{w}x{h}",
         )
 
-    # -- Shared --
+    # -- Shared public surface -----------------------------------------------
 
     def resolution(self) -> tuple[int, int]:
         return self._model.slate_resolution
@@ -3046,15 +1316,12 @@ class SlateDialog(QDialog):
         return self._model.slate_fps
 
     def watermark_params(self) -> dict:
-        """Return the current watermark settings (passes through to the form)."""
         return self._form.watermark_params()
 
     def slate_data(self) -> dict:
-        """Return the slate form data."""
         data = self._form.slate_data()
         data["colorspace"] = self._dst_colorspace or "\u2014"
         return data
 
     def thumbnail_b64(self) -> str:
-        """Return the raw base64 thumbnail string."""
         return self._form.thumbnail_b64()

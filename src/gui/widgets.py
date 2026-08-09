@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -10,21 +12,28 @@ if TYPE_CHECKING:
 
 from PySide6.QtCore import (
     QDir,
+    QEvent,
     QObject,
     QPoint,
     QRegularExpression,
+    QRunnable,
     QSettings,
+    QSize,
     QStandardPaths,
     Qt,
     QThread,
+    QThreadPool,
     QTimer,
     Signal,
     Slot,
 )
 from PySide6.QtGui import (
     QAction,
+    QColor,
     QGuiApplication,
     QIcon,
+    QImage,
+    QKeySequence,
     QPainter,
     QPixmap,
     QRegularExpressionValidator,
@@ -53,6 +62,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -74,11 +84,13 @@ from ..core.constants import (
     DEFAULT_START_FRAME,
     DEFAULT_VIDEO_CODEC,
     EXR_COMPRESSIONS,
+    IMAGE_SEQUENCE_EXTS,
     OCIO_SOURCE_BUNDLED,
     OCIO_SOURCE_ENV,
     OCIO_SOURCE_FILE,
     SCALE_OPTIONS,
     available_video_codecs,
+    is_image_sequence_ext,
     video_codec_by_key,
 )
 from ..core.nuke_discover import is_nuke_source_key
@@ -91,12 +103,19 @@ from ..core.ocio_utils import (
 )
 from ..core.sequence import probe_exr_colorspace, probe_exr_metadata, scan_exr_sequences
 from ..core.video import probe_video_metadata, scan_video_files
+from .preferences import (
+    file_manager_label,
+    path_is_revealable,
+)
+from .segmented_control import SegmentedControl
 from .style import DESC_STYLE, HINT_STYLE, STATUS_DIM, STATUS_ERR, STATUS_OK
 
 try:
     import PyOpenColorIO as OCIO
 except ImportError:
     OCIO = None  # type: ignore[assignment]
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1322,12 +1341,66 @@ class _SearchableTree(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# EXR sequence browser dialog (with metadata inspector)
+# Image sequence browser dialog (list / grid + metadata inspector)
 # ---------------------------------------------------------------------------
+
+_SEQ_BROWSER_VIEW_KEY = "ui/sequence_browser_view"
+_SEQ_BROWSER_VIEW_LIST = "list"
+_SEQ_BROWSER_VIEW_GRID = "grid"
+_SEQ_BROWSER_VIEW_PREVIEW = "preview"
+_SEQ_BROWSER_GEOMETRY_KEY = "ui/sequence_browser_geometry"
+_SEQ_BROWSER_OUTER_SPLIT_KEY = "ui/sequence_browser_outer_splitter"
+_SEQ_BROWSER_CONTENT_SPLIT_KEY = "ui/sequence_browser_content_splitter"
+_SEQ_BROWSER_COL_WIDTHS_KEY = "ui/sequence_browser_column_widths"
+_SEQ_BROWSER_HEADER_STATE_KEY = "ui/sequence_browser_header_state"
+_SEQ_THUMB_EDGE = 160
+_SEQ_THUMB_ICON = QSize(160, 100)
+
+
+class _ThumbSignals(QObject):
+    """Signals for :class:`_ThumbJob` (QRunnable cannot define Qt signals)."""
+
+    ready = Signal(int, int, object)  # gen, row, QImage | None
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+
+
+class _ThumbJob(QRunnable):
+    """Background first-frame thumbnail decode for one sequence row."""
+
+    def __init__(self, gen: int, row: int, path: str, signals: _ThumbSignals) -> None:
+        super().__init__()
+        self._gen = gen
+        self._row = row
+        self._path = path
+        self._signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        import numpy as np
+
+        from .browser_thumbs import load_browser_thumbnail_rgb
+
+        qimg: QImage | None = None
+        try:
+            rgb = load_browser_thumbnail_rgb(self._path, max_edge=_SEQ_THUMB_EDGE)
+            if rgb is not None and rgb.ndim == 3 and rgb.shape[2] >= 3:
+                h, w = int(rgb.shape[0]), int(rgb.shape[1])
+                # Copy so QImage owns a stable buffer after the numpy array frees.
+                buf = np.ascontiguousarray(rgb[:, :, :3], dtype=np.uint8).copy()
+                qimg = QImage(buf.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+        except Exception:
+            qimg = None
+        self._signals.ready.emit(self._gen, self._row, qimg)
 
 
 class SequenceBrowserDialog(QDialog):
-    """Directory browser + EXR sequence table + toggleable metadata panel."""
+    """Directory browser + image sequence list/grid, with in-dialog playback.
+
+    Preview mode replaces the browse body with :class:`SequencePlayer` (Space /
+    Preview / context menu). Escape or **Back** returns to browsing.
+    """
 
     _COLUMNS = [
         "Name",
@@ -1346,8 +1419,8 @@ class SequenceBrowserDialog(QDialog):
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Browse EXR Sequences")
-        self.resize(1060, 450)
+        self.setWindowTitle("Browse Image Sequences")
+        self.resize(1120, 560)
         self._selected_dir: str = ""
         self._selected_name: str = ""
         # First-frame path of the selected sequence (preferred for set_input so
@@ -1355,23 +1428,52 @@ class SequenceBrowserDialog(QDialog):
         self._selected_frame_path: str = ""
         self._seq_data: list[dict] = []
         self._auto_select_name = select_name
+        self._syncing_selection = False
+        self._thumb_gen = 0
+        self._thumb_cache: dict[str, QPixmap] = {}
+        self._placeholder_icon = self._make_placeholder_icon()
+        self._thumb_signals = _ThumbSignals(self)
+        self._thumb_signals.ready.connect(self._on_thumb_ready)
+        # Use the *global* pool — never own a QThreadPool on this dialog.
+        # A dialog-owned pool waits for OIIO workers in its destructor and freezes
+        # the app after Browse → Open.
+        self._thumb_pool = QThreadPool.globalInstance()
+        self._player = None  # lazy SequencePlayer for in-dialog preview
+        self._previewing = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # path bar + inspect toggle
+        # ---- Top bar: folder path + List|Grid|Preview + Inspect ----
         path_row = QHBoxLayout()
         path_row.addWidget(QLabel("Folder:"))
         self._path_edit = QLineEdit()
         self._path_edit.setPlaceholderText("Navigate in the tree or paste a path here")
         path_row.addWidget(self._path_edit, 1)
+
+        self._view_seg = SegmentedControl(
+            [
+                ("List", _SEQ_BROWSER_VIEW_LIST),
+                ("Grid", _SEQ_BROWSER_VIEW_GRID),
+                ("Preview", _SEQ_BROWSER_VIEW_PREVIEW),
+            ],
+            parent=self,
+        )
+        self._view_seg.setSegmentToolTip(0, "List view (table)")
+        self._view_seg.setSegmentToolTip(1, "Grid view with thumbnails")
+        self._view_seg.setSegmentToolTip(
+            2, "Playback of the first sequence in this folder (VFX: usually one per folder)"
+        )
+        self._view_seg.setToolTip("Sequence browser layout")
+        path_row.addWidget(self._view_seg)
+
         self._inspect_cb = QCheckBox("Inspect")
-        self._inspect_cb.setToolTip("Show EXR metadata for selected sequence")
+        self._inspect_cb.setToolTip("Show image metadata for the selected / previewed sequence")
         path_row.addWidget(self._inspect_cb)
         layout.addLayout(path_row)
 
-        # -- left: places sidebar + dir tree (full height) --
+        # -- left: places sidebar + dir tree (stays visible in preview) --
         self._places = _PlacesSidebar()
         self._places.navigate_requested.connect(self._navigate_to)
 
@@ -1399,7 +1501,7 @@ class SequenceBrowserDialog(QDialog):
         left_layout.addWidget(self._places)
         left_layout.addWidget(self._searchable_tree, 1)
 
-        # -- center: sequence table --
+        # -- center: list table OR thumbnail grid --
         center = QWidget()
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
@@ -1411,43 +1513,105 @@ class SequenceBrowserDialog(QDialog):
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
-        self._table.setMinimumWidth(320)
+        self._table.setMinimumWidth(280)
+        self._table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         th = self._table.horizontalHeader()
+        # Name (col 0) is Stretch — it owns leftover width and is the flexible
+        # column when the container shrinks. Other columns stay Interactive so
+        # the user can size them; they keep width until the Name floor is hit.
+        th.setSectionsMovable(False)
         th.setStretchLastSection(False)
+        th.setMinimumSectionSize(48)
         th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for col in range(1, len(self._COLUMNS)):
-            th.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        center_layout.addWidget(self._table, 1)
+            th.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        # Sensible first-open defaults for non-name columns (QSettings can override).
+        th.resizeSection(1, 64)
+        th.resizeSection(2, 100)
+        th.resizeSection(3, 100)
+        th.resizeSection(4, 72)
+        th.resizeSection(5, 100)
+        th.resizeSection(6, 120)
+        # Keep Name readable under squeeze (global min is 48; Name wants more).
+        self._name_col_min = 140
+        th.sectionResized.connect(self._on_table_section_resized)
+        # Debounced layout save so column tweaks persist without waiting for close.
+        self._layout_save_timer = QTimer(self)
+        self._layout_save_timer.setSingleShot(True)
+        self._layout_save_timer.setInterval(400)
+        self._layout_save_timer.timeout.connect(self._save_browser_layout)
+        th.sectionResized.connect(lambda *_: self._schedule_layout_save())
 
-        # -- right: metadata inspector --
+        self._grid = QListWidget()
+        self._grid.setViewMode(QListWidget.ViewMode.IconMode)
+        self._grid.setIconSize(_SEQ_THUMB_ICON)
+        self._grid.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self._grid.setMovement(QListWidget.Movement.Static)
+        self._grid.setUniformItemSizes(True)
+        self._grid.setSpacing(10)
+        self._grid.setWordWrap(True)
+        self._grid.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._grid.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self._grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._grid.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Grid is the primary content: claim all extra space when the dialog grows.
+        self._grid.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._grid.setMinimumWidth(360)
+
+        # List | Grid | Preview share one stack (Inspect stays beside them).
+        self._preview_page = QWidget()
+        self._preview_host = QVBoxLayout(self._preview_page)
+        self._preview_host.setContentsMargins(0, 0, 0, 0)
+        self._preview_host.setSpacing(0)
+
+        self._view_stack = QStackedWidget()
+        self._view_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._view_stack.addWidget(self._table)  # 0 = list
+        self._view_stack.addWidget(self._grid)  # 1 = grid
+        self._view_stack.addWidget(self._preview_page)  # 2 = preview
+        center.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        center.setMinimumWidth(360)
+        center_layout.addWidget(self._view_stack, 1)
+
+        # -- Inspect panel (available in list, grid, and preview) --
         self._meta_panel = QWidget()
+        self._meta_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         meta_layout = QVBoxLayout(self._meta_panel)
         meta_layout.setContentsMargins(0, 0, 0, 0)
         meta_layout.setSpacing(4)
-        meta_layout.addWidget(QLabel("<b>EXR Metadata</b>"))
+        meta_layout.addWidget(QLabel("<b>Image Metadata</b>"))
         self._meta_text = QPlainTextEdit()
         self._meta_text.setReadOnly(True)
-        self._meta_text.setMinimumWidth(240)
+        self._meta_text.setMinimumWidth(160)
         self._meta_text.setObjectName("metaPane")
         meta_layout.addWidget(self._meta_text, 1)
         self._meta_panel.setVisible(False)
+        self._meta_panel.setMinimumWidth(160)
 
-        # content splitter: table + metadata
+        # content: list/grid/player + optional inspect
         self._content_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._content_splitter.addWidget(center)
         self._content_splitter.addWidget(self._meta_panel)
-        self._content_splitter.setStretchFactor(0, 3)
-        self._content_splitter.setStretchFactor(1, 2)
-        for i in range(self._content_splitter.count()):
-            self._content_splitter.setCollapsible(i, False)
+        self._content_splitter.setStretchFactor(0, 1)
+        self._content_splitter.setStretchFactor(1, 0)
+        self._content_splitter.setCollapsible(0, False)
+        self._content_splitter.setCollapsible(1, False)
 
-        # right side: content splitter + status/buttons row
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(6)
-        right_layout.addWidget(self._content_splitter, 1)
+        # outer: folder tree | content
+        left_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        left_panel.setMinimumWidth(160)
+        self._outer_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._outer_splitter.addWidget(left_panel)
+        self._outer_splitter.addWidget(self._content_splitter)
+        self._outer_splitter.setStretchFactor(0, 0)
+        self._outer_splitter.setStretchFactor(1, 1)
+        self._outer_splitter.setCollapsible(0, False)
+        self._outer_splitter.setCollapsible(1, False)
+        layout.addWidget(self._outer_splitter, 1)
 
+        # Footer: status + Open/Cancel (mode is the List|Grid|Preview segment)
         bottom_row = QHBoxLayout()
         self._status = QLabel()
         self._status.setStyleSheet(STATUS_DIM)
@@ -1460,28 +1624,165 @@ class SequenceBrowserDialog(QDialog):
         self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Open)
         self._ok_btn.setEnabled(False)
         bottom_row.addWidget(buttons)
-        right_layout.addLayout(bottom_row)
+        layout.addLayout(bottom_row)
 
-        # outer splitter: left panel (full height) | right side
-        self._outer_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._outer_splitter.addWidget(left_panel)
-        self._outer_splitter.addWidget(right_widget)
-        self._outer_splitter.setStretchFactor(0, 2)
-        self._outer_splitter.setStretchFactor(1, 5)
-        for i in range(self._outer_splitter.count()):
-            self._outer_splitter.setCollapsible(i, False)
-        layout.addWidget(self._outer_splitter, 1)
+        # Default proportions (overridden by QSettings when present).
+        self._outer_splitter.setSizes([240, 880])
+        self._outer_splitter.splitterMoved.connect(lambda *_: self._schedule_layout_save())
+        self._content_splitter.splitterMoved.connect(lambda *_: self._schedule_layout_save())
         self._tree.clicked.connect(self._on_tree_clicked)
         self._table.itemSelectionChanged.connect(self._on_table_selection)
         self._table.cellDoubleClicked.connect(self._on_table_double_clicked)
+        self._table.customContextMenuRequested.connect(self._on_table_context_menu)
+        self._grid.itemSelectionChanged.connect(self._on_grid_selection)
+        self._grid.itemDoubleClicked.connect(self._on_grid_double_clicked)
+        self._grid.customContextMenuRequested.connect(self._on_grid_context_menu)
         self._path_edit.returnPressed.connect(self._on_path_entered)
+        # Space → preview (table/grid eat key presses; filter their viewports).
+        self._table.installEventFilter(self)
+        self._table.viewport().installEventFilter(self)
+        self._grid.installEventFilter(self)
+        self._grid.viewport().installEventFilter(self)
+        self.installEventFilter(self)
+        # Restore view mode (list default) before connecting to avoid a double apply.
+        # Don't cold-start into Preview (needs a folder scan first).
+        saved_view = str(QSettings().value(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_LIST) or "")
+        self._last_browse_mode = (
+            _SEQ_BROWSER_VIEW_GRID
+            if saved_view == _SEQ_BROWSER_VIEW_GRID
+            else _SEQ_BROWSER_VIEW_LIST
+        )
+        if self._last_browse_mode == _SEQ_BROWSER_VIEW_GRID:
+            self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_GRID)
+            self._view_stack.setCurrentIndex(1)
+        else:
+            self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_LIST)
+            self._view_stack.setCurrentIndex(0)
+        self._view_seg.currentIndexChanged.connect(self._on_view_changed)
+
         # Default Inspect on without relying on toggled side effects for selection.
         self._inspect_cb.setChecked(True)
         self._toggle_inspect(True)
         self._inspect_cb.toggled.connect(self._toggle_inspect)
 
+        # Geometry / splitters / column widths from last session.
+        self._restore_browser_layout()
+
+        # Create the sequence player (and its QOpenGLWidget) *before* the dialog
+        # is shown. Qt 6.4+: first QOpenGLWidget in an already-shown top-level
+        # recreates the native window and can SIGSEGV on macOS. Slate is fine
+        # because its player is built in the dialog constructor; match that.
+        try:
+            self._ensure_player()
+        except Exception:
+            log.exception("Could not pre-create sequence player for browser")
+
         if start_dir and Path(start_dir).is_dir():
             self._navigate_to(start_dir)
+
+    def _schedule_layout_save(self) -> None:
+        """Debounce layout persistence while the user drags splitters/columns."""
+        timer = getattr(self, "_layout_save_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _restore_browser_layout(self) -> None:
+        """Restore dialog geometry, splitter sizes, and list header state."""
+        settings = QSettings()
+        geo = settings.value(_SEQ_BROWSER_GEOMETRY_KEY)
+        if geo is not None:
+            try:
+                self.restoreGeometry(geo)
+            except Exception:
+                pass
+
+        outer = settings.value(_SEQ_BROWSER_OUTER_SPLIT_KEY)
+        if outer is not None:
+            try:
+                sizes = [int(x) for x in outer]  # type: ignore[arg-type]
+                if len(sizes) == 2 and all(s > 0 for s in sizes):
+                    self._outer_splitter.setSizes(sizes)
+            except Exception:
+                pass
+
+        content = settings.value(_SEQ_BROWSER_CONTENT_SPLIT_KEY)
+        if content is not None and self._meta_panel.isVisible():
+            try:
+                sizes = [int(x) for x in content]  # type: ignore[arg-type]
+                if len(sizes) == 2 and sizes[0] > 0 and sizes[1] >= 0:
+                    self._content_splitter.setSizes(sizes)
+            except Exception:
+                pass
+
+        th = self._table.horizontalHeader()
+        # Prefer Qt native header state (widths + interactive modes).
+        header_state = settings.value(_SEQ_BROWSER_HEADER_STATE_KEY)
+        if header_state is not None:
+            try:
+                th.restoreState(header_state)
+                # Re-assert Name stretch priority after restore (saveState can
+                # re-apply Interactive on every section).
+                th.setStretchLastSection(False)
+                th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                for col in range(1, self._table.columnCount()):
+                    th.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            except Exception:
+                header_state = None
+        if header_state is None:
+            # Legacy fallback: plain width list.
+            widths = settings.value(_SEQ_BROWSER_COL_WIDTHS_KEY)
+            if widths is not None:
+                try:
+                    cols = [int(x) for x in widths]  # type: ignore[arg-type]
+                    for i, w in enumerate(cols):
+                        if i == 0:
+                            continue
+                        if i < self._table.columnCount() and w >= 48:
+                            th.resizeSection(i, w)
+                except Exception:
+                    pass
+
+    def _save_browser_layout(self) -> None:
+        """Persist dialog geometry, splitter sizes, and list header state."""
+        settings = QSettings()
+        settings.setValue(_SEQ_BROWSER_GEOMETRY_KEY, self.saveGeometry())
+        settings.setValue(_SEQ_BROWSER_OUTER_SPLIT_KEY, self._outer_splitter.sizes())
+        # Only store content split when Inspect is open (hidden pane is 0-width).
+        if self._meta_panel.isVisible():
+            settings.setValue(_SEQ_BROWSER_CONTENT_SPLIT_KEY, self._content_splitter.sizes())
+        th = self._table.horizontalHeader()
+        settings.setValue(_SEQ_BROWSER_HEADER_STATE_KEY, th.saveState())
+        # Also keep a simple width list for debugging / older readers.
+        widths = [th.sectionSize(i) for i in range(self._table.columnCount())]
+        settings.setValue(_SEQ_BROWSER_COL_WIDTHS_KEY, widths)
+
+    def _on_table_section_resized(self, logical_index: int, _old: int, new_size: int) -> None:
+        """If a side column grows so much that Name would starve, clamp it."""
+        if logical_index == 0:
+            return
+        th = self._table.horizontalHeader()
+        name_w = th.sectionSize(0)
+        floor = int(getattr(self, "_name_col_min", 140))
+        if name_w >= floor:
+            return
+        # Shrink the resized column just enough to restore the Name floor.
+        deficit = floor - name_w
+        th.blockSignals(True)
+        try:
+            th.resizeSection(logical_index, max(48, new_size - deficit))
+        finally:
+            th.blockSignals(False)
+
+    @staticmethod
+    def _make_placeholder_icon() -> QIcon:
+        pm = QPixmap(_SEQ_THUMB_ICON)
+        pm.fill(QColor(36, 36, 40))
+        painter = QPainter(pm)
+        painter.setPen(QColor(90, 90, 98))
+        painter.drawRect(0, 0, pm.width() - 1, pm.height() - 1)
+        painter.drawText(pm.rect(), int(Qt.AlignmentFlag.AlignCenter), "\u2026")
+        painter.end()
+        return QIcon(pm)
 
     def selected_directory(self) -> str:
         """Directory that was scanned (parent of sequences)."""
@@ -1495,13 +1796,14 @@ class SequenceBrowserDialog(QDialog):
 
         Prefer this over :meth:`selected_directory` — a directory alone always
         resolves to the first sequence on disk, which is wrong when the folder
-        has several EXR sequences.
+        has several sequences.
         """
         if self._selected_frame_path:
             return self._selected_frame_path
         return self._selected_dir
 
     def _navigate_to(self, directory: str) -> None:
+        # Stay on Preview if active — scan reloads the first sequence of the new folder.
         idx = self._fs_model.index(directory)
         if idx.isValid():
             self._tree.setCurrentIndex(idx)
@@ -1527,8 +1829,31 @@ class SequenceBrowserDialog(QDialog):
         if path and Path(path).is_dir():
             self._navigate_to(path)
 
+    def _on_view_changed(self, _index: int) -> None:
+        mode = self._view_seg.currentData()
+        if mode == _SEQ_BROWSER_VIEW_PREVIEW:
+            QSettings().setValue(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_PREVIEW)
+            self._view_stack.setCurrentIndex(2)
+            self._load_preview_sequence()
+            return
+        # Leaving preview
+        if self._previewing:
+            self._stop_preview_playback()
+        if mode == _SEQ_BROWSER_VIEW_GRID:
+            self._last_browse_mode = _SEQ_BROWSER_VIEW_GRID
+            self._view_stack.setCurrentIndex(1)
+            QSettings().setValue(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_GRID)
+            self._queue_thumbnails()
+        else:
+            self._last_browse_mode = _SEQ_BROWSER_VIEW_LIST
+            self._view_stack.setCurrentIndex(0)
+            QSettings().setValue(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_LIST)
+
     def _scan_directory(self, directory: str) -> None:
+        # Invalidate in-flight thumbnail jobs for the previous folder.
+        self._thumb_gen += 1
         self._table.setRowCount(0)
+        self._grid.clear()
         self._selected_dir = directory
         self._selected_name = ""
         self._selected_frame_path = ""
@@ -1540,10 +1865,16 @@ class SequenceBrowserDialog(QDialog):
             seqs = scan_exr_sequences(directory)
         except Exception as e:
             self._status.setText(f"Error: {e}")
+            if self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW:
+                self._stop_preview_playback()
             return
 
         if not seqs:
-            self._status.setText("No EXR sequences in this folder.")
+            self._status.setText(
+                f"No image sequences in this folder ({', '.join(sorted(IMAGE_SEQUENCE_EXTS))})."
+            )
+            if self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW:
+                self._stop_preview_playback()
             return
 
         self._seq_data = seqs
@@ -1583,22 +1914,103 @@ class SequenceBrowserDialog(QDialog):
             self._table.setItem(row, 5, comp_item)
             self._table.setItem(row, 6, cs_item)
 
+            # Grid shell immediately (placeholder icon); thumbnails fill async.
+            res = s.get("resolution") or ""
+            caption = f"{display_name}\n{s['frames']}f"
+            if res:
+                caption += f"  {res}"
+            gitem = QListWidgetItem(self._placeholder_icon, caption)
+            gitem.setData(Qt.ItemDataRole.UserRole, row)
+            gitem.setTextAlignment(int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop))
+            gitem.setSizeHint(QSize(_SEQ_THUMB_ICON.width() + 24, _SEQ_THUMB_ICON.height() + 48))
+            self._grid.addItem(gitem)
+
         select_row = -1
         if self._auto_select_name:
-            for row in range(self._table.rowCount()):
-                item = self._table.item(row, 0)
-                if item and item.data(Qt.ItemDataRole.UserRole) == self._auto_select_name:
+            for row, s in enumerate(seqs):
+                if s.get("name") == self._auto_select_name:
                     select_row = row
                     break
         if select_row < 0 and seqs:
             # Always pick a row so Open is enabled without an extra click / Inspect dance.
+            # Preview mode always uses the first sequence (VFX: one seq per folder).
             select_row = 0
         if select_row >= 0:
-            self._table.selectRow(select_row)
-            # selectRow does not always emit on a freshly rebuilt table — apply explicitly.
-            self._apply_table_selection(select_row)
+            self._apply_selection(select_row)
 
-        self._status.setText(f"{len(seqs)} sequence(s) found")
+        n = len(seqs)
+        if n > 1:
+            self._status.setText(f"{n} sequence(s) found — Preview uses the first")
+        else:
+            self._status.setText(f"{n} sequence(s) found")
+        mode = self._view_seg.currentData()
+        if mode == _SEQ_BROWSER_VIEW_GRID:
+            self._queue_thumbnails()
+        elif mode == _SEQ_BROWSER_VIEW_PREVIEW:
+            self._load_preview_sequence()
+
+    def _queue_thumbnails(self) -> None:
+        """Dispatch background thumbnail jobs for the current folder (grid only)."""
+        if not self._seq_data:
+            return
+        gen = self._thumb_gen
+        for row, s in enumerate(self._seq_data):
+            path = str(s.get("first_frame") or "")
+            if not path:
+                path = self._first_frame_for_sequence(
+                    str(s.get("name") or ""),
+                    str(s.get("path") or self._selected_dir),
+                )
+            if not path:
+                continue
+            cached = self._thumb_cache.get(path)
+            if cached is not None:
+                self._set_grid_icon(row, cached)
+                continue
+            self._thumb_pool.start(_ThumbJob(gen, row, path, self._thumb_signals))
+
+    @Slot(int, int, object)
+    def _on_thumb_ready(self, gen: int, row: int, qimg: object) -> None:
+        if gen != self._thumb_gen:
+            return
+        if row < 0 or row >= self._grid.count():
+            return
+        if not isinstance(qimg, QImage) or qimg.isNull():
+            return
+        pm = QPixmap.fromImage(qimg)
+        if pm.isNull():
+            return
+        # Letterbox into the fixed icon slot for a uniform grid.
+        canvas = QPixmap(_SEQ_THUMB_ICON)
+        canvas.fill(QColor(28, 28, 32))
+        scaled = pm.scaled(
+            _SEQ_THUMB_ICON,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        painter = QPainter(canvas)
+        x = (_SEQ_THUMB_ICON.width() - scaled.width()) // 2
+        y = (_SEQ_THUMB_ICON.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+
+        path = ""
+        if 0 <= row < len(self._seq_data):
+            path = str(self._seq_data[row].get("first_frame") or "")
+        if path:
+            self._thumb_cache[path] = canvas
+            # Bound cache so long browse sessions do not grow forever.
+            if len(self._thumb_cache) > 256:
+                # Drop arbitrary oldest-ish entries (dict order = insertion).
+                for key in list(self._thumb_cache.keys())[:64]:
+                    self._thumb_cache.pop(key, None)
+
+        self._set_grid_icon(row, canvas)
+
+    def _set_grid_icon(self, row: int, pixmap: QPixmap) -> None:
+        item = self._grid.item(row)
+        if item is not None:
+            item.setIcon(QIcon(pixmap))
 
     def _first_frame_for_sequence(self, name: str, directory: str, *, cached: str = "") -> str:
         """Resolve the first frame path for sequence *name* in *directory*."""
@@ -1609,14 +2021,14 @@ class SequenceBrowserDialog(QDialog):
         for sq in fileseq.findSequencesOnDisk(directory):
             if (
                 sq.basename().rstrip("._") == name
-                and sq.extension().lower() == ".exr"
+                and is_image_sequence_ext(sq.extension())
                 and sq.frameSet()
             ):
                 return str(sq.frame(sorted(sq.frameSet())[0]))
         return ""
 
-    def _apply_table_selection(self, row: int) -> None:
-        """Commit table row *row* as the chosen sequence (name + first frame)."""
+    def _apply_selection(self, row: int) -> None:
+        """Commit sequence index *row* and keep list/grid selection in sync."""
         if row < 0 or row >= len(self._seq_data):
             self._selected_name = ""
             self._selected_frame_path = ""
@@ -1630,41 +2042,334 @@ class SequenceBrowserDialog(QDialog):
             self._selected_dir,
             cached=str(s.get("first_frame") or ""),
         )
-        self._ok_btn.setEnabled(bool(self._selected_name and self._selected_dir))
+        can_open = bool(self._selected_name and self._selected_dir)
+        self._ok_btn.setEnabled(can_open)
+
+        self._syncing_selection = True
+        try:
+            self._table.selectRow(row)
+            if 0 <= row < self._grid.count():
+                self._grid.setCurrentRow(row)
+        finally:
+            self._syncing_selection = False
+
         if self._meta_panel.isVisible():
             self._show_metadata(row)
 
     def _on_table_selection(self) -> None:
+        if self._syncing_selection:
+            return
         rows = self._table.selectionModel().selectedRows()
         if rows:
-            self._apply_table_selection(rows[0].row())
+            self._apply_selection(rows[0].row())
         else:
             self._selected_name = ""
             self._selected_frame_path = ""
             self._ok_btn.setEnabled(False)
 
+    def _on_grid_selection(self) -> None:
+        if self._syncing_selection:
+            return
+        item = self._grid.currentItem()
+        if item is None:
+            self._selected_name = ""
+            self._selected_frame_path = ""
+            self._ok_btn.setEnabled(False)
+            return
+        row = int(item.data(Qt.ItemDataRole.UserRole) or self._grid.row(item))
+        self._apply_selection(row)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.KeyPress:
+            from PySide6.QtGui import QKeyEvent
+
+            if isinstance(event, QKeyEvent) and not event.isAutoRepeat():
+                if event.key() == Qt.Key.Key_Space:
+                    # Toggle Preview segment
+                    if self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW:
+                        QTimer.singleShot(
+                            0,
+                            lambda: self._view_seg.setCurrentData(self._last_browse_mode),
+                        )
+                    else:
+                        QTimer.singleShot(
+                            0,
+                            lambda: self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_PREVIEW),
+                        )
+                    return True
+                if (
+                    event.key() == Qt.Key.Key_Escape
+                    and self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW
+                ):
+                    self._view_seg.setCurrentData(self._last_browse_mode)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW
+        ):
+            self._view_seg.setCurrentData(self._last_browse_mode)
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            if self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW:
+                self._view_seg.setCurrentData(self._last_browse_mode)
+            else:
+                self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_PREVIEW)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _on_table_context_menu(self, pos: QPoint) -> None:
+        index = self._table.indexAt(pos)
+        if index.isValid():
+            self._apply_selection(index.row())
+        self._show_sequence_context_menu(self._table.viewport().mapToGlobal(pos))
+
+    def _on_grid_context_menu(self, pos: QPoint) -> None:
+        item = self._grid.itemAt(pos)
+        if item is not None:
+            row = int(item.data(Qt.ItemDataRole.UserRole) or self._grid.row(item))
+            self._apply_selection(row)
+        self._show_sequence_context_menu(self._grid.viewport().mapToGlobal(pos))
+
+    def _show_sequence_context_menu(self, global_pos: QPoint) -> None:
+        menu = QMenu(self)
+        preview_act = QAction("Preview", self)
+        preview_act.setShortcut(Qt.Key.Key_Space)
+        preview_act.triggered.connect(
+            lambda: self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_PREVIEW)
+        )
+        menu.addAction(preview_act)
+        open_act = QAction("Open", self)
+        open_act.setEnabled(self._ok_btn.isEnabled())
+        open_act.triggered.connect(self.accept)
+        menu.addAction(open_act)
+        menu.exec(global_pos)
+
+    def _ensure_player(self):
+        """Return the embedded :class:`SequencePlayer` (created in ``__init__``)."""
+        if self._player is not None:
+            return self._player
+        from .player.sequence_player import SequencePlayer
+
+        # Same GPU OCIO player as the slate editor. Must exist before the dialog
+        # is shown so the first QOpenGLWidget is not added post-show (Qt 6.4+
+        # native-window recreate crash). Cache budget strip stays in Preferences.
+        self._player = SequencePlayer(
+            show_cache_ui=False,
+            prefer_gpu=True,
+            parent=self._preview_page,
+        )
+        self._preview_host.addWidget(self._player, 1)
+        return self._player
+
+    def _load_preview_sequence(self) -> None:
+        """Load the first sequence in the current folder into the player.
+
+        VFX folders usually hold one sequence; if several are present, the first
+        (EXR-preferred sort from :func:`scan_exr_sequences`) is used.
+        """
+        self._previewing = True
+        self._view_stack.setCurrentIndex(2)
+        if not self._seq_data:
+            self._status.setText("No sequences to preview in this folder")
+            self._stop_preview_playback(clear_only=True)
+            return
+
+        # Always first sequence in the scan list.
+        self._apply_selection(0)
+        s = self._seq_data[0]
+        path = str(s.get("first_frame") or "")
+        if not path:
+            path = self._first_frame_for_sequence(
+                str(s.get("name") or ""),
+                str(s.get("path") or self._selected_dir),
+            )
+        if not path:
+            self._status.setText("Could not resolve first frame for preview")
+            return
+
+        ocio_cfg = None
+        src_cs = ""
+        fps = 24.0
+        host = self.parent()
+        if host is not None:
+            ocio_cfg = getattr(host, "_ocio_cfg", None)
+            src_btn = getattr(host, "src_btn", None)
+            if src_btn is not None and hasattr(src_btn, "current_space"):
+                try:
+                    src_cs = str(src_btn.current_space() or "")
+                except Exception:
+                    src_cs = ""
+            if hasattr(host, "get_fps"):
+                try:
+                    fps = float(host.get_fps())
+                except Exception:
+                    fps = 24.0
+
+        try:
+            player = self._ensure_player()
+        except Exception as e:
+            log.exception("Failed to create sequence player for browser preview")
+            self._status.setText(f"Preview unavailable: {e}")
+            return
+
+        try:
+            ok = player.load_sequence(
+                path,
+                fps=fps if fps > 0 else 24.0,
+                ocio_cfg=ocio_cfg,
+                src_colorspace=src_cs,
+            )
+        except Exception as e:
+            log.exception("Preview load failed for %s", path)
+            self._status.setText(f"Preview failed: {e}")
+            return
+
+        label = str(s.get("pattern") or s.get("name") or Path(path).name)
+        n = len(self._seq_data)
+        if ok:
+            extra = f" · {n} sequences (using first)" if n > 1 else ""
+            self._status.setText(f"Preview · {label}{extra}")
+        else:
+            self._status.setText(f"No frames found for {label}")
+        self.setWindowTitle(f"Browse Image Sequences — {label}")
+        if self._meta_panel.isVisible():
+            self._show_metadata(0)
+        player.setFocus(Qt.FocusReason.OtherFocusReason)
+        QTimer.singleShot(0, player.fit_in_view)
+
+    def _stop_preview_playback(self, *, clear_only: bool = False) -> None:
+        """Stop the player without changing the List/Grid/Preview segment.
+
+        Keeps the player + GPU plane + RAM cache warm so re-entering Preview
+        is instant (only stops transport and background prefetch).
+        """
+        self._previewing = False
+        if self._player is not None:
+            try:
+                self._player.set_playing(False)
+            except RuntimeError:
+                pass
+            try:
+                self._player.shutdown_prefetch_only()
+            except RuntimeError:
+                pass
+        if not clear_only:
+            self.setWindowTitle("Browse Image Sequences")
+
     def _on_table_double_clicked(self, row: int, _col: int) -> None:
-        self._apply_table_selection(row)
+        self._apply_selection(row)
+        if self._ok_btn.isEnabled():
+            self.accept()
+
+    def _on_grid_double_clicked(self, item: QListWidgetItem) -> None:
+        if item is None:
+            return
+        row = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+        self._apply_selection(row)
         if self._ok_btn.isEnabled():
             self.accept()
 
     def accept(self) -> None:
-        # Re-sync selection in case the model lagged (Open with keyboard, etc.).
-        rows = self._table.selectionModel().selectedRows()
-        if rows:
-            self._apply_table_selection(rows[0].row())
+        # Re-sync selection when browsing; Preview already selected first seq.
+        if self._view_seg.currentData() != _SEQ_BROWSER_VIEW_PREVIEW:
+            if self._view_stack.currentIndex() == 1:
+                item = self._grid.currentItem()
+                if item is not None:
+                    row = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+                    self._apply_selection(row)
+            else:
+                rows = self._table.selectionModel().selectedRows()
+                if rows:
+                    self._apply_selection(rows[0].row())
         if not self._selected_name:
             return
+        self._shutdown_browser_workers()
+        self._save_browser_layout()
         super().accept()
 
+    def reject(self) -> None:
+        if self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW:
+            self._view_seg.setCurrentData(self._last_browse_mode)
+            return
+        self._shutdown_browser_workers()
+        self._save_browser_layout()
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._shutdown_browser_workers()
+        self._save_browser_layout()
+        super().closeEvent(event)
+
+    def _shutdown_browser_workers(self) -> None:
+        """Stop player + invalidate thumbs without blocking the GUI thread.
+
+        Prefetch uses ``wait=False``. The player stays parented to this dialog
+        so Qt destroys it with the dialog tree — we must **not**
+        ``setParent(None)`` + ``deleteLater()`` while dropping the last Python
+        ref (that double-frees the C++ QObject and SIGSEGVs in
+        ``QObject::~QObject``).
+        """
+        self._previewing = False
+        # Invalidate in-flight thumb jobs.
+        self._thumb_gen += 1
+        player = self._player
+        # Keep self._player set until after shutdown so slots still resolve if a
+        # queued event races us; then clear the Python ref only (parent still
+        # owns the C++ object).
+        if player is not None:
+            try:
+                player.set_playing(False)
+            except RuntimeError:
+                pass
+            try:
+                player.shutdown()
+            except RuntimeError:
+                pass
+            try:
+                player.hide()
+            except RuntimeError:
+                pass
+        self._player = None
+
     def _toggle_inspect(self, checked: bool) -> None:
-        sizes = self._outer_splitter.sizes()
         self._meta_panel.setVisible(checked)
-        self._outer_splitter.setSizes(sizes)
         if checked:
-            rows = self._table.selectionModel().selectedRows()
-            if rows:
-                self._show_metadata(rows[0].row())
+            # Prefer last Inspect width from QSettings; otherwise a modest default.
+            total = sum(self._content_splitter.sizes())
+            if total <= 0:
+                total = max(self._content_splitter.width(), 640)
+            meta_w = 260
+            saved = QSettings().value(_SEQ_BROWSER_CONTENT_SPLIT_KEY)
+            if saved is not None:
+                try:
+                    sizes = [int(x) for x in saved]  # type: ignore[arg-type]
+                    if len(sizes) == 2 and sizes[1] >= 120:
+                        meta_w = sizes[1]
+                except Exception:
+                    pass
+            self._content_splitter.setSizes([max(total - meta_w, 400), meta_w])
+            row = self._current_selected_row()
+            if row >= 0:
+                self._show_metadata(row)
+        else:
+            # Give the full content width back to the sequence view.
+            total = sum(self._content_splitter.sizes()) or max(self._content_splitter.width(), 640)
+            self._content_splitter.setSizes([total, 0])
+
+    def _current_selected_row(self) -> int:
+        if self._view_stack.currentIndex() == 1:
+            item = self._grid.currentItem()
+            if item is not None:
+                return int(item.data(Qt.ItemDataRole.UserRole) or self._grid.row(item))
+        rows = self._table.selectionModel().selectedRows()
+        if rows:
+            return rows[0].row()
+        return -1
 
     def _show_metadata(self, row: int) -> None:
         if row < 0 or row >= len(self._seq_data):
@@ -1673,7 +2378,9 @@ class SequenceBrowserDialog(QDialog):
         s = self._seq_data[row]
         directory = s["path"]
         name = s["name"]
-        first_path = self._first_frame_for_sequence(name, directory)
+        first_path = self._first_frame_for_sequence(
+            name, directory, cached=str(s.get("first_frame") or "")
+        )
         if not first_path:
             self._meta_text.setPlainText("Could not locate first frame.")
             return
@@ -2380,12 +3087,13 @@ class ConvertTab(QWidget):
         self.input_path.setPlaceholderText(
             "Video file (mp4, mov, mkv, \u2026)"
             if mode == "video2exr"
-            else "Folder with EXRs, or any .exr from the sequence"
+            else "Folder with frames, or any frame (EXR / PNG / JPG / \u2026)"
         )
         saved_in = str(settings.value(f"{mode}/input", "") or "").strip()
         if saved_in:
             self.input_path.setText(saved_in)
         self._browse_in = QPushButton("Browse\u2026")
+        self._browse_in.setToolTip(self._browse_button_tooltip())
         in_row.addWidget(self.input_path, 1)
         in_row.addWidget(self._browse_in)
         in_main.addLayout(in_row)
@@ -2439,6 +3147,7 @@ class ConvertTab(QWidget):
         if saved_out:
             self.output_path.setText(saved_out)
         self._browse_out = QPushButton("Browse\u2026")
+        self._browse_out.setToolTip(self._browse_button_tooltip())
         out_row.addWidget(self.output_path, 1)
         out_row.addWidget(self._browse_out)
         out_main.addLayout(out_row)
@@ -2664,8 +3373,9 @@ class ConvertTab(QWidget):
                 self.setTabOrder(tab_chain[i], tab_chain[i + 1])
 
         # -- Connections --
-        self._browse_in.clicked.connect(self._pick_input)
-        self._browse_out.clicked.connect(self._pick_output)
+        self._browse_in.clicked.connect(lambda: self._on_browse_clicked(is_input=True))
+        self._browse_out.clicked.connect(lambda: self._on_browse_clicked(is_input=False))
+        self._install_path_field_menus()
         # Input settings are persisted by set_input(); no textChanged hook needed.
         self.output_path.textChanged.connect(
             lambda t: self._settings.setValue(f"{self._mode}/output", t)
@@ -2765,7 +3475,7 @@ class ConvertTab(QWidget):
                 self.set_input(text)
                 return
         else:
-            if p.is_dir() or (p.is_file() and p.suffix.lower() == ".exr"):
+            if p.is_dir() or (p.is_file() and is_image_sequence_ext(p.suffix)):
                 self.set_input(text)
                 return
 
@@ -2945,6 +3655,9 @@ class ConvertTab(QWidget):
         return self._slate_model
 
     def slate_enabled(self) -> bool:
+        # Overlays are EXR → video only; never on Video → EXR ingest.
+        if self._mode != "exr2video":
+            return False
         return self._slate_model is not None and self._slate_model.slate_enabled
 
     def get_slate_data(self) -> dict | None:
@@ -2966,6 +3679,8 @@ class ConvertTab(QWidget):
         return self._slate_model.slate_resolution
 
     def burnin_enabled(self) -> bool:
+        if self._mode != "exr2video":
+            return False
         return self._slate_model is not None and self._slate_model.burnin_enabled
 
     def get_burnin_fields(self) -> dict[str, str] | None:
@@ -2981,6 +3696,8 @@ class ConvertTab(QWidget):
         return self._slate_model.effective_burnin_fields(input_path)
 
     def watermark_enabled(self) -> bool:
+        if self._mode != "exr2video":
+            return False
         return self._slate_model is not None and self._slate_model.watermark_enabled
 
     def get_watermark_params(self) -> dict | None:
@@ -3013,14 +3730,15 @@ class ConvertTab(QWidget):
     def _open_slate_dialog(self) -> None:
         from .slate_widgets import SlateDialog
 
-        if self._slate_model is None:
+        # Ingest (Video → EXR) never has slate / burn-in / watermark.
+        if self._mode != "exr2video" or self._slate_model is None:
             return
 
         # Timeline + shot scrub require a validated EXR sequence. If the field
         # still shows a path but the model was never accepted (or was cleared),
         # re-probe before opening so the dialog is not missing the transport.
         inp = self.get_input_path()
-        if not inp and self._mode == "exr2video":
+        if not inp:
             raw = self.input_path.text().strip()
             if raw and self.set_input(raw):
                 inp = self.get_input_path()
@@ -3105,24 +3823,179 @@ class ConvertTab(QWidget):
             else:
                 self.log_message.emit(f"Codec ({key}): default settings")
 
+    @staticmethod
+    def _browse_button_tooltip() -> str:
+        """Tooltip for Browse buttons including modifier-click reveal hint."""
+        fm = file_manager_label()
+        if sys.platform == "darwin":
+            mod = "⌘-click"
+        else:
+            mod = "Ctrl-click"
+        return f"Browse for a path.\n{mod} to {fm.lower()} when the field has a valid path."
+
+    def _install_path_field_menus(self) -> None:
+        """Replace the default line-edit menu with path-oriented actions."""
+        for edit in (self.input_path, self.output_path):
+            edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            edit.customContextMenuRequested.connect(
+                lambda pos, e=edit: self._show_path_context_menu(e, pos)
+            )
+
+    @staticmethod
+    def _folder_path_from_field(text: str) -> str:
+        """Directory to copy/open for a path field value (file, folder, or name.####.ext)."""
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        p = Path(raw).expanduser()
+        # Sequence pattern → containing directory
+        if "#" in p.name:
+            return str(p.parent)
+        try:
+            if p.is_dir():
+                return str(p)
+            if p.is_file():
+                return str(p.parent)
+        except OSError:
+            pass
+        # Non-existent file-like path → parent; bare path → as-is
+        if p.suffix or "." in p.name:
+            return str(p.parent) if str(p.parent) not in ("", ".") else str(p)
+        return str(p)
+
+    def _show_path_context_menu(self, edit: QLineEdit, pos: QPoint) -> None:
+        """Standard cut/copy/paste plus path helpers (replaces stock QLineEdit menu).
+
+        Keyboard shortcuts (⌘/Ctrl+X/C/V) remain the QLineEdit defaults; this menu
+        only customizes the right-click surface.
+        """
+        menu = QMenu(edit)
+        text = edit.text().strip()
+        has_sel = edit.hasSelectedText()
+        editable = not edit.isReadOnly()
+        folder = self._folder_path_from_field(text)
+
+        # --- Standard edit actions (same semantics as QLineEdit default menu) ---
+        cut = QAction("Cut", menu)
+        cut.setShortcut(QKeySequence.StandardKey.Cut)
+        cut.setShortcutVisibleInContextMenu(True)
+        cut.setEnabled(editable and has_sel)
+        cut.triggered.connect(edit.cut)
+        menu.addAction(cut)
+
+        copy = QAction("Copy", menu)
+        copy.setShortcut(QKeySequence.StandardKey.Copy)
+        copy.setShortcutVisibleInContextMenu(True)
+        copy.setEnabled(has_sel)
+        copy.triggered.connect(edit.copy)
+        menu.addAction(copy)
+
+        paste = QAction("Paste", menu)
+        paste.setShortcut(QKeySequence.StandardKey.Paste)
+        paste.setShortcutVisibleInContextMenu(True)
+        # QLineEdit has no canPaste() in PySide6; check the clipboard ourselves.
+        clip = QGuiApplication.clipboard()
+        can_paste = bool(clip is not None and (clip.text() or "").strip())
+        paste.setEnabled(editable and can_paste)
+        paste.triggered.connect(edit.paste)
+        menu.addAction(paste)
+
+        select_all = QAction("Select All", menu)
+        select_all.setShortcut(QKeySequence.StandardKey.SelectAll)
+        select_all.setShortcutVisibleInContextMenu(True)
+        select_all.setEnabled(bool(edit.text()))
+        select_all.triggered.connect(edit.selectAll)
+        menu.addAction(select_all)
+
+        menu.addSeparator()
+
+        # --- Path-specific helpers ---
+        # QAction.triggered(bool) — never bind the bool as the path string.
+        def _clip(s: str) -> None:
+            QGuiApplication.clipboard().setText(s)
+
+        copy_file = QAction("Copy File Path", menu)
+        copy_file.setEnabled(bool(text))
+        copy_file.triggered.connect(lambda _=False, t=text: _clip(t))
+        menu.addAction(copy_file)
+
+        copy_folder = QAction("Copy Folder Path", menu)
+        copy_folder.setEnabled(bool(folder))
+        copy_folder.triggered.connect(lambda _=False, f=folder: _clip(f))
+        menu.addAction(copy_folder)
+
+        open_act = QAction(file_manager_label(), menu)
+        open_act.setEnabled(bool(folder) and path_is_revealable(folder))
+        open_act.triggered.connect(lambda _=False, f=folder: self._try_reveal_path(f))
+        menu.addAction(open_act)
+
+        menu.exec(edit.mapToGlobal(pos))
+
+    def _try_reveal_path(self, text: str) -> bool:
+        """Open the path's folder in the OS file manager via QDesktopServices."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        raw = (text or "").strip()
+        if not raw:
+            return False
+        folder = self._folder_path_from_field(raw)
+        if not folder:
+            return False
+        try:
+            p = Path(folder).expanduser()
+            if not p.is_dir():
+                # Parent may exist even if the typed leaf does not.
+                if p.parent.is_dir():
+                    p = p.parent
+                else:
+                    return False
+            url = QUrl.fromLocalFile(str(p.resolve()))
+            if not QDesktopServices.openUrl(url):
+                self.log_message.emit(f"Could not open file manager for {p}")
+                return False
+            self.log_message.emit(f"Opened folder: {p}")
+            return True
+        except Exception as e:
+            log.exception("Open folder failed: %s", raw)
+            self.log_message.emit(f"Could not open file manager: {e}")
+            return False
+
+    def _on_browse_clicked(self, *, is_input: bool) -> None:
+        """Browse…, or ⌘/Ctrl-click to reveal the current path in the file manager."""
+        mods = QGuiApplication.keyboardModifiers()
+        if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
+            edit = self.input_path if is_input else self.output_path
+            if self._try_reveal_path(edit.text()):
+                return
+            # No valid path — fall through to normal browse.
+        if is_input:
+            self._pick_input()
+        else:
+            self._pick_output()
+
     def _pick_input(self) -> None:
         if self._mode == "video2exr":
             start = self.input_path.text().strip() or str(Path.home())
             dlg = VideoBrowserDialog(start, parent=self)
             if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_path():
-                self.set_input(dlg.selected_path())
+                # Async probe — large MXFs must not freeze after Browse returns.
+                self.set_input_async(dlg.selected_path())
         else:
             start = self.get_input_path() or str(Path.home())
             sel_name = ""
             if self._input_seq is not None:
                 sel_name = self._input_seq.basename().rstrip("._")
             dlg = SequenceBrowserDialog(start, select_name=sel_name, parent=self)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                # Prefer first-frame path so multi-sequence folders open the
-                # row the user selected (directory alone always picks sorted[0]).
-                path = dlg.selected_path() or dlg.selected_directory()
-                if path:
-                    self.set_input(path)
+            accepted = dlg.exec() == QDialog.DialogCode.Accepted
+            # Prefer first-frame path so multi-sequence folders open the
+            # row the user selected (directory alone always picks sorted[0]).
+            path = (dlg.selected_path() or dlg.selected_directory()) if accepted else ""
+            # Destroy the dialog before probing so its GL/prefetch teardown
+            # is not interleaved with set_input work on the GUI thread.
+            dlg.deleteLater()
+            if path:
+                QTimer.singleShot(0, lambda p=path: self.set_input_async(p))
 
     def _pick_output(self) -> None:
         if self._mode == "video2exr":
@@ -3161,7 +4034,7 @@ class ConvertTab(QWidget):
             if p.is_file() and p.suffix.lower() in _VIDEO_EXTS:
                 return self.set_input(str(p))
         else:
-            if p.is_dir() or (p.is_file() and p.suffix.lower() == ".exr"):
+            if p.is_dir() or (p.is_file() and is_image_sequence_ext(p.suffix)):
                 return self.set_input(str(p))
         return False
 
@@ -3190,12 +4063,13 @@ class ConvertTab(QWidget):
         self.output_path.setText(str(out))
 
     def _auto_fill_exr_output(self, video_path: str) -> None:
-        """Set output EXR path to <video_parent>/<stem>/<stem>.####.exr."""
+        """Set output EXR path to ``<video_parent>/<stem>/<stem>.####.exr``."""
         if self._mode != "video2exr":
             return
         p = Path(video_path)
         out_dir = p.parent / p.stem
         pad = "#" * self.get_padding()
+        # Always name.####.ext (dot pad) — never underscore.
         display = str(out_dir / f"{p.stem}.{pad}.exr")
         self.output_path.setText(display)
 
@@ -3280,12 +4154,43 @@ class ConvertTab(QWidget):
             QTimer.singleShot(500, self, lambda: self.dst_btn.setStyleSheet(""))
 
     def _auto_detect_colorspace(self, exr_dir: str) -> None:
-        """Probe colorspace from EXRs and select it in src_btn if found."""
+        """Probe or infer source colorspace for the loaded image sequence."""
         if self._mode != "exr2video":
             return
+        from ..core.sequence import sequence_looks_scene_referred
+
         cs = probe_exr_colorspace(exr_dir)
         if not cs:
+            # Display-encoded stills (PNG/JPG/…) rarely carry OCIO tags — default sRGB.
+            try:
+                scene = sequence_looks_scene_referred(exr_dir)
+            except Exception:
+                scene = True
+            if scene:
+                return
+            candidates = [
+                "sRGB Encoded Rec.709 (sRGB)",
+                "sRGB - Texture",
+                "Utility - sRGB - Texture",
+                "sRGB",
+                "Output - Rec.709",
+            ]
+            ocio_cfg = getattr(self, "_ocio_cfg", None)
+            preferred = candidates[0]
+            if ocio_cfg is not None:
+                from ..core.ocio_utils import resolve_alias
+
+                for name in candidates:
+                    resolved = resolve_alias(ocio_cfg, name)
+                    if resolved:
+                        preferred = resolved
+                        break
+            if self.src_btn.try_select(preferred):
+                self.log_message.emit(f"Display still sequence — source color space: {preferred}")
+                self.src_btn.setStyleSheet("background-color: #3a3020;")
+                QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
             return
+
         canonical = cs
         ocio_cfg = getattr(self, "_ocio_cfg", None)
         if ocio_cfg is not None:
@@ -3299,7 +4204,7 @@ class ConvertTab(QWidget):
             self.src_btn.setStyleSheet("background-color: #3a3020;")
             QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
         else:
-            self.log_message.emit(f'EXR color space "{cs}" not found in current OCIO config')
+            self.log_message.emit(f'Image color space "{cs}" not found in current OCIO config')
 
     # -- Input model --
 
@@ -3397,7 +4302,7 @@ class ConvertTab(QWidget):
         elif kind == "exr":
             seq = result.get("seq")
             if seq is None:
-                self.log_message.emit(f"Could not resolve EXR sequence: {path}")
+                self.log_message.emit(f"Could not resolve image sequence: {path}")
                 return
             self._input_seq = seq
             self._video_info = None
@@ -3541,10 +4446,46 @@ class ConvertTab(QWidget):
         """
         raw = self.output_path.text().strip()
         if self._mode == "video2exr" and raw:
-            p = Path(raw)
-            if "#" in p.name:
-                return str(p.parent)
+            from ..core.sequence import parse_dot_sequence_output
+
+            try:
+                directory, _name, _pad = parse_dot_sequence_output(raw)
+            except ValueError:
+                # Fall back to parent-of-pattern for odd strings.
+                p = Path(raw)
+                return str(p.parent) if "#" in p.name or p.suffix else str(p)
+            return directory or raw
         return raw
+
+    def get_output_sequence_name(self) -> str:
+        """Basename for Video → EXR ``name.####.exr`` writes (empty → video stem)."""
+        if self._mode != "video2exr":
+            return ""
+        raw = self.output_path.text().strip()
+        if not raw:
+            return ""
+        from ..core.sequence import parse_dot_sequence_output
+
+        try:
+            _directory, name, _pad = parse_dot_sequence_output(raw)
+        except ValueError:
+            return ""
+        return name or ""
+
+    def get_output_sequence_padding(self) -> int | None:
+        """Padding width from a ``name.####.exr`` pattern, or None if not set."""
+        if self._mode != "video2exr":
+            return None
+        raw = self.output_path.text().strip()
+        if not raw:
+            return None
+        from ..core.sequence import parse_dot_sequence_output
+
+        try:
+            _directory, _name, pad = parse_dot_sequence_output(raw)
+        except ValueError:
+            return None
+        return pad
 
     def get_frame_range(self) -> str:
         """Return the user-specified frame range string, or '' for all frames."""

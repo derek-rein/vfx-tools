@@ -13,6 +13,58 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Added
+
+- **Image sequences beyond EXR → video:** `exr2video` (CLI + GUI) accepts
+  OpenEXR plus **DPX**, and display stills via OpenImageIO — **PNG**,
+  **JPEG** (`.jpg` / `.jpeg`), and **WebP**. Sequence browse, drag-and-drop,
+  and folder scan pick these up; mixed folders prefer EXR, then DPX.
+  EXR/DPX default toward scene-linear; PNG/JPEG/WebP toward **sRGB**.
+- **Sequence browser List | Grid | Preview:** segmented control switches
+  between the metadata table, a thumbnail grid (async OIIO first-frame
+  previews), and in-dialog playback of the **first** sequence in the folder
+  (`SequencePlayer`). Inspect stays available; **Space** toggles Preview,
+  **Esc** returns to list/grid. Mode is stored in `QSettings`
+  (`ui/sequence_browser_view`).
+- **Playback cache budget** lives in **File → Preferences** (not in browser
+  Preview). Left/Right arrows step frames in the player.
+- **Sequence browser layout memory:** window geometry, splitter sizes, and
+  resizable list columns are stored in `QSettings`.
+- **Reusable sequence player** (`src/gui/player/`): shared transport, RAM cache,
+  and GPU/CPU OCIO display path used by the slate editor and browser preview.
+- **Input/output path QoL:** path fields use a custom context menu with standard
+  Cut / Copy / Paste / Select All plus **Copy File Path**, **Copy Folder Path**,
+  and Open in Finder / Explorer (via `QDesktopServices`). ⌘-click (macOS) or
+  Ctrl-click (Windows/Linux) on **Browse…** opens the folder when the path is
+  valid.
+- **Open result (Video → EXR):** opens the written sequence in a standalone
+  built-in player window (cache strip shown; same GPU OCIO path as the slate
+  editor). Opens the sequence named from the source video stem (not a mixed
+  folder scan), with OCIO source locked to the convert destination space.
+  Window geometry is clamped on-screen. **EXR → Video** still uses the preferred
+  external video player.
+- **Video → EXR is ingest-only:** slate / burn-in / watermark are never applied
+  (removed from the convert API; **Slate** menu disabled on that tab).
+- **Video → EXR output name:** the field pattern ``name.####.exr`` is respected
+  (writes ``name.1001.exr``, …). Sequence discovery and writes use **dot pads
+  only** (``name.####.ext``); underscore pads (``name_####.ext``) are ignored.
+- **Video → EXR → player colour:** post-convert playback uses convert
+  **destination** as OCIO source (e.g. ACEScg → working → display). File probes
+  prefer ``exrconverter:dstColorSpace`` over OIIO’s often-wrong
+  ``oiio:ColorSpace`` (commonly rewritten to ``lin_rec709``).
+
+### Fixed
+
+- **Sequence browser Preview crash:** two related Qt/PySide issues —
+  (1) adding the first `QOpenGLWidget` to an *already shown* top-level window
+  recreates the native surface (`RasterSurface` → `OpenGLSurface`, Qt 6.4+) and
+  can SIGSEGV on macOS — the player/GPU plane is now created in the browse
+  dialog constructor before show (same pattern as the slate editor);
+  (2) tearing down with `setParent(None)` + `deleteLater()` while dropping the
+  last Python ref double-destroyed the C++ QObject. GL is released explicitly;
+  the player stays parented to the dialog. Viewer gain/gamma live in
+  `nuke_slider.py`.
+
 ---
 
 ## [0.6.1] — 2026-08-08

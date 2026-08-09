@@ -162,6 +162,21 @@ class TimelineSlider(QWidget):
     def value(self) -> int:
         return self._value
 
+    @property
+    def first_frame(self) -> int:
+        """Inclusive timeline start (lowest scrubbable frame)."""
+        return self._first
+
+    @property
+    def last_frame(self) -> int:
+        """Inclusive timeline end (highest scrubbable frame)."""
+        return self._last
+
+    @property
+    def is_dragging_playhead(self) -> bool:
+        """True while the user is dragging the playhead (not programmatic set)."""
+        return self._dragging_playhead
+
     def set_cached_frames(self, frames: set[int]) -> None:
         self._cached_frames = set(frames)
         self.update()

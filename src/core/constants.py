@@ -45,6 +45,60 @@ DEFAULT_EXR_COMPRESSION = "dwaa"
 DEFAULT_FRAME_PADDING = 4
 DEFAULT_START_FRAME = 1001
 
+# Image-sequence extensions accepted as input for EXR→video (and the sequence
+# browser). OpenEXR remains the primary path; DPX is the other production still
+# format; PNG / JPEG / WebP cover common display stills.
+#
+# Deliberately excluded:
+# - BMP / TGA — little production value for sequences
+# - GIF — animation containers vs frame sequences are a common footgun
+# - HEIC / AVIF — not reliable in our OIIO/PyAV wheels
+# - Cineon / multi-part EXR — add deliberately if needed
+IMAGE_SEQUENCE_EXTS: frozenset[str] = frozenset(
+    {
+        ".exr",
+        ".dpx",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+    }
+)
+
+# Formats treated as scene-referred / linear by default for OCIO src.
+# Everything else in IMAGE_SEQUENCE_EXTS is assumed display-encoded (sRGB-ish).
+# DPX is film/pipeline data (often log or linear) — not sRGB display stills.
+SCENE_REFERRED_IMAGE_EXTS: frozenset[str] = frozenset({".exr", ".dpx"})
+
+# Prefer EXR when a folder contains mixed sequences, then DPX, then display stills.
+_IMAGE_SEQ_EXT_PRIORITY: dict[str, int] = {
+    ".exr": 0,
+    ".dpx": 1,
+    ".png": 2,
+    ".jpg": 3,
+    ".jpeg": 3,
+    ".webp": 4,
+}
+
+
+def is_image_sequence_ext(ext: str) -> bool:
+    """True if *ext* (with or without leading dot) is an accepted sequence format."""
+    e = ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+    return e in IMAGE_SEQUENCE_EXTS
+
+
+def is_scene_referred_image_ext(ext: str) -> bool:
+    """True when the format is expected to hold scene-linear data (EXR)."""
+    e = ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+    return e in SCENE_REFERRED_IMAGE_EXTS
+
+
+def image_sequence_ext_priority(ext: str) -> int:
+    """Sort key: lower = preferred when scanning a mixed folder."""
+    e = ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+    return _IMAGE_SEQ_EXT_PRIORITY.get(e, 50)
+
+
 SCALE_OPTIONS = [
     (1.0, "100%"),
     (0.75, "75%"),

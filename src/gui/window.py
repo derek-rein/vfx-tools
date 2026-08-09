@@ -36,7 +36,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.constants import APP_NAME, APP_ORG, APP_VERSION, GITHUB_REPO
+from ..core.constants import (
+    APP_NAME,
+    APP_ORG,
+    APP_VERSION,
+    GITHUB_REPO,
+    IMAGE_SEQUENCE_EXTS,
+    is_image_sequence_ext,
+)
 from ..core.ocio_utils import color_space_families, config_source_info
 from ..services.presets import delete_preset, list_presets, load_preset, save_preset
 from ..services.worker import ConvertWorker
@@ -120,6 +127,8 @@ class MainWindow(QMainWindow):
         self._ocio_cfg = None
         # "convert" | None — keeps progress UI from fighting itself.
         self._busy: str | None = None
+        # Standalone sequence player from post-convert Open result (Video → EXR).
+        self._result_player_win: QDialog | None = None
 
         self._build_menu_bar()
 
@@ -185,8 +194,10 @@ class MainWindow(QMainWindow):
         after_row.addWidget(self._copy_path_cb)
         self._open_after_cb = QCheckBox("Open result")
         self._open_after_cb.setToolTip(
-            "Open the finished video in your preferred player "
-            "(File → Preferences). For EXR output this has no effect — use Show in folder."
+            "EXR → Video: open the finished file in your preferred player "
+            "(File → Preferences).\n"
+            "Video → EXR: open the sequence in the built-in player window "
+            "(with playback cache)."
         )
         self._open_after_cb.setChecked(self._settings.value("ui/open_after", False, type=bool))
         self._open_after_cb.toggled.connect(lambda v: self._settings.setValue("ui/open_after", v))
@@ -241,10 +252,12 @@ class MainWindow(QMainWindow):
         self._clear_log.clicked.connect(self._log.clear)
         self._tabs.currentChanged.connect(lambda i: self._settings.setValue("ui/tab", i))
         self._tabs.currentChanged.connect(lambda _: self._update_go_state())
+        self._tabs.currentChanged.connect(lambda _: self._update_slate_menu_enabled())
         self._v2e_tab.log_message.connect(self._append_log)
         self._e2v_tab.log_message.connect(self._append_log)
         self._v2e_tab.readiness_changed.connect(lambda _: self._update_go_state())
         self._e2v_tab.readiness_changed.connect(lambda _: self._update_go_state())
+        self._update_slate_menu_enabled()
         self._go.setEnabled(self._active_tab().is_ready())
 
         self._reload_ocio()
@@ -287,7 +300,7 @@ class MainWindow(QMainWindow):
             ):
                 self._tabs.setCurrentIndex(0)
             else:
-                # Directory, EXR frame, or sequence pattern → EXR tab
+                # Directory, image sequence frame, or pattern → EXR → Video tab
                 self._tabs.setCurrentIndex(1)
 
         if open_path:
@@ -319,10 +332,10 @@ class MainWindow(QMainWindow):
         self._presets_menu = mb.addMenu("&Presets")
         self._presets_menu.aboutToShow.connect(self._populate_presets_menu)
 
-        slate_menu = mb.addMenu("&Slate")
-        edit_slate_action = QAction("Edit Slate && Overlays\u2026", self)
-        edit_slate_action.triggered.connect(self._open_slate_dialog)
-        slate_menu.addAction(edit_slate_action)
+        self._slate_menu = mb.addMenu("&Slate")
+        self._edit_slate_action = QAction("Edit Slate && Overlays\u2026", self)
+        self._edit_slate_action.triggered.connect(self._open_slate_dialog)
+        self._slate_menu.addAction(self._edit_slate_action)
 
         help_menu = mb.addMenu("&Help")
 
@@ -360,7 +373,24 @@ class MainWindow(QMainWindow):
 
     # -- Slate menu --
 
+    def _update_slate_menu_enabled(self) -> None:
+        """Slate / burn-in / watermark are EXR → Video only (never Video → EXR)."""
+        e2v = self._tabs.currentIndex() == 1
+        self._slate_menu.setEnabled(e2v)
+        self._edit_slate_action.setEnabled(e2v)
+        if e2v:
+            self._edit_slate_action.setToolTip("Edit slate, burn-in, and watermark overlays")
+        else:
+            self._edit_slate_action.setToolTip(
+                "Slate / burn-in / watermark apply only on EXR → Video (not ingest)."
+            )
+
     def _open_slate_dialog(self) -> None:
+        if self._tabs.currentIndex() != 1:
+            self._append_log(
+                "Slate / burn-in / watermark are EXR → Video only — not used on Video → EXR."
+            )
+            return
         self._active_tab()._open_slate_dialog()
 
     # -- Presets --
@@ -546,7 +576,7 @@ class MainWindow(QMainWindow):
             if not frame_set:
                 frame_set = None
 
-        # -- Slate / burn-in / watermark: EXR → video only (never video → EXR) --
+        # -- Slate / burn-in / watermark: EXR → video only (never Video → EXR) --
         slate_np = None
         overlay_np = None
         slate_overlay_np = None
@@ -603,6 +633,17 @@ class MainWindow(QMainWindow):
             )
 
         if mode == "video2exr":
+            # Sequence name + pad from the output field (name.####.exr).
+            # Empty name → convert falls back to the video stem.
+            try:
+                out_name = tab.get_output_sequence_name()
+            except Exception:
+                out_name = ""
+            try:
+                pattern_pad = tab.get_output_sequence_padding()
+            except Exception:
+                pattern_pad = None
+            pad = int(pattern_pad) if pattern_pad is not None else tab.get_padding()
             # ocio_cfg intentionally omitted — worker rebuilds from config_source/path.
             kwargs = dict(
                 video_path=inp,
@@ -613,10 +654,11 @@ class MainWindow(QMainWindow):
                 config_source=cs,
                 config_path=cp,
                 scale=tab.get_scale(),
-                padding=tab.get_padding(),
+                padding=pad,
                 start_frame=tab.get_start_frame(),
                 frame_set=frame_set,
                 exr_opts=tab.get_exr_opts() or None,
+                output_name=out_name,
             )
         else:
             _codec_key, _codec, _pix = tab.get_video_codec_info()
@@ -648,6 +690,22 @@ class MainWindow(QMainWindow):
         # Prefer the Nuke-style #### pattern shown in the field for sequences.
         display_out = tab.output_path.text().strip()
         self._output_clipboard = display_out or str(out_path)
+        # Video → EXR open-result: files are ``{output_name}.{frame}.exr``.
+        self._output_seq_dir = ""
+        self._output_seq_stem = ""
+        self._output_seq_pad = 4
+        self._output_seq_start = 1001
+        self._output_dst_space = dst
+        self._output_fps = 24.0
+        if mode == "video2exr":
+            self._output_seq_dir = str(out_path)
+            written_name = str(kwargs.get("output_name") or Path(inp).stem)
+            self._output_seq_stem = written_name
+            self._output_seq_pad = int(kwargs.get("padding") or tab.get_padding())
+            self._output_seq_start = int(tab.get_start_frame())
+            vi = getattr(tab, "_video_info", None)
+            if vi is not None and getattr(vi, "fps", 0) and float(vi.fps) > 0:
+                self._output_fps = float(vi.fps)
 
         self._append_log(f"--- {mode} ---")
         self._thread = QThread(self)
@@ -717,11 +775,13 @@ class MainWindow(QMainWindow):
                     self._append_log(f"{msg.capitalize()}: {target}")
                 except OSError as e:
                     self._append_log(f"Could not open player: {e}")
-            elif mode != "exr2video":
-                # Open result is video-oriented; nudge EXR users toward folder.
-                self._append_log(
-                    "Open result applies to video output — use Show in folder for EXR sequences."
-                )
+            elif mode == "video2exr" and target:
+                try:
+                    msg = self._open_sequence_result(target)
+                    notes.append(msg)
+                    self._append_log(f"{msg.capitalize()}: {target}")
+                except Exception as e:
+                    self._append_log(f"Could not open sequence player: {e}")
 
         if self._show_folder_cb.isChecked():
             reveal_target = target if (target and Path(target).exists()) else folder
@@ -745,6 +805,127 @@ class MainWindow(QMainWindow):
             self._busy = None
         self._cancel_btn.setEnabled(False)
         self._update_go_state()
+
+    def _resolve_v2e_open_path(self, fallback: str) -> str:
+        """First-frame path for the sequence just written by Video → EXR.
+
+        Convert always names files ``{video_stem}.{frame:0N}.exr`` under the
+        output directory. Opening the directory alone is wrong when other
+        sequences already live there (``find_exr_sequence`` picks sorted[0]).
+        """
+        folder = str(getattr(self, "_output_seq_dir", "") or fallback or "")
+        stem = str(getattr(self, "_output_seq_stem", "") or "")
+        pad = int(getattr(self, "_output_seq_pad", 4) or 4)
+        start = int(getattr(self, "_output_seq_start", 1001) or 1001)
+        if not folder:
+            return fallback
+        if stem:
+            first = Path(folder) / f"{stem}.{start:0{pad}d}.exr"
+            if first.is_file():
+                return str(first)
+            # Frame range / start may not match start_frame (trimmed range).
+            # Prefer any sequence whose basename matches the video stem.
+            try:
+                from ..core.sequence import scan_exr_sequences
+
+                for row in scan_exr_sequences(folder):
+                    if row.get("name") == stem and row.get("first_frame"):
+                        return str(row["first_frame"])
+            except Exception:
+                pass
+        return folder
+
+    def _open_sequence_result(self, path: str) -> str:
+        """Open a converted EXR (or image) sequence in the built-in player window.
+
+        Colour pipeline (matches convert write):
+
+        * EXR pixels are already in convert **destination** space (e.g. ACEScg).
+        * Player treats that as source → OCIO to compositing/working space →
+          display/view (GPU when available).
+
+        Do **not** trust ``oiio:ColorSpace`` alone (OIIO often tags any
+        scene-linear EXR as ``lin_rec709``).
+        """
+        from .player.player_window import SequencePlayerWindow
+
+        open_path = self._resolve_v2e_open_path(path)
+        # Known write colorspace from convert start (authoritative).
+        src_cs = str(getattr(self, "_output_dst_space", "") or "")
+        if not src_cs:
+            try:
+                src_cs = str(self._v2e_tab.dst_btn.current_space() or "")
+            except Exception:
+                src_cs = ""
+        # Fall back to our EXR attribute (not mangled oiio:ColorSpace).
+        if not src_cs and open_path:
+            try:
+                from ..core.sequence import probe_pixel_colorspace
+
+                src_cs = probe_pixel_colorspace(open_path)
+            except Exception:
+                src_cs = ""
+        if src_cs and self._ocio_cfg is not None:
+            try:
+                from ..core.ocio_utils import find_equivalent_space
+
+                resolved = find_equivalent_space(self._ocio_cfg, src_cs)
+                if resolved:
+                    src_cs = resolved
+            except Exception:
+                pass
+        if self._ocio_cfg is None:
+            self._append_log(
+                "Sequence player: no OCIO config — frames will show without a display transform."
+            )
+        else:
+            try:
+                from ..core.ocio_utils import get_compositing_space
+
+                working = get_compositing_space(self._ocio_cfg)
+                self._append_log(
+                    f"Sequence player OCIO: {src_cs or '?'} → {working} → display/view"
+                )
+            except Exception:
+                self._append_log(f"Sequence player OCIO source: {src_cs or '?'}")
+
+        fps = float(getattr(self, "_output_fps", 0) or 0) or 24.0
+
+        # Reuse a live window so repeated converts don't stack players.
+        win = self._result_player_win
+        if win is not None:
+            try:
+                _ = win.isVisible()
+                win.reload(
+                    open_path,
+                    ocio_cfg=self._ocio_cfg,
+                    src_colorspace=src_cs,
+                    fps=fps,
+                )
+                win.show()
+                win.raise_()
+                win.activateWindow()
+                return f"opened in sequence player ({src_cs or 'no OCIO src'})"
+            except RuntimeError:
+                self._result_player_win = None
+
+        win = SequencePlayerWindow(
+            open_path,
+            settings=self._settings,
+            ocio_cfg=self._ocio_cfg,
+            src_colorspace=src_cs,
+            fps=fps,
+            parent=self,
+        )
+        win.destroyed.connect(self._on_result_player_destroyed)
+        self._result_player_win = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        return f"opened in sequence player ({src_cs or 'no OCIO src'})"
+
+    def _on_result_player_destroyed(self, *_args: object) -> None:
+        self._result_player_win = None
 
     def _cancel_run(self) -> None:
         if self._worker:
@@ -903,12 +1084,12 @@ class MainWindow(QMainWindow):
                 w, h, _fps, _total = probe_video(inp)
                 return w, h
             else:
-                from ..core.exr_io import read_exr
+                from ..core.exr_io import read_image
                 from ..core.sequence import find_exr_sequence
 
                 paths, _bn = find_exr_sequence(inp)
                 if paths:
-                    first = read_exr(paths[0])
+                    first = read_image(paths[0])
                     return first.shape[1], first.shape[0]
         except Exception:
             pass
@@ -1001,7 +1182,7 @@ class MainWindow(QMainWindow):
             for url in mime.urls():
                 if url.isLocalFile():
                     p = Path(url.toLocalFile())
-                    if p.is_dir() or p.suffix.lower() in (self._VIDEO_EXTS | {".exr"}):
+                    if p.is_dir() or p.suffix.lower() in (self._VIDEO_EXTS | IMAGE_SEQUENCE_EXTS):
                         event.acceptProposedAction()
                         return
         event.ignore()
@@ -1020,7 +1201,7 @@ class MainWindow(QMainWindow):
                 self._append_log(f"Dropped video: {p.name}")
                 event.acceptProposedAction()
                 return
-            if p.is_dir() or (p.is_file() and p.suffix.lower() == ".exr"):
+            if p.is_dir() or (p.is_file() and is_image_sequence_ext(p.suffix)):
                 self._tabs.setCurrentIndex(1)
                 self._e2v_tab.handle_dropped_path(str(p))
                 self._append_log(f"Dropped: {p.name}")
@@ -1032,6 +1213,14 @@ class MainWindow(QMainWindow):
         # Flush prefs (input paths, post-convert toggles, …) before exit so a
         # subsequent launch restores a validated source without re-browsing.
         self._settings.sync()
+        # Close standalone sequence player first (releases GL / prefetch).
+        win = self._result_player_win
+        self._result_player_win = None
+        if win is not None:
+            try:
+                win.close()
+            except RuntimeError:
+                pass
         # Stop background work so QApplication tear-down does not race threads.
         if self._worker is not None:
             self._worker.cancel()

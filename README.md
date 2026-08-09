@@ -1,6 +1,6 @@
 # EXR Converter
 
-Desktop app and CLI for converting between **video** and **OpenEXR** sequences with **OpenColorIO** color management and built-in **slate rendering**. Uses **PyAV** for decode/encode, **OpenImageIO** for EXR I/O, and **PySide6** (QPainter) for the GUI and slate compositing.
+Desktop app and CLI for converting between **video** and **OpenEXR** sequences with **OpenColorIO** color management and built-in **slate rendering**. Uses **PyAV** for decode/encode, **OpenImageIO** for EXR (and other still) I/O, and **PySide6** (QPainter) for the GUI and slate compositing. **EXR → video** also accepts **DPX** and display still sequences (**PNG**, **JPEG**, **WebP**).
 
 Targets the [VFX Reference Platform CY2026](https://vfxplatform.com/#reference-platform): Python 3.13, Qt/PySide 6.8, OpenColorIO 2.5, OpenEXR 3.4, NumPy 2.3.
 
@@ -86,12 +86,15 @@ subcommand to open the GUI (optionally with `--open` / `--gui-ocio`).
 uv run python main.py video2exr -i clip.mov -o ./exr_out/
 ```
 
-**EXR → video**
+**EXR / image sequence → video**
 
 ```bash
 uv run python main.py exr2video -i ./plate -o review.mov --fps 24
 # or any frame file from the sequence:
 uv run python main.py exr2video -i ./plate/plate.1001.exr -o review.mov --fps 24
+# PNG / JPEG / DPX sequences work the same way:
+uv run python main.py exr2video -i ./png_seq -o review.mp4 --codec h264 --fps 24
+uv run python main.py exr2video -i ./dpx_seq -o review.mov --fps 24
 ```
 
 **GUI with path pre-loaded** (also used by the Nuke integration)

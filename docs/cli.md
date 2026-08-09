@@ -31,7 +31,7 @@ Related: [GUI](./gui.md) · [Nuke integration](./nuke.md) · [README](../README.
 |------------|----------------|
 | `main.py` *(no subcommand)* | Open the GUI |
 | `main.py video2exr …` | CLI: video → OCIO → EXR sequence |
-| `main.py exr2video …` | CLI: EXR sequence → OCIO → video |
+| `main.py exr2video …` | CLI: image sequence (EXR / PNG / JPG / …) → OCIO → video |
 
 Global flags (before the subcommand; convert flags may also appear after it):
 
@@ -101,12 +101,17 @@ uv run python main.py video2exr -i plate.mov --frame-range 1-100 --workers 4
 
 ---
 
-## `exr2video` — EXR → video
+## `exr2video` — image sequence → video
+
+Primary path is **OpenEXR**. Also accepted: **DPX**, and display stills
+**PNG**, **JPEG** (`.jpg` / `.jpeg`), **WebP**. Mixed folders prefer EXR,
+then DPX, then display stills.
 
 ```bash
 uv run python main.py exr2video -i ./plate
 uv run python main.py exr2video -i ./plate -o review.mov --fps 24
 uv run python main.py exr2video -i ./plate/plate.1001.exr -o review.mov --fps 24
+uv run python main.py exr2video -i ./png_seq -o review.mp4 --codec h264 --fps 24
 uv run python main.py exr2video -i ./plate --codec h264 --crf 18
 ```
 
@@ -116,7 +121,7 @@ uv run python main.py exr2video -i ./plate --codec h264 --crf 18
 | `-o` / `--output` | next to sequence | Video path; default extension follows codec family (below) |
 | `--fps` | `24` | Frame rate |
 | `--ocio` | bundled / `$OCIO` | Config file path |
-| `--src` | EXR meta / scene_linear | Scene-linear source space |
+| `--src` | format-aware | EXR/DPX: metadata / `scene_linear`. PNG/JPEG/WebP: sRGB-ish display space |
 | `--dst` | `Output - Rec.709` | Display / delivery space |
 | `--scale` | `1.0` | Output scale |
 | `--codec` | `prores` | Codec key — see ladder below (default = ProRes 422 HQ, **10-bit** software) |
