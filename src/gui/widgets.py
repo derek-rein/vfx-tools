@@ -1350,7 +1350,21 @@ _SEQ_BROWSER_VIEW_GRID = "grid"
 _SEQ_BROWSER_VIEW_PREVIEW = "preview"
 _VID_BROWSER_VIEW_KEY = "ui/video_browser_view"
 _VID_BROWSER_VIEW_LIST = "list"
+_VID_BROWSER_VIEW_GRID = "grid"
 _VID_BROWSER_VIEW_PREVIEW = "preview"
+
+
+def _configure_path_line_edit(edit: QLineEdit) -> None:
+    """Path field must not grow the dialog when the text is very long.
+
+    ``QLineEdit.sizeHint()`` tracks content width; with a normal Expanding
+    policy that becomes the layout minimum. Horizontal *Ignored* lets the
+    layout assign width (stretch=1) without following path length.
+    """
+    edit.setMinimumWidth(80)
+    edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+
 _SEQ_BROWSER_GEOMETRY_KEY = "ui/sequence_browser_geometry"
 _SEQ_BROWSER_OUTER_SPLIT_KEY = "ui/sequence_browser_outer_splitter"
 _SEQ_BROWSER_CONTENT_SPLIT_KEY = "ui/sequence_browser_content_splitter"
@@ -1383,11 +1397,15 @@ class _ThumbJob(QRunnable):
     def run(self) -> None:
         import numpy as np
 
-        from .browser_thumbs import load_browser_thumbnail_rgb
+        from .browser_thumbs import load_browser_thumbnail_rgb, load_video_thumbnail_rgb
 
         qimg: QImage | None = None
         try:
-            rgb = load_browser_thumbnail_rgb(self._path, max_edge=_SEQ_THUMB_EDGE)
+            ext = Path(self._path).suffix.lower()
+            if ext in _VIDEO_EXTS:
+                rgb = load_video_thumbnail_rgb(self._path, max_edge=_SEQ_THUMB_EDGE)
+            else:
+                rgb = load_browser_thumbnail_rgb(self._path, max_edge=_SEQ_THUMB_EDGE)
             if rgb is not None and rgb.ndim == 3 and rgb.shape[2] >= 3:
                 h, w = int(rgb.shape[0]), int(rgb.shape[1])
                 # Copy so QImage owns a stable buffer after the numpy array frees.
@@ -1453,6 +1471,7 @@ class SequenceBrowserDialog(QDialog):
         path_row.addWidget(QLabel("Folder:"))
         self._path_edit = QLineEdit()
         self._path_edit.setPlaceholderText("Navigate in the tree or paste a path here")
+        _configure_path_line_edit(self._path_edit)
         path_row.addWidget(self._path_edit, 1)
 
         self._view_seg = SegmentedControl(
@@ -2415,25 +2434,36 @@ class VideoBrowserDialog(QDialog):
         self._player = None
         self._previewing = False
         self._last_browse_mode = _VID_BROWSER_VIEW_LIST
+        self._thumb_gen = 0
+        self._thumb_cache: dict[str, QPixmap] = {}
+        self._placeholder_icon = self._make_vid_placeholder_icon()
+        self._thumb_signals = _ThumbSignals(self)
+        self._thumb_signals.ready.connect(self._on_vid_thumb_ready)
+        self._thumb_pool = QThreadPool.globalInstance()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+        # Don't let children force the dialog wider than the user sized it.
+        layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetDefaultConstraint)
 
         path_row = QHBoxLayout()
         path_row.addWidget(QLabel("Folder:"))
         self._path_edit = QLineEdit()
         self._path_edit.setPlaceholderText("Navigate in the tree or paste a path here")
+        _configure_path_line_edit(self._path_edit)
         path_row.addWidget(self._path_edit, 1)
         self._view_seg = SegmentedControl(
             [
                 ("List", _VID_BROWSER_VIEW_LIST),
+                ("Grid", _VID_BROWSER_VIEW_GRID),
                 ("Preview", _VID_BROWSER_VIEW_PREVIEW),
             ],
             parent=self,
         )
         self._view_seg.setSegmentToolTip(0, "List view (table)")
-        self._view_seg.setSegmentToolTip(1, "Playback of the selected / first video")
+        self._view_seg.setSegmentToolTip(1, "Grid view with first-frame thumbnails")
+        self._view_seg.setSegmentToolTip(2, "Playback of the selected / first video")
         path_row.addWidget(self._view_seg)
         self._inspect_cb = QCheckBox("Inspect")
         self._inspect_cb.setToolTip("Show video metadata for selected / previewed file")
@@ -2480,13 +2510,39 @@ class VideoBrowserDialog(QDialog):
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
-        self._table.setMinimumWidth(320)
+        self._table.setMinimumWidth(200)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._table.setWordWrap(False)
         th = self._table.horizontalHeader()
         th.setStretchLastSection(False)
         th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # Interactive (not ResizeToContents) so long paths never force dialog width.
         for col in range(1, len(self._COLUMNS)):
-            th.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        center_layout.addWidget(self._table, 1)
+            th.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            th.resizeSection(col, 88)
+        th.resizeSection(1, 100)
+        th.resizeSection(2, 80)
+        th.resizeSection(3, 56)
+        th.resizeSection(4, 64)
+        th.resizeSection(5, 72)
+        # table alone is not the center — stack holds list/grid/preview
+        self._list_page = QWidget()
+        list_layout = QVBoxLayout(self._list_page)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.addWidget(self._table, 1)
+
+        self._grid = QListWidget()
+        self._grid.setViewMode(QListWidget.ViewMode.IconMode)
+        self._grid.setIconSize(_SEQ_THUMB_ICON)
+        self._grid.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self._grid.setMovement(QListWidget.Movement.Static)
+        self._grid.setUniformItemSizes(True)
+        self._grid.setSpacing(10)
+        self._grid.setWordWrap(True)
+        self._grid.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._grid.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._grid.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._grid.setMinimumWidth(200)
 
         # Preview page (SequencePlayer via load_video)
         self._preview_page = QWidget()
@@ -2496,8 +2552,14 @@ class VideoBrowserDialog(QDialog):
         self._preview_host = preview_layout
 
         self._view_stack = QStackedWidget()
-        self._view_stack.addWidget(center)  # 0 list
-        self._view_stack.addWidget(self._preview_page)  # 1 preview
+        self._view_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._view_stack.addWidget(self._list_page)  # 0 list
+        self._view_stack.addWidget(self._grid)  # 1 grid
+        self._view_stack.addWidget(self._preview_page)  # 2 preview
+        center_layout.addWidget(self._view_stack, 1)
+        center.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        center.setMinimumWidth(200)
+
         # Pre-create player before dialog show (OpenGL surface rule).
         try:
             self._ensure_player()
@@ -2512,19 +2574,20 @@ class VideoBrowserDialog(QDialog):
         meta_layout.addWidget(QLabel("<b>Video Metadata</b>"))
         self._meta_text = QPlainTextEdit()
         self._meta_text.setReadOnly(True)
-        self._meta_text.setMinimumWidth(240)
+        self._meta_text.setMinimumWidth(160)
         self._meta_text.setObjectName("metaPane")
         meta_layout.addWidget(self._meta_text, 1)
         self._meta_panel.setVisible(False)
+        self._meta_panel.setMinimumWidth(160)
 
-        # content splitter: list/preview + metadata
+        # content splitter: list/grid/preview + metadata
         self._content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._content_splitter.addWidget(self._view_stack)
+        self._content_splitter.addWidget(center)
         self._content_splitter.addWidget(self._meta_panel)
-        self._content_splitter.setStretchFactor(0, 3)
-        self._content_splitter.setStretchFactor(1, 2)
-        for i in range(self._content_splitter.count()):
-            self._content_splitter.setCollapsible(i, False)
+        self._content_splitter.setStretchFactor(0, 1)
+        self._content_splitter.setStretchFactor(1, 0)
+        self._content_splitter.setCollapsible(0, False)
+        self._content_splitter.setCollapsible(1, False)
 
         # right side: content splitter + status/buttons row
         right_widget = QWidget()
@@ -2548,24 +2611,40 @@ class VideoBrowserDialog(QDialog):
         right_layout.addLayout(bottom_row)
 
         # outer splitter: left panel (full height) | right side
+        left_panel.setMinimumWidth(160)
+        left_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._outer_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._outer_splitter.addWidget(left_panel)
         self._outer_splitter.addWidget(right_widget)
-        self._outer_splitter.setStretchFactor(0, 2)
-        self._outer_splitter.setStretchFactor(1, 5)
-        for i in range(self._outer_splitter.count()):
-            self._outer_splitter.setCollapsible(i, False)
+        self._outer_splitter.setStretchFactor(0, 0)
+        self._outer_splitter.setStretchFactor(1, 1)
+        self._outer_splitter.setCollapsible(0, False)
+        self._outer_splitter.setCollapsible(1, False)
+        self._outer_splitter.setSizes([240, 820])
         layout.addWidget(self._outer_splitter, 1)
 
         self._tree.clicked.connect(self._on_tree_clicked)
         self._table.itemSelectionChanged.connect(self._on_table_selection)
         self._table.cellDoubleClicked.connect(lambda _r, _c: self.accept())
+        self._grid.itemSelectionChanged.connect(self._on_grid_selection)
+        self._grid.itemDoubleClicked.connect(self._on_grid_double_clicked)
         self._path_edit.returnPressed.connect(self._on_path_entered)
         self._inspect_cb.toggled.connect(self._toggle_inspect)
-        self._view_seg.setCurrentData(_VID_BROWSER_VIEW_LIST)
+        saved = str(QSettings().value(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_LIST) or "")
+        self._last_browse_mode = (
+            _VID_BROWSER_VIEW_GRID if saved == _VID_BROWSER_VIEW_GRID else _VID_BROWSER_VIEW_LIST
+        )
+        if self._last_browse_mode == _VID_BROWSER_VIEW_GRID:
+            self._view_seg.setCurrentData(_VID_BROWSER_VIEW_GRID)
+            self._view_stack.setCurrentIndex(1)
+        else:
+            self._view_seg.setCurrentData(_VID_BROWSER_VIEW_LIST)
+            self._view_stack.setCurrentIndex(0)
         self._view_seg.currentIndexChanged.connect(self._on_view_changed)
         self._table.installEventFilter(self)
         self._table.viewport().installEventFilter(self)
+        self._grid.installEventFilter(self)
+        self._grid.viewport().installEventFilter(self)
         self.installEventFilter(self)
 
         if start_dir:
@@ -2578,6 +2657,11 @@ class VideoBrowserDialog(QDialog):
 
     def selected_path(self) -> str:
         return self._selected_path
+
+    def _make_vid_placeholder_icon(self) -> QIcon:
+        pm = QPixmap(_SEQ_THUMB_ICON)
+        pm.fill(QColor(0x2A, 0x2A, 0x2A))
+        return QIcon(pm)
 
     def _ensure_player(self):
         if self._player is not None:
@@ -2596,18 +2680,24 @@ class VideoBrowserDialog(QDialog):
         mode = self._view_seg.currentData()
         if mode == _VID_BROWSER_VIEW_PREVIEW:
             QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_PREVIEW)
-            self._view_stack.setCurrentIndex(1)
+            self._view_stack.setCurrentIndex(2)
             self._load_preview_video()
             return
         if self._previewing:
             self._stop_preview_playback()
-        self._last_browse_mode = _VID_BROWSER_VIEW_LIST
-        self._view_stack.setCurrentIndex(0)
-        QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_LIST)
+        if mode == _VID_BROWSER_VIEW_GRID:
+            self._last_browse_mode = _VID_BROWSER_VIEW_GRID
+            self._view_stack.setCurrentIndex(1)
+            QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_GRID)
+            self._queue_video_thumbnails()
+        else:
+            self._last_browse_mode = _VID_BROWSER_VIEW_LIST
+            self._view_stack.setCurrentIndex(0)
+            QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_LIST)
 
     def _load_preview_video(self) -> None:
         self._previewing = True
-        self._view_stack.setCurrentIndex(1)
+        self._view_stack.setCurrentIndex(2)
         path = self._selected_path
         if not path and self._file_data:
             path = str(self._file_data[0].get("path") or "")
@@ -2615,6 +2705,8 @@ class VideoBrowserDialog(QDialog):
                 self._selected_path = path
                 self._ok_btn.setEnabled(True)
                 self._table.selectRow(0)
+                if self._grid.count() > 0:
+                    self._grid.setCurrentRow(0)
         if not path:
             self._status.setText("No video to preview in this folder")
             self._stop_preview_playback(clear_only=True)
@@ -2697,7 +2789,14 @@ class VideoBrowserDialog(QDialog):
                 pass
 
     def accept(self) -> None:
-        if self._view_seg.currentData() != _VID_BROWSER_VIEW_PREVIEW:
+        mode = self._view_seg.currentData()
+        if mode == _VID_BROWSER_VIEW_GRID:
+            item = self._grid.currentItem()
+            if item is not None:
+                row = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+                if 0 <= row < len(self._file_data):
+                    self._selected_path = str(self._file_data[row].get("path") or "")
+        elif mode != _VID_BROWSER_VIEW_PREVIEW:
             rows = self._table.selectionModel().selectedRows()
             if rows:
                 item = self._table.item(rows[0].row(), 0)
@@ -2716,6 +2815,7 @@ class VideoBrowserDialog(QDialog):
         super().reject()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._thumb_gen += 1
         self._shutdown_player()
         super().closeEvent(event)
 
@@ -2767,7 +2867,9 @@ class VideoBrowserDialog(QDialog):
         was_preview = self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW
         if was_preview:
             self._stop_preview_playback()
+        self._thumb_gen += 1
         self._table.setRowCount(0)
+        self._grid.clear()
         self._selected_path = ""
         self._file_data = []
         self._ok_btn.setEnabled(False)
@@ -2789,6 +2891,7 @@ class VideoBrowserDialog(QDialog):
         for row, f in enumerate(files):
             name_item = QTableWidgetItem(f["name"])
             name_item.setData(Qt.ItemDataRole.UserRole, f["path"])
+            name_item.setToolTip(f["path"])
 
             res_item = QTableWidgetItem(f.get("resolution", ""))
             res_item.setTextAlignment(center_align)
@@ -2812,20 +2915,104 @@ class VideoBrowserDialog(QDialog):
             self._table.setItem(row, 4, frames_item)
             self._table.setItem(row, 5, dur_item)
 
+            gitem = QListWidgetItem(self._placeholder_icon, f["name"])
+            gitem.setData(Qt.ItemDataRole.UserRole, row)
+            gitem.setToolTip(f["path"])
+            gitem.setSizeHint(QSize(_SEQ_THUMB_ICON.width() + 24, _SEQ_THUMB_ICON.height() + 48))
+            self._grid.addItem(gitem)
+
         selected = False
         if self._auto_select_path:
             for row in range(self._table.rowCount()):
                 item = self._table.item(row, 0)
                 if item and item.data(Qt.ItemDataRole.UserRole) == self._auto_select_path:
                     self._table.selectRow(row)
+                    self._grid.setCurrentRow(row)
                     selected = True
                     break
         if not selected and files:
             self._table.selectRow(0)
+            self._grid.setCurrentRow(0)
 
         self._status.setText(f"{len(files)} video file(s) found")
-        if was_preview:
+        mode = self._view_seg.currentData()
+        if mode == _VID_BROWSER_VIEW_GRID:
+            self._queue_video_thumbnails()
+        elif was_preview or mode == _VID_BROWSER_VIEW_PREVIEW:
             self._load_preview_video()
+
+    def _queue_video_thumbnails(self) -> None:
+        if not self._file_data:
+            return
+        gen = self._thumb_gen
+        for row, f in enumerate(self._file_data):
+            path = str(f.get("path") or "")
+            if not path:
+                continue
+            cached = self._thumb_cache.get(path)
+            if cached is not None:
+                self._set_vid_grid_icon(row, cached)
+                continue
+            self._thumb_pool.start(_ThumbJob(gen, row, path, self._thumb_signals))
+
+    @Slot(int, int, object)
+    def _on_vid_thumb_ready(self, gen: int, row: int, qimg: object) -> None:
+        if gen != self._thumb_gen:
+            return
+        if row < 0 or row >= self._grid.count():
+            return
+        if qimg is None or not isinstance(qimg, QImage) or qimg.isNull():
+            return
+        pm = QPixmap.fromImage(qimg)
+        path = ""
+        if 0 <= row < len(self._file_data):
+            path = str(self._file_data[row].get("path") or "")
+        if path:
+            self._thumb_cache[path] = pm
+        self._set_vid_grid_icon(row, pm)
+
+    def _set_vid_grid_icon(self, row: int, pm: QPixmap) -> None:
+        if row < 0 or row >= self._grid.count():
+            return
+        item = self._grid.item(row)
+        if item is None:
+            return
+        canvas = QPixmap(_SEQ_THUMB_ICON)
+        canvas.fill(QColor(0x1E, 0x1E, 0x1E))
+        scaled = pm.scaled(
+            _SEQ_THUMB_ICON,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (_SEQ_THUMB_ICON.width() - scaled.width()) // 2
+        y = (_SEQ_THUMB_ICON.height() - scaled.height()) // 2
+        painter = QPainter(canvas)
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        item.setIcon(QIcon(canvas))
+
+    def _on_grid_selection(self) -> None:
+        item = self._grid.currentItem()
+        if item is None:
+            return
+        row = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+        if 0 <= row < len(self._file_data):
+            self._selected_path = str(self._file_data[row].get("path") or "")
+            self._ok_btn.setEnabled(bool(self._selected_path))
+            self._table.selectRow(row)
+            if self._meta_panel.isVisible():
+                self._show_metadata(row)
+            if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:
+                self._load_preview_video()
+
+    def _on_grid_double_clicked(self, item: QListWidgetItem) -> None:
+        if item is None:
+            return
+        row = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+        if 0 <= row < len(self._file_data):
+            self._selected_path = str(self._file_data[row].get("path") or "")
+            if self._selected_path:
+                self.accept()
 
     def _on_table_selection(self) -> None:
         rows = self._table.selectionModel().selectedRows()
@@ -2834,6 +3021,8 @@ class VideoBrowserDialog(QDialog):
             item = self._table.item(row, 0)
             self._selected_path = item.data(Qt.ItemDataRole.UserRole) if item else ""
             self._ok_btn.setEnabled(bool(self._selected_path))
+            if 0 <= row < self._grid.count():
+                self._grid.setCurrentRow(row)
             if self._meta_panel.isVisible():
                 self._show_metadata(row)
             if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:

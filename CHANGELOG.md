@@ -52,9 +52,9 @@ rolling the `[Unreleased]` section into a versioned heading.
   **destination** as OCIO source (e.g. ACEScg → working → display). File probes
   prefer ``exrconverter:dstColorSpace`` over OIIO’s often-wrong
   ``oiio:ColorSpace`` (commonly rewritten to ``lin_rec709``).
-- **Video browser Preview:** List | Preview playback of the selected file in the
-  shared ``SequencePlayer`` (PyAV decode → RAM cache → OCIO display), matching
-  sequence-browser parity.
+- **Video browser List | Grid | Preview:** first-frame video thumbs (PyAV),
+  in-dialog playback via ``SequencePlayer``, and path fields that no longer
+  grow the dialog when paths are long.
 
 ### Fixed
 

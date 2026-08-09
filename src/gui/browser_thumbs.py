@@ -1,8 +1,8 @@
-"""Fast sequence-browser thumbnails via OpenImageIO (no OCIO).
+"""Fast browser thumbnails: stills via OpenImageIO, video via PyAV (no OCIO).
 
-Designed for the image-sequence file browser grid: decode first frame, box-filter
-downscale, optional cheap Rec.709 OETF for scene-referred formats, return uint8
-RGB for ``QImage``. All work is pure CPU / OIIO and safe off the GUI thread.
+Image-sequence grid: decode first frame, box-filter downscale, optional cheap
+Rec.709 OETF for scene-referred formats. Video grid: first decoded frame via
+PyAV. Returns uint8 RGB for ``QImage``. Safe off the GUI thread.
 """
 
 from __future__ import annotations
@@ -16,6 +16,55 @@ from ..core.constants import is_scene_referred_image_ext
 
 # Default max edge for browser icons (speed over fidelity).
 DEFAULT_THUMB_EDGE = 160
+
+
+def _downscale_uint8_rgb(rgb: np.ndarray, max_edge: int) -> np.ndarray:
+    """Box-filter *rgb* (H,W,3) float or uint8 to max edge; return uint8 RGB."""
+    arr = np.asarray(rgb)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[:, :, np.newaxis], 3, axis=2)
+    if arr.shape[2] > 3:
+        arr = arr[:, :, :3]
+    if arr.dtype != np.float32 and arr.dtype != np.float64:
+        arr = arr.astype(np.float32)
+        if arr.max() > 1.5:
+            arr = arr * (1.0 / 255.0)
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    if h <= 0 or w <= 0:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    edge = max(16, int(max_edge))
+    scale = min(1.0, edge / float(max(w, h)))
+    tw = max(1, int(round(w * scale)))
+    th = max(1, int(round(h * scale)))
+    if tw < w or th < h:
+        # Nearest-ish box via simple stride sample (fast ID thumbs).
+        ys = (np.linspace(0, h - 1, th)).astype(np.int32)
+        xs = (np.linspace(0, w - 1, tw)).astype(np.int32)
+        arr = arr[ys][:, xs]
+    return np.clip(arr * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def load_video_thumbnail_rgb(
+    path: str,
+    *,
+    max_edge: int = DEFAULT_THUMB_EDGE,
+) -> np.ndarray | None:
+    """Return uint8 RGB thumbnail from the first video frame, or ``None``."""
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        import av
+
+        container = av.open(path)
+        try:
+            for frame in container.decode(video=0):
+                rgb = frame.to_ndarray(format="rgb24")
+                return _downscale_uint8_rgb(rgb, max_edge)
+        finally:
+            container.close()
+    except Exception:
+        return None
+    return None
 
 
 def load_browser_thumbnail_rgb(

@@ -67,9 +67,11 @@ Window size, splitter positions, list/grid mode, and list column widths are
 remembered in `QSettings` (`ui/sequence_browser_*`).
 
 **Video browser** (Video → EXR input) mirrors the sequence browser with
-**List | Preview**. **Preview** plays the selected file (or the first file in
-the folder) with the same player transport, cache strip, and OCIO controls.
-**Space** toggles Preview; **Esc** returns to the list.
+**List | Grid | Preview**. **Grid** shows first-frame video thumbnails (PyAV).
+**Preview** plays the selected file (or the first file in the folder) with the
+same player transport, cache strip, and OCIO controls. **Space** toggles
+Preview; **Esc** returns to list/grid. Folder path fields never expand the
+dialog when paths are long (text elides; width follows the layout).
 
 ---
 
