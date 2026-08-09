@@ -1348,6 +1348,9 @@ _SEQ_BROWSER_VIEW_KEY = "ui/sequence_browser_view"
 _SEQ_BROWSER_VIEW_LIST = "list"
 _SEQ_BROWSER_VIEW_GRID = "grid"
 _SEQ_BROWSER_VIEW_PREVIEW = "preview"
+_VID_BROWSER_VIEW_KEY = "ui/video_browser_view"
+_VID_BROWSER_VIEW_LIST = "list"
+_VID_BROWSER_VIEW_PREVIEW = "preview"
 _SEQ_BROWSER_GEOMETRY_KEY = "ui/sequence_browser_geometry"
 _SEQ_BROWSER_OUTER_SPLIT_KEY = "ui/sequence_browser_outer_splitter"
 _SEQ_BROWSER_CONTENT_SPLIT_KEY = "ui/sequence_browser_content_splitter"
@@ -2398,17 +2401,20 @@ class SequenceBrowserDialog(QDialog):
 
 
 class VideoBrowserDialog(QDialog):
-    """Directory browser + video file table + toggleable metadata panel."""
+    """Directory browser + video file table + in-dialog playback preview."""
 
     _COLUMNS = ["Name", "Resolution", "Codec", "FPS", "Frames", "Duration"]
 
     def __init__(self, start_dir: str = "", parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Browse Video Files")
-        self.resize(1060, 450)
+        self.resize(1060, 520)
         self._selected_path: str = ""
         self._file_data: list[dict[str, str]] = []
         self._auto_select_path: str = ""
+        self._player = None
+        self._previewing = False
+        self._last_browse_mode = _VID_BROWSER_VIEW_LIST
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -2419,8 +2425,18 @@ class VideoBrowserDialog(QDialog):
         self._path_edit = QLineEdit()
         self._path_edit.setPlaceholderText("Navigate in the tree or paste a path here")
         path_row.addWidget(self._path_edit, 1)
+        self._view_seg = SegmentedControl(
+            [
+                ("List", _VID_BROWSER_VIEW_LIST),
+                ("Preview", _VID_BROWSER_VIEW_PREVIEW),
+            ],
+            parent=self,
+        )
+        self._view_seg.setSegmentToolTip(0, "List view (table)")
+        self._view_seg.setSegmentToolTip(1, "Playback of the selected / first video")
+        path_row.addWidget(self._view_seg)
         self._inspect_cb = QCheckBox("Inspect")
-        self._inspect_cb.setToolTip("Show video metadata for selected file")
+        self._inspect_cb.setToolTip("Show video metadata for selected / previewed file")
         path_row.addWidget(self._inspect_cb)
         layout.addLayout(path_row)
 
@@ -2472,6 +2488,22 @@ class VideoBrowserDialog(QDialog):
             th.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         center_layout.addWidget(self._table, 1)
 
+        # Preview page (SequencePlayer via load_video)
+        self._preview_page = QWidget()
+        preview_layout = QVBoxLayout(self._preview_page)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(0)
+        self._preview_host = preview_layout
+
+        self._view_stack = QStackedWidget()
+        self._view_stack.addWidget(center)  # 0 list
+        self._view_stack.addWidget(self._preview_page)  # 1 preview
+        # Pre-create player before dialog show (OpenGL surface rule).
+        try:
+            self._ensure_player()
+        except Exception:
+            log.exception("Could not pre-create video player")
+
         # -- right: metadata inspector --
         self._meta_panel = QWidget()
         meta_layout = QVBoxLayout(self._meta_panel)
@@ -2485,9 +2517,9 @@ class VideoBrowserDialog(QDialog):
         meta_layout.addWidget(self._meta_text, 1)
         self._meta_panel.setVisible(False)
 
-        # content splitter: table + metadata
+        # content splitter: list/preview + metadata
         self._content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._content_splitter.addWidget(center)
+        self._content_splitter.addWidget(self._view_stack)
         self._content_splitter.addWidget(self._meta_panel)
         self._content_splitter.setStretchFactor(0, 3)
         self._content_splitter.setStretchFactor(1, 2)
@@ -2530,6 +2562,11 @@ class VideoBrowserDialog(QDialog):
         self._table.cellDoubleClicked.connect(lambda _r, _c: self.accept())
         self._path_edit.returnPressed.connect(self._on_path_entered)
         self._inspect_cb.toggled.connect(self._toggle_inspect)
+        self._view_seg.setCurrentData(_VID_BROWSER_VIEW_LIST)
+        self._view_seg.currentIndexChanged.connect(self._on_view_changed)
+        self._table.installEventFilter(self)
+        self._table.viewport().installEventFilter(self)
+        self.installEventFilter(self)
 
         if start_dir:
             d = Path(start_dir)
@@ -2541,6 +2578,164 @@ class VideoBrowserDialog(QDialog):
 
     def selected_path(self) -> str:
         return self._selected_path
+
+    def _ensure_player(self):
+        if self._player is not None:
+            return self._player
+        from .player.sequence_player import SequencePlayer
+
+        self._player = SequencePlayer(
+            show_cache_ui=True,
+            prefer_gpu=True,
+            parent=self._preview_page,
+        )
+        self._preview_host.addWidget(self._player, 1)
+        return self._player
+
+    def _on_view_changed(self, _index: int) -> None:
+        mode = self._view_seg.currentData()
+        if mode == _VID_BROWSER_VIEW_PREVIEW:
+            QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_PREVIEW)
+            self._view_stack.setCurrentIndex(1)
+            self._load_preview_video()
+            return
+        if self._previewing:
+            self._stop_preview_playback()
+        self._last_browse_mode = _VID_BROWSER_VIEW_LIST
+        self._view_stack.setCurrentIndex(0)
+        QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_LIST)
+
+    def _load_preview_video(self) -> None:
+        self._previewing = True
+        self._view_stack.setCurrentIndex(1)
+        path = self._selected_path
+        if not path and self._file_data:
+            path = str(self._file_data[0].get("path") or "")
+            if path:
+                self._selected_path = path
+                self._ok_btn.setEnabled(True)
+                self._table.selectRow(0)
+        if not path:
+            self._status.setText("No video to preview in this folder")
+            self._stop_preview_playback(clear_only=True)
+            return
+
+        ocio_cfg = None
+        src_cs = ""
+        host = self.parent()
+        if host is not None:
+            ocio_cfg = getattr(host, "_ocio_cfg", None)
+            src_btn = getattr(host, "src_btn", None)
+            if src_btn is not None and hasattr(src_btn, "current_space"):
+                try:
+                    src_cs = str(src_btn.current_space() or "")
+                except Exception:
+                    src_cs = ""
+
+        try:
+            player = self._ensure_player()
+        except Exception as e:
+            log.exception("Failed to create video player")
+            self._status.setText(f"Preview unavailable: {e}")
+            return
+
+        try:
+            ok = player.load_video(
+                path,
+                ocio_cfg=ocio_cfg,
+                src_colorspace=src_cs,
+            )
+        except Exception as e:
+            log.exception("Video preview load failed for %s", path)
+            self._status.setText(f"Preview failed: {e}")
+            return
+
+        label = Path(path).name
+        if ok:
+            self._status.setText(f"Preview · {label}")
+        else:
+            self._status.setText(f"Could not open {label}")
+        self.setWindowTitle(f"Browse Video Files — {label}")
+        if self._meta_panel.isVisible():
+            for row, f in enumerate(self._file_data):
+                if f.get("path") == path:
+                    self._show_metadata(row)
+                    break
+        player.setFocus(Qt.FocusReason.OtherFocusReason)
+        QTimer.singleShot(0, player.fit_in_view)
+
+    def _stop_preview_playback(self, *, clear_only: bool = False) -> None:
+        self._previewing = False
+        if self._player is not None:
+            try:
+                self._player.set_playing(False)
+            except RuntimeError:
+                pass
+            try:
+                self._player.shutdown_prefetch_only()
+            except RuntimeError:
+                pass
+        if not clear_only:
+            self.setWindowTitle("Browse Video Files")
+
+    def _shutdown_player(self) -> None:
+        self._previewing = False
+        player = self._player
+        self._player = None
+        if player is not None:
+            try:
+                player.set_playing(False)
+            except RuntimeError:
+                pass
+            try:
+                player.shutdown()
+            except RuntimeError:
+                pass
+            try:
+                player.hide()
+            except RuntimeError:
+                pass
+
+    def accept(self) -> None:
+        if self._view_seg.currentData() != _VID_BROWSER_VIEW_PREVIEW:
+            rows = self._table.selectionModel().selectedRows()
+            if rows:
+                item = self._table.item(rows[0].row(), 0)
+                if item is not None:
+                    self._selected_path = item.data(Qt.ItemDataRole.UserRole) or ""
+        if not self._selected_path:
+            return
+        self._shutdown_player()
+        super().accept()
+
+    def reject(self) -> None:
+        if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:
+            self._view_seg.setCurrentData(self._last_browse_mode)
+            return
+        self._shutdown_player()
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._shutdown_player()
+        super().closeEvent(event)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.KeyPress:
+            key = event.key()  # type: ignore[attr-defined]
+            if key == Qt.Key.Key_Space and not event.isAutoRepeat():  # type: ignore[attr-defined]
+                if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:
+                    # Let the player handle Space for play/pause when focused.
+                    if self._player is not None and self._player.hasFocus():
+                        return False
+                    self._view_seg.setCurrentData(self._last_browse_mode)
+                else:
+                    self._view_seg.setCurrentData(_VID_BROWSER_VIEW_PREVIEW)
+                return True
+            if key == Qt.Key.Key_Escape:
+                if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:
+                    self._view_seg.setCurrentData(self._last_browse_mode)
+                    return True
+        return super().eventFilter(obj, event)
 
     def _navigate_to(self, directory: str) -> None:
         idx = self._fs_model.index(directory)
@@ -2569,6 +2764,9 @@ class VideoBrowserDialog(QDialog):
             self._navigate_to(path)
 
     def _scan_directory(self, directory: str) -> None:
+        was_preview = self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW
+        if was_preview:
+            self._stop_preview_playback()
         self._table.setRowCount(0)
         self._selected_path = ""
         self._file_data = []
@@ -2622,10 +2820,12 @@ class VideoBrowserDialog(QDialog):
                     self._table.selectRow(row)
                     selected = True
                     break
-        if not selected and len(files) == 1:
+        if not selected and files:
             self._table.selectRow(0)
 
         self._status.setText(f"{len(files)} video file(s) found")
+        if was_preview:
+            self._load_preview_video()
 
     def _on_table_selection(self) -> None:
         rows = self._table.selectionModel().selectedRows()
@@ -2636,18 +2836,26 @@ class VideoBrowserDialog(QDialog):
             self._ok_btn.setEnabled(bool(self._selected_path))
             if self._meta_panel.isVisible():
                 self._show_metadata(row)
+            if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:
+                self._load_preview_video()
         else:
             self._selected_path = ""
             self._ok_btn.setEnabled(False)
 
     def _toggle_inspect(self, checked: bool) -> None:
-        sizes = self._outer_splitter.sizes()
+        sizes = self._content_splitter.sizes()
         self._meta_panel.setVisible(checked)
-        self._outer_splitter.setSizes(sizes)
         if checked:
+            total = sum(sizes) if sum(sizes) > 0 else max(self._content_splitter.width(), 640)
+            self._content_splitter.setSizes([max(200, total - 260), 260])
             rows = self._table.selectionModel().selectedRows()
             if rows:
                 self._show_metadata(rows[0].row())
+            elif self._selected_path:
+                for row, f in enumerate(self._file_data):
+                    if f.get("path") == self._selected_path:
+                        self._show_metadata(row)
+                        break
 
     def _show_metadata(self, row: int) -> None:
         if row < 0 or row >= len(self._file_data):

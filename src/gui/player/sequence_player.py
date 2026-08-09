@@ -28,6 +28,7 @@ from ...core.constants import APP_NAME, APP_ORG
 from ...services.cache_prefs import cache_budget_bytes
 from ...services.exr_prefetch import ExrPrefetchService
 from ...services.frame_cache import FrameCache
+from ...services.video_prefetch import VideoPrefetchService
 from ..ocio_gpu_plane import (
     OcioGpuImagePlane,
     gpu_ocio_available,
@@ -110,6 +111,7 @@ class SequencePlayer(QWidget):
         self._last_viewer_display: tuple[str, str, str] | None = None
 
         self._exr_seq = None
+        self._video_path: str | None = None
         self._shot_frames: list[int] = []
         self._shot_frames_set: set[int] = set()
         self._first_shot: int | None = None
@@ -120,7 +122,7 @@ class SequencePlayer(QWidget):
         self._fps: float = 24.0
 
         self._shot_cache = FrameCache(cache_budget_bytes(self._settings), self)
-        self._prefetch: ExrPrefetchService | None = None
+        self._prefetch: ExrPrefetchService | VideoPrefetchService | None = None
         self._playback_wait_frame: int | None = None
         self._cache_paused = False
         self._hooks: OverlayHooks | None = None
@@ -256,6 +258,7 @@ class SequencePlayer(QWidget):
             self.set_resolution(resolution[0], resolution[1])
 
         self._exr_seq = None
+        self._video_path = None
         self._shot_frames = []
         self._shot_frames_set = set()
         self._first_shot = None
@@ -329,12 +332,113 @@ class SequencePlayer(QWidget):
         self.refresh()
         return True
 
+    def load_video(
+        self,
+        path: str,
+        *,
+        fps: float = 0.0,
+        ocio_cfg: object | None = None,
+        src_colorspace: str = "",
+        resolution: tuple[int, int] | None = None,
+    ) -> bool:
+        """Open a video file for cache-first playback (same viewer as sequences).
+
+        Frame indices are 1-based over an estimated frame count from the probe.
+        """
+        self.shutdown_prefetch_only()
+        self._shot_cache.clear()
+        self._shot_cache.budget_bytes = cache_budget_bytes(self._settings)
+        self._ocio_cfg = ocio_cfg
+        self._src_colorspace = src_colorspace or ""
+        self._ocio_proc_cache.clear()
+        self._working_space = ""
+        self._last_viewer_display = None
+        self._viewer_display_proc = None
+        self._ec_exposure_prop = None
+        self._ec_gamma_prop = None
+        self._exr_seq = None
+        self._video_path = None
+        self._shot_frames = []
+        self._shot_frames_set = set()
+        self._first_shot = None
+        self._last_shot = None
+
+        if not path:
+            self._repopulate_display_views()
+            self._sync_gpu_view_settings()
+            return False
+
+        try:
+            from ...core.video import probe_video
+
+            w, h, probed_fps, n_frames = probe_video(path)
+        except Exception:
+            log.exception("Could not probe video for player: %s", path)
+            self._repopulate_display_views()
+            self._sync_gpu_view_settings()
+            return False
+
+        n_frames = max(1, int(n_frames or 1))
+        use_fps = float(fps) if fps and fps > 0 else float(probed_fps or 24.0)
+        if use_fps <= 0:
+            use_fps = 24.0
+        self.set_fps(use_fps)
+        if resolution is not None and resolution[0] > 0 and resolution[1] > 0:
+            self.set_resolution(resolution[0], resolution[1])
+        elif w > 0 and h > 0:
+            self.set_resolution(int(w), int(h))
+
+        self._video_path = path
+        self._shot_frames = list(range(1, n_frames + 1))
+        self._shot_frames_set = set(self._shot_frames)
+        self._first_shot = 1
+        self._last_shot = n_frames
+
+        if self._src_colorspace and self._ocio_cfg is not None:
+            try:
+                from ...core.ocio_utils import find_equivalent_space
+
+                resolved = find_equivalent_space(self._ocio_cfg, self._src_colorspace)
+                if resolved:
+                    self._src_colorspace = resolved
+            except Exception:
+                pass
+
+        log.info(
+            "SequencePlayer load_video: %s frames=%s fps=%.3f src=%r",
+            path,
+            n_frames,
+            use_fps,
+            self._src_colorspace,
+        )
+
+        self._timeline.set_range(self._first_shot, self._last_shot)
+        self._timeline.set_marker_frames({})
+        self._current_frame = self._first_shot
+        self._timeline.set_value(self._current_frame)
+
+        self._prefetch = VideoPrefetchService(
+            path,
+            self._shot_cache,
+            self._shot_frames,
+            frame_transform=self._build_worker_frame_transform(),
+            parent=self,
+        )
+        self._prefetch.frame_loaded.connect(self._on_prefetch_frame_loaded)
+
+        self._repopulate_display_views()
+        self._sync_gpu_view_settings()
+        self._sync_prefetch()
+        self.refresh()
+        return True
+
     def clear(self) -> None:
         """Stop playback, drop cache, and reset to an empty timeline."""
         self.set_playing(False)
         self.shutdown_prefetch_only()
         self._shot_cache.clear()
         self._exr_seq = None
+        self._video_path = None
         self._shot_frames = []
         self._shot_frames_set = set()
         self._first_shot = None
