@@ -83,10 +83,12 @@ _E2V_EPILOG = """\
 examples:
   %(prog)s -i ./plate
   %(prog)s -i "./plate.####.exr" -o review.mov --fps 24
+  %(prog)s -i ./png_seq -o review.mp4 --codec h264 --fps 24
   %(prog)s -i ./plate --codec prores --src ACEScg --dst "Output - Rec.709"
   %(prog)s -i ./plate --codec h264 --crf 18 --preset medium
   %(prog)s -i ./plate --frame-range 1001-1100 --ocio /path/to/config.ocio
 
+Input: OpenEXR sequences (primary), DPX, or PNG / JPEG / WebP.
 Omit -o to write <parent>/<dirname>.mov (extension follows codec).
 See docs/cli.md for codecs and bit-depth notes.
 """
@@ -244,8 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     e2v = sub.add_parser(
         "exr2video",
-        help="EXR sequence → OCIO → video.",
-        description="Read an EXR sequence, apply OCIO, encode a video file.",
+        help="Image sequence (EXR/DPX/PNG/JPG/WebP) → OCIO → video.",
+        description=(
+            "Read an image sequence (OpenEXR primary; also DPX, PNG, JPEG, WebP), "
+            "apply OCIO, encode a video file."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_E2V_EPILOG,
     )
@@ -253,7 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
         "-i",
         "--input",
         required=True,
-        help="EXR sequence directory or any existing frame file from the sequence",
+        help=(
+            "Image sequence directory or any existing frame file "
+            "(.exr, .dpx, .png, .jpg/.jpeg, .webp)"
+        ),
     )
     e2v.add_argument(
         "-o",
@@ -271,7 +279,10 @@ def build_parser() -> argparse.ArgumentParser:
     e2v.add_argument(
         "--src",
         default=None,
-        help="Source color space (default: EXR metadata / scene_linear)",
+        help=(
+            "Source color space (default: metadata / scene_linear for EXR & DPX; "
+            "sRGB-ish for PNG/JPEG/WebP display stills)"
+        ),
     )
     e2v.add_argument(
         "--dst",
@@ -461,34 +472,57 @@ def resolve_v2e_spaces(cfg, args: argparse.Namespace, log) -> tuple[str, str]:
 
 
 def resolve_e2v_spaces(cfg, args: argparse.Namespace, log) -> tuple[str, str]:
-    """Source/destination for EXR→video, with metadata / role defaults."""
+    """Source/destination for image→video, with metadata / role defaults.
+
+    EXR defaults toward scene-linear; display-encoded stills (PNG/JPEG/…) default
+    toward sRGB so OCIO does not treat 8-bit sRGB as linear light.
+    """
+    from .core.sequence import probe_exr_colorspace, sequence_looks_scene_referred
+
+    scene_linear = True
+    try:
+        scene_linear = sequence_looks_scene_referred(args.input)
+    except Exception:
+        scene_linear = True
+
     src_arg = args.src
     if src_arg is None:
         probed = ""
         try:
-            from .core.sequence import probe_exr_colorspace
-
             # Prefer directory for probe.
             p = Path(args.input)
             probe_dir = str(p if p.is_dir() else p.parent)
             probed = probe_exr_colorspace(probe_dir) or ""
         except Exception:
             probed = ""
-        fallbacks = ([probed] if probed else []) + [
-            DEFAULT_SRC_E2V,
-            "ACEScg",
-            "ACES2065-1",
-            "linear",
-        ]
-        src = _resolve_space(cfg, None, fallbacks=fallbacks, role="scene_linear", log=log)
+        if scene_linear:
+            fallbacks = ([probed] if probed else []) + [
+                DEFAULT_SRC_E2V,
+                "ACEScg",
+                "ACES2065-1",
+                "linear",
+            ]
+            role = "scene_linear"
+        else:
+            fallbacks = ([probed] if probed else []) + [
+                "sRGB Encoded Rec.709 (sRGB)",
+                "sRGB - Texture",
+                "Utility - sRGB - Texture",
+                "sRGB",
+                "Output - Rec.709",
+            ]
+            role = "color_picking"
+        src = _resolve_space(cfg, None, fallbacks=fallbacks, role=role, log=log)
         if probed:
-            log(f"EXR metadata color space: {probed} → {src}")
+            log(f"Image metadata color space: {probed} → {src}")
+        elif not scene_linear:
+            log(f"Display still sequence — source color space: {src}")
     else:
         src = _resolve_space(
             cfg,
             src_arg,
-            fallbacks=[DEFAULT_SRC_E2V],
-            role="scene_linear",
+            fallbacks=[DEFAULT_SRC_E2V if scene_linear else "sRGB Encoded Rec.709 (sRGB)"],
+            role="scene_linear" if scene_linear else "color_picking",
             log=log,
         )
 

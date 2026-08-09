@@ -11,7 +11,7 @@ import av
 import numpy as np
 import PyOpenColorIO as OCIO
 
-from .exr_io import read_exr, write_exr
+from .exr_io import read_image, write_exr
 from .ocio_utils import (
     get_compositing_space,
     get_overlay_authoring_space,
@@ -56,13 +56,14 @@ _FPS_RATIONALS: dict[float, Fraction] = {
 
 
 def _frame_num_from_path(filepath: str) -> int | None:
-    """Extract the trailing frame number from a sequence filename.
-
-    Handles both dot-separated (``name.0001.exr``) and underscore-separated
-    (``name_00001.exr``) conventions.
-    """
+    """Extract the frame number from a ``name.####.ext`` filename."""
     import re
 
+    # Prefer name.FRAME.ext (canonical).
+    m = re.search(r"\.(\d+)\.[A-Za-z0-9]+$", Path(filepath).name)
+    if m:
+        return int(m.group(1))
+    # Legacy trailing digits on stem (should not appear for new writes).
     stem = Path(filepath).stem
     m = re.search(r"(\d+)$", stem)
     if m:
@@ -239,13 +240,24 @@ def run_video_to_exr(
     padding: int = 4,
     start_frame: int = 1001,
     frame_set: set[int] | None = None,
-    slate_frame: np.ndarray | None = None,
     exr_opts: dict[str, str] | None = None,
     deinterlace: str = "auto",
+    output_name: str = "",
 ) -> None:
+    """Decode video → OCIO → EXR sequence (ingest).
+
+    Files are always written as ``{output_name}.{frame:0N}.ext`` (dot pad only).
+    *output_name* defaults to the video stem when empty. Slate / burn-in /
+    watermark are **never** applied on this path.
+    """
     ocio_cfg = _ensure_ocio(ocio_cfg, config_source, config_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    stem = (output_name or Path(video_path).stem).strip()
+    # Never allow path separators in the sequence name.
+    stem = Path(stem).name
+    if not stem:
+        stem = Path(video_path).stem
     w, h, _fps, total = probe_video(video_path)
     ow, oh = _scaled_dims(w, h, scale)
     render_total = len(frame_set) if frame_set else total
@@ -253,16 +265,8 @@ def run_video_to_exr(
         res_info = f"{w}x{h}" if scale >= 1.0 else f"{w}x{h} \u2192 {ow}x{oh}"
         range_info = f", range trimmed to {render_total}" if frame_set else ""
         log(f"Input: {video_path}  ({res_info}, ~{total} frames{range_info})")
-
-    if slate_frame is not None:
-        stem = Path(video_path).stem
-        fmt = f"0{padding}d"
-        slate_num = start_frame - 1
-        slate_path = str(output_dir / f"{stem}.{slate_num:{fmt}}.exr")
-        rgb3 = np.ascontiguousarray(slate_frame[:, :, :3], dtype=np.float32)
-        write_exr(slate_path, rgb3, compression=compression, exr_opts=exr_opts)
-        if log:
-            log(f"Slate frame written \u2192 {slate_path}")
+        nuke_pat = "#" * max(1, int(padding))
+        log(f"Output sequence: {output_dir / f'{stem}.{nuke_pat}.exr'}")
 
     n_workers = workers if workers > 0 else _DEFAULT_WORKERS
 
@@ -286,13 +290,13 @@ def run_video_to_exr(
             frame_set,
             exr_opts=exr_opts,
             deinterlace=deinterlace,
+            output_name=stem,
         )
         return
 
     if log:
         log(f"OCIO: {src_space} \u2192 {dst_space}  ({n_workers} workers)")
 
-    stem = Path(video_path).stem
     container = av.open(video_path)
     stream = container.streams.video[0]
     max_inflight = n_workers * 2
@@ -393,13 +397,15 @@ def _v2e_serial(
     frame_set: set[int] | None = None,
     exr_opts: dict[str, str] | None = None,
     deinterlace: str = "auto",
+    output_name: str = "",
 ) -> None:
     cpu = make_cpu_processor(ocio_cfg, src_space, dst_space)
     render_total = len(frame_set) if frame_set else total
     if log:
         log(f"OCIO: {src_space} \u2192 {dst_space}  (single-threaded)")
 
-    stem = Path(video_path).stem
+    stem = (output_name or Path(video_path).stem).strip()
+    stem = Path(stem).name or Path(video_path).stem
     container = av.open(video_path)
     stream = container.streams.video[0]
     frame_buf = np.empty((h, w, 3), dtype=np.float32)
@@ -474,11 +480,11 @@ def run_exr_to_video(
     overlay_provider: Callable[[int | None], np.ndarray | None] | None = None,
     codec_opts: dict[str, str] | None = None,
 ) -> None:
-    """Encode an EXR sequence (with optional slate / overlays) to a video.
+    """Encode an image sequence (EXR/PNG/JPG/… with optional slate / overlays) to video.
 
     The encode pipeline runs in a scene-linear *working space*:
 
-    1. EXR src → working (per-worker)
+    1. image src → working (per-worker)
     2. composite *burnin_overlay* (linearised into working space) on every frame
     3. working → display
     4. quantise to uint16 → video stream
@@ -516,9 +522,9 @@ def run_exr_to_video(
 
     total = len(paths)
     if total == 0:
-        raise RuntimeError("No EXR frames to encode.")
+        raise RuntimeError("No image frames to encode.")
 
-    first = read_exr(paths[0])
+    first = read_image(paths[0])
     h, w = first.shape[:2]
     ow, oh = _scaled_dims(w, h, scale)
     if log:
@@ -735,11 +741,11 @@ def _e2v_serial(
         for idx, path in enumerate(paths, 1):
             if cancel_check and cancel_check():
                 raise RuntimeError("Cancelled")
-            rgb = read_exr(path)
+            rgb = read_image(path)
             frame_buf = np.ascontiguousarray(rgb[:, :, :3], dtype=np.float32)
             fh, fw = frame_buf.shape[:2]
             # *w*/*h* are the (possibly scaled) output dims; process at native
-            # EXR resolution and only reformat the VideoFrame if needed.
+            # frame resolution and only reformat the VideoFrame if needed.
             cpu_to_working.apply(OCIO.PackedImageDesc(frame_buf, fw, fh, 3))
 
             # Per-frame tokens (e.g. <frame>) require re-rendering + re-linearising

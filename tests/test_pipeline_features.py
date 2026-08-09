@@ -495,7 +495,8 @@ class TestSequenceAndRoundTrip:
         assert len(rows) >= 1
         assert rows[0]["frames"] == 3
 
-    def test_underscore_frame_names(self, tmp_path: Path):
+    def test_underscore_frame_names_ignored(self, tmp_path: Path):
+        """App only supports name.####.ext (dot pad); underscore pads are ignored."""
         d = tmp_path / "us"
         d.mkdir()
         for i in range(3):
@@ -504,9 +505,8 @@ class TestSequenceAndRoundTrip:
                 np.full((16, 32, 3), 0.3, dtype=np.float32),
                 compression="zip",
             )
-        paths, basename = find_exr_sequence(str(d))
-        assert len(paths) == 3
-        assert basename
+        with pytest.raises(RuntimeError, match="No image sequences"):
+            find_exr_sequence(str(d))
 
     def test_round_trip_video_exr_video(self, tmp_path: Path):
         vid = tmp_path / "in.mov"

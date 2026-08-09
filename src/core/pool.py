@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import PyOpenColorIO as OCIO
 
-from .exr_io import read_exr, write_exr
+from .exr_io import read_image, write_exr
 
 # Workers cache up to two CPUProcessors: one for src→working (OCIO load
 # stage) and one for working→display (OCIO display stage).  Each is keyed
@@ -83,11 +83,11 @@ def process_frame_e2v(
     dst_space: str,
     overlay_working: np.ndarray | None = None,
 ) -> tuple[int, np.ndarray]:
-    """Read one EXR, run the full working-space comp pipeline, return (idx, rgb_u16).
+    """Read one still (EXR/PNG/JPG/…), run working-space comp, return (idx, rgb_u16).
 
     Pipeline:
 
-    1. read EXR (in *src_space*)
+    1. read image (in *src_space*)
     2. OCIO src→working (scene-linear)
     3. composite *overlay_working* (alpha-over) if provided — ``overlay_working``
        is a float32 RGBA buffer **already linearised into the working space**
@@ -97,12 +97,12 @@ def process_frame_e2v(
     Raises
     ------
     RuntimeError
-        If the EXR cannot be read.
+        If the frame cannot be read.
     """
     cpu_to_working = _ensure_cpu(config_source, config_path, src_space, working_space)
     cpu_to_display = _ensure_cpu(config_source, config_path, working_space, dst_space)
 
-    rgb = read_exr(path)
+    rgb = read_image(path)
     h, w = rgb.shape[:2]
     desc = OCIO.PackedImageDesc(rgb, w, h, 3)
     cpu_to_working.apply(desc)

@@ -1,12 +1,82 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import fileseq
 
+from .constants import (
+    IMAGE_SEQUENCE_EXTS,
+    image_sequence_ext_priority,
+    is_image_sequence_ext,
+    is_scene_referred_image_ext,
+)
+
+# Canonical sequence naming for this app: ``name.####.ext`` (dot frame pad only).
+# fileseq reports basenames as ``name.`` for that form; underscore pads (``name_``)
+# are not supported for discovery or writing.
+_DOT_PAD_PATTERN = re.compile(
+    r"^(?P<name>.+)\.(?P<pad>#+)\.(?P<ext>[A-Za-z0-9]+)$",
+    re.IGNORECASE,
+)
+_DOT_FRAME_PATTERN = re.compile(
+    r"^(?P<name>.+)\.(?P<frame>\d+)\.(?P<ext>[A-Za-z0-9]+)$",
+    re.IGNORECASE,
+)
+
+
+def is_dot_frame_sequence(seq: fileseq.FileSequence) -> bool:
+    """True when *seq* uses ``name.####.ext`` (basename ends with ``.``)."""
+    try:
+        return str(seq.basename()).endswith(".")
+    except Exception:
+        return False
+
+
+def parse_dot_sequence_output(
+    path: str,
+) -> tuple[str, str | None, int | None]:
+    """Parse a Video → EXR output path into ``(directory, name, padding)``.
+
+    Accepts:
+
+    - ``/out/shot.####.exr`` → ``("/out", "shot", 4)``
+    - ``/out/shot.1001.exr`` → ``("/out", "shot", None)`` (pad from UI/CLI)
+    - ``/out`` or ``/out/`` → ``("/out", None, None)`` (name from video stem)
+
+    Underscore pads (``shot_####.exr``) are rejected with :class:`ValueError`.
+    """
+    raw = (path or "").strip()
+    if not raw:
+        return "", None, None
+    p = Path(raw).expanduser()
+    name = p.name
+
+    # Underscore pad — not supported
+    if re.search(r"_#+\.[A-Za-z0-9]+$", name, re.I) or re.search(
+        r"_\d+\.[A-Za-z0-9]+$", name, re.I
+    ):
+        raise ValueError(
+            f"Unsupported sequence pattern {name!r}: use name.####.ext "
+            f"(dot-separated frames), not underscore pads."
+        )
+
+    # Explicit pad pattern: name.####.exr
+    m = _DOT_PAD_PATTERN.match(name)
+    if m:
+        return str(p.parent), m.group("name"), len(m.group("pad"))
+
+    # Single frame style name.1001.exr → sequence name only
+    m = _DOT_FRAME_PATTERN.match(name)
+    if m:
+        return str(p.parent), m.group("name"), None
+
+    # Directory (or any non-pattern path treated as output folder)
+    return str(p), None, None
+
 
 def _probe_resolution(filepath: str) -> tuple[int, int]:
-    """Read display-window width and height from an EXR header without decoding pixels."""
+    """Read display-window width and height from an image header without decoding pixels."""
     try:
         import OpenImageIO as oiio
 
@@ -22,35 +92,76 @@ def _probe_resolution(filepath: str) -> tuple[int, int]:
     return 0, 0
 
 
-def _find_exr_seqs(directory: str) -> list[fileseq.FileSequence]:
-    """Return all .exr FileSequences found in *directory*, sorted by basename."""
+def _find_image_seqs(directory: str) -> list[fileseq.FileSequence]:
+    """Return image FileSequences found in *directory*, sorted by format priority then basename.
+
+    Only **dot-padded** sequences (``name.####.ext``) are returned. Underscore
+    pads (``name_####.ext``) are ignored — this app always uses name-dot-frame.
+
+    OpenEXR sequences sort first so mixed folders still pick EXR by default.
+    """
     seqs = fileseq.findSequencesOnDisk(directory)
-    exr = [s for s in seqs if s.extension().lower() == ".exr" and s.frameSet()]
-    return sorted(exr, key=lambda s: s.basename())
+    out = [
+        s
+        for s in seqs
+        if is_image_sequence_ext(s.extension()) and s.frameSet() and is_dot_frame_sequence(s)
+    ]
+    return sorted(
+        out,
+        key=lambda s: (image_sequence_ext_priority(s.extension()), s.basename()),
+    )
+
+
+# Back-compat alias used by older call sites / tests.
+_find_exr_seqs = _find_image_seqs
+
+
+def probe_pixel_colorspace(filepath: str) -> str:
+    """Return the OCIO colorspace of the *pixels* in *filepath*, if known.
+
+    Preference order:
+
+    1. ``exrconverter:dstColorSpace`` — space we wrote after OCIO (always correct
+       for files from this app).
+    2. ``oiio:ColorSpace`` — third-party / OIIO tag (often mangled to
+       ``lin_rec709`` for any scene-linear EXR; treat as weak hint only when
+       our attribute is missing).
+    """
+    try:
+        import OpenImageIO as oiio
+
+        inp = oiio.ImageInput.open(filepath)
+        if not inp:
+            return ""
+        try:
+            spec = inp.spec()
+            ours = spec.getattribute("exrconverter:dstColorSpace")
+            if ours:
+                return str(ours)
+            oiio_cs = spec.getattribute("oiio:ColorSpace")
+            if oiio_cs:
+                return str(oiio_cs)
+        finally:
+            inp.close()
+    except Exception:
+        pass
+    return ""
 
 
 def probe_exr_colorspace(directory: str) -> str:
-    """Return the oiio:ColorSpace from the first EXR in *directory*, or ''."""
-    for s in _find_exr_seqs(directory):
+    """Return the pixel colorspace of the preferred sequence in *directory*, or ''."""
+    for s in _find_image_seqs(directory):
         first_frame = list(s.frameSet())[0]
         path = s.frame(first_frame)
-        try:
-            import OpenImageIO as oiio
-
-            inp = oiio.ImageInput.open(path)
-            if inp:
-                cs = inp.spec().getattribute("oiio:ColorSpace")
-                inp.close()
-                if cs:
-                    return str(cs)
-        except Exception:
-            pass
+        cs = probe_pixel_colorspace(path)
+        if cs:
+            return cs
         break
     return ""
 
 
 def probe_exr_metadata(filepath: str) -> dict[str, str]:
-    """Return a dict of human-readable EXR metadata from the first frame."""
+    """Return a dict of human-readable image metadata from the first frame."""
     result: dict[str, str] = {}
     try:
         import OpenImageIO as oiio
@@ -86,17 +197,18 @@ def probe_exr_metadata(filepath: str) -> dict[str, str]:
 
 
 def scan_exr_sequences(directory: str) -> list[dict]:
-    """Return metadata dicts for every EXR sequence found in *directory*.
+    """Return metadata dicts for every supported image sequence found in *directory*.
 
     Each dict contains:
         name       - sequence basename (e.g. "beauty")
         frames     - number of frames
         range      - human-readable frame range string
-        resolution - "W\u00d7H" string from the first frame
+        resolution - "W×H" string from the first frame
         path       - the directory scanned
+        extension  - file extension including the leading dot (e.g. ".exr")
     """
     results = []
-    for s in _find_exr_seqs(directory):
+    for s in _find_image_seqs(directory):
         fs = s.frameSet()
         frame_list = sorted(fs)
         range_str = s.frameRange() if frame_list else "?"
@@ -127,7 +239,8 @@ def scan_exr_sequences(directory: str) -> list[dict]:
                 pass
 
         pad = "#" * s.zfill()
-        pattern = f"{s.basename()}{pad}{s.extension()}"
+        ext = s.extension()
+        pattern = f"{s.basename()}{pad}{ext}"
 
         results.append(
             {
@@ -141,17 +254,21 @@ def scan_exr_sequences(directory: str) -> list[dict]:
                 "colorspace": colorspace,
                 "path": directory,
                 "first_frame": first_path,
+                "extension": ext.lower() if ext else "",
             }
         )
     return results
 
 
 def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
-    """Resolve *input_path* to an ordered list of EXR file paths + a basename.
+    """Resolve *input_path* to an ordered list of image file paths + a basename.
 
     *input_path* may be:
-    - a directory  -> scan for .exr sequences, pick the first
-    - a single .exr file -> scan its parent dir, find the sequence it belongs to
+    - a directory  → scan for supported image sequences, pick preferred (EXR first)
+    - a single frame file → scan its parent dir, find the sequence it belongs to
+
+    Supported extensions: see :data:`IMAGE_SEQUENCE_EXTS` (``.exr``, ``.dpx``,
+    ``.png``, ``.jpg`` / ``.jpeg``, ``.webp``).
     """
     p = Path(input_path)
     if p.is_file():
@@ -161,12 +278,13 @@ def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
     else:
         raise RuntimeError(f"Path does not exist: {input_path}")
 
-    exr_seqs = _find_exr_seqs(scan_dir)
-    if not exr_seqs:
-        raise RuntimeError(f"No EXR sequences found in {scan_dir}")
+    seqs = _find_image_seqs(scan_dir)
+    if not seqs:
+        exts = ", ".join(sorted(IMAGE_SEQUENCE_EXTS))
+        raise RuntimeError(f"No image sequences found in {scan_dir} (supported: {exts})")
 
     if p.is_file():
-        for s in exr_seqs:
+        for s in seqs:
             fs = s.frameSet()
             if not fs:
                 continue
@@ -174,12 +292,15 @@ def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
                 if Path(s.frame(f)).name == p.name:
                     frames = sorted(fs)
                     return [s.frame(f) for f in frames], s.basename().rstrip("._")
-        return [str(p)], p.stem
+        # Lone single frame that is not part of a multi-frame sequence.
+        if is_image_sequence_ext(p.suffix):
+            return [str(p)], p.stem
+        raise RuntimeError(f"Not a supported image sequence frame: {p.name}")
 
-    seq = exr_seqs[0]
+    seq = seqs[0]
     fs = seq.frameSet()
     if not fs:
-        raise RuntimeError(f"EXR sequence has no frames in {scan_dir}")
+        raise RuntimeError(f"Image sequence has no frames in {scan_dir}")
     frames = sorted(fs)
     return [seq.frame(f) for f in frames], seq.basename().rstrip("._")
 
@@ -199,13 +320,14 @@ def find_exr_sequence_info(
     else:
         raise RuntimeError(f"Path does not exist: {input_path}")
 
-    exr_seqs = _find_exr_seqs(scan_dir)
-    if not exr_seqs:
-        raise RuntimeError(f"No EXR sequences found in {scan_dir}")
+    seqs = _find_image_seqs(scan_dir)
+    if not seqs:
+        exts = ", ".join(sorted(IMAGE_SEQUENCE_EXTS))
+        raise RuntimeError(f"No image sequences found in {scan_dir} (supported: {exts})")
 
     seq = None
     if p.is_file():
-        for s in exr_seqs:
+        for s in seqs:
             fs = s.frameSet()
             if not fs:
                 continue
@@ -215,14 +337,38 @@ def find_exr_sequence_info(
                     break
             if seq:
                 break
+        if seq is None and is_image_sequence_ext(p.suffix):
+            # Build a one-frame sequence for an isolated still.
+            seq = fileseq.FileSequence(str(p))
     if seq is None:
-        seq = exr_seqs[0]
+        seq = seqs[0]
 
     fs = seq.frameSet()
     if not fs:
-        raise RuntimeError(f"EXR sequence has no frames in {scan_dir}")
+        # Single-file FileSequence may have an empty frame set depending on path.
+        if p.is_file() and is_image_sequence_ext(p.suffix):
+            return [str(p)], p.stem, [0], 0, seq
+        raise RuntimeError(f"Image sequence has no frames in {scan_dir}")
     frames = sorted(int(f) for f in fs)
     paths = [seq.frame(f) for f in frames]
     name = seq.basename().rstrip("._")
     pad_width = seq.zfill()
     return paths, name, frames, pad_width, seq
+
+
+def sequence_looks_scene_referred(input_path: str) -> bool:
+    """True when the resolved sequence is EXR (or another scene-linear format).
+
+    Used for OCIO source defaults: display-encoded PNG/JPG sequences should
+    default toward sRGB, not ``scene_linear``.
+    """
+    p = Path(input_path)
+    if p.is_file() and is_image_sequence_ext(p.suffix):
+        return is_scene_referred_image_ext(p.suffix)
+    try:
+        paths, _ = find_exr_sequence(input_path)
+    except Exception:
+        return True
+    if not paths:
+        return True
+    return is_scene_referred_image_ext(Path(paths[0]).suffix)

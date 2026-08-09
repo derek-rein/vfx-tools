@@ -389,6 +389,33 @@ class OcioGpuImagePlane(QOpenGLWidget):
     def is_alive(self) -> bool:
         return not self._gpu_dead
 
+    def release_gl(self) -> None:
+        """Tear down GL resources before the widget is destroyed.
+
+        Call this from the owning player on shutdown. Relying only on
+        ``closeEvent`` is unreliable when the widget is reparented /
+        ``deleteLater``'d from a dialog stack (browser Preview path).
+        """
+        if self._gpu_dead and not self._gl_ready:
+            return
+        if self._gl_ready:
+            try:
+                self.makeCurrent()
+                self._teardown_gl()
+            except Exception:
+                log.debug("GL release teardown failed", exc_info=True)
+            finally:
+                try:
+                    self.doneCurrent()
+                except Exception:
+                    pass
+        self._gl_ready = False
+        self._gpu_dead = True
+        self._image = None
+        self._overlay = None
+        self._shader_desc = None
+        self._exp_prop = None
+
     # -- GL lifecycle ---------------------------------------------------------
 
     def initializeGL(self) -> None:
@@ -555,17 +582,9 @@ class OcioGpuImagePlane(QOpenGLWidget):
             log.exception("paintGL failed")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self._gl_ready and not self._gpu_dead:
-            try:
-                self.makeCurrent()
-                self._teardown_gl()
-            except Exception:
-                log.debug("GL teardown failed", exc_info=True)
-            finally:
-                try:
-                    self.doneCurrent()
-                except Exception:
-                    pass
+        # Explicit cleanup with makeCurrent (Qt docs: do not rely on deleteLater
+        # for OpenGL resource teardown).
+        self.release_gl()
         super().closeEvent(event)
 
     def _fail(self, reason: str) -> None:

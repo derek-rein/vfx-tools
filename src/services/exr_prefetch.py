@@ -304,7 +304,11 @@ class ExrPrefetchService(QObject):
             rgb = fut.result()
         except Exception:
             rgb = None
-        self._delivery_ready.emit(frame, rgb, generation)
+        try:
+            self._delivery_ready.emit(frame, rgb, generation)
+        except RuntimeError:
+            # Prefetch QObject already deleted (dialog closed mid-load).
+            return
 
     def _deliver(self, frame: int, rgb: np.ndarray | None, generation: int) -> None:
         # GUI-thread slot.

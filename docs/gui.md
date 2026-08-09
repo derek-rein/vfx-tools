@@ -24,12 +24,54 @@ from a Read — see [nuke.md](./nuke.md).
 
 | Tab | Direction | Notes |
 |-----|-----------|--------|
-| **Video → EXR** | Decode video → OCIO → EXR sequence | No slate / burn-in / watermark |
-| **EXR → Video** | EXR sequence → OCIO → video | Slate, burn-in, and watermark available |
+| **Video → EXR** | Decode video → OCIO → EXR sequence | **Ingest only** — never slate / burn-in / watermark (menu disabled on this tab). Output field uses ``name.####.exr``; that basename is written (not forced to the video stem). |
+| **EXR → Video** | Image sequence → OCIO → video | OpenEXR primary; also DPX, PNG, JPEG, WebP. Slate / burn-in / watermark available. Sequences must be ``name.####.ext`` (dot pad). |
 
 Mode can be forced with `--mode video2exr|exr2video`, or inferred from `--open`
-(`auto`: EXR-like paths open **EXR → Video**, common video extensions open
+(`auto`: image-sequence paths open **EXR → Video**, common video extensions open
 **Video → EXR**).
+
+### Input / output paths
+
+Right-click the **Input** or **Output** path field for:
+
+| Action | Behavior |
+|--------|----------|
+| **Cut / Copy / Paste / Select All** | Standard line-edit edit commands (same as ⌘/Ctrl+X/C/V/A) |
+| **Copy File Path** | Full text from the field |
+| **Copy Folder Path** | Containing directory (or the path itself when it is a folder / sequence pattern) |
+| **Open in Finder** / **Show in Explorer** / **Open Containing Folder** | Open that folder via the system file manager (`QDesktopServices`) |
+
+**Browse…** opens the normal browser or file dialog. With a valid path in the
+field, **⌘-click** (macOS) or **Ctrl-click** (Windows/Linux) on **Browse…**
+reveals that path in the OS file manager instead.
+
+**Sequence browser** lists every supported still sequence in a folder. Mixed
+folders prefer EXR, then DPX. Display-encoded stills (PNG/JPEG/WebP) auto-suggest
+an **sRGB** source color space; EXR/DPX default toward scene-linear / metadata.
+
+**Views:** the top bar has **List | Grid | Preview** plus **Inspect** (always
+available). **List** is the metadata table; **Grid** shows first-frame
+thumbnails (async OIIO downscale; EXR/DPX get a cheap display curve).
+**Preview** replaces the list/grid with an in-dialog player for the **first**
+sequence in the folder (typical VFX layout is one sequence per folder; if
+several exist, the first wins). Folder tree and path stay visible. Browser
+Preview uses the same GPU OCIO `SequencePlayer` as the slate editor (the GL
+widget is created with the dialog, before it is shown, so the window starts as
+an OpenGL surface). **Space** toggles Preview ↔ last list/grid mode; **Esc**
+leaves Preview; **Left/Right** step frames. Double-click or **Open** commits
+the selection into the convert tab. The slate editor reuses the player with
+live burn-in/watermark overlays.
+
+Window size, splitter positions, list/grid mode, and list column widths are
+remembered in `QSettings` (`ui/sequence_browser_*`).
+
+**Video browser** (Video → EXR input) mirrors the sequence browser with
+**List | Grid | Preview**. **Grid** shows first-frame video thumbnails (PyAV).
+**Preview** plays the selected file (or the first file in the folder) with the
+same player transport, cache strip, and OCIO controls. **Space** toggles
+Preview; **Esc** returns to list/grid. Folder path fields never expand the
+dialog when paths are long (text elides; width follows the layout).
 
 ---
 
@@ -81,15 +123,16 @@ Checkboxes under the convert actions (persisted in `QSettings`):
 | Toggle | Default | Action |
 |--------|---------|--------|
 | **Copy path** | on | Copy the output path to the clipboard |
-| **Open result** | off | Open the **video** with the preferred player (Preferences). No-op for EXR output — use **Show in folder**. |
+| **Open result** | off | **EXR → Video:** open the finished file with the preferred video player (Preferences). **Video → EXR:** open the sequence in a built-in player window (GPU OCIO when available, with the playback cache strip). |
 | **Show in folder** | off | Reveal the file or sequence folder in the OS file manager |
 
 ### Preferences (`File → Preferences…`)
 
 | Setting | Purpose |
 |---------|---------|
-| **Video player** | System default, or a custom app/CLI path (IINA, VLC, mpv, …). Used by **Open result**. |
+| **Video player** | System default, or a custom app/CLI path (IINA, VLC, mpv, …). Used by **Open result** for video output. |
 | **Slate thumbnail frame** | First / middle / last frame of the EXR sequence for the slate still |
+| **Playback cache budget** | % of system RAM for decoded sequence frames (slate, browser Preview, post-convert sequence player) |
 
 Settings org/app: `QSettings("VFXTools", "EXRConverter")`.
 

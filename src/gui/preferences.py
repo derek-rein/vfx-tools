@@ -23,8 +23,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
+)
+
+from ..services.cache_prefs import (
+    load_cache_budget_pct,
+    save_cache_budget_pct,
+    total_ram_bytes,
 )
 
 # QSettings keys
@@ -179,6 +186,29 @@ def _launch_custom_player(player: str, media: Path) -> str:
         creationflags=creationflags,
     )
     return f"opened in {label}"
+
+
+def file_manager_label() -> str:
+    """User-facing name of the OS file manager (for menus / tooltips)."""
+    if sys.platform == "darwin":
+        return "Open in Finder"
+    if sys.platform == "win32":
+        return "Show in Explorer"
+    return "Open Containing Folder"
+
+
+def path_is_revealable(path: str | Path) -> bool:
+    """Return True when *path* or its parent directory exists on disk."""
+    raw = str(path or "").strip()
+    if not raw:
+        return False
+    p = Path(raw).expanduser()
+    try:
+        if p.exists():
+            return True
+        return p.parent.is_dir()
+    except OSError:
+        return False
 
 
 def reveal_in_file_manager(path: str | Path) -> str:
@@ -382,12 +412,44 @@ class PreferencesDialog(QDialog):
                 self._thumb_combo.setCurrentIndex(i)
                 break
 
+        # --- Playback RAM cache budget ---
+        cache_box = QGroupBox("Playback cache")
+        cache_layout = QVBoxLayout(cache_box)
+        cache_hint = QLabel(
+            "How much system RAM the sequence player may use for decoded frames "
+            "(slate editor and file-browser Preview). Higher values mean longer "
+            "smooth play; lower values free memory for other apps."
+        )
+        cache_hint.setWordWrap(True)
+        cache_hint.setStyleSheet("color: #aaa;")
+        cache_layout.addWidget(cache_hint)
+
+        cache_row = QHBoxLayout()
+        cache_row.addWidget(QLabel("Budget:"))
+        self._cache_slider = QSlider(Qt.Orientation.Horizontal)
+        self._cache_slider.setRange(1, 90)
+        self._cache_slider.setValue(load_cache_budget_pct(settings))
+        self._cache_slider.setToolTip("Playback RAM cache as % of physical memory")
+        self._cache_value = QLabel()
+        self._cache_value.setMinimumWidth(120)
+        self._cache_slider.valueChanged.connect(self._update_cache_label)
+        self._update_cache_label(self._cache_slider.value())
+        cache_row.addWidget(self._cache_slider, 1)
+        cache_row.addWidget(self._cache_value)
+        cache_layout.addLayout(cache_row)
+        root.addWidget(cache_box)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    def _update_cache_label(self, pct: int) -> None:
+        budget_gb = total_ram_bytes() * pct / 100 / (1024**3)
+        total_gb = total_ram_bytes() / (1024**3)
+        self._cache_value.setText(f"{pct}%  (~{budget_gb:.1f} / {total_gb:.1f} GB)")
 
     def _sync_custom_enabled(self) -> None:
         on = self._custom_radio.isChecked()
@@ -460,4 +522,5 @@ class PreferencesDialog(QDialog):
             self._settings,
             int(thumb_data) if thumb_data is not None else THUMBNAIL_FRAME_MID,
         )
+        save_cache_budget_pct(self._settings, int(self._cache_slider.value()))
         self.accept()

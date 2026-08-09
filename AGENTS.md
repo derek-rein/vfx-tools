@@ -64,6 +64,7 @@ main.py                 # GUI / CLI entry
 src/
   core/                 # convert, video, EXR I/O, OCIO, codecs constants, sequences
   gui/                  # PySide6 window, tabs, slate UI, preferences, style
+  gui/player/           # SequencePlayer, ShuttleBar, ImagePreviewView (shared playback)
   render/               # slate, burn-in, watermark, tokens (QPainter)
   services/             # worker thread, presets, cache, slate model, prefetch
   rc_resources.py       # generated from resources.qrc — do not hand-edit
@@ -85,7 +86,8 @@ site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
 | Main window / post-convert actions | `src/gui/window.py` |
 | Player prefs / reveal-in-folder | `src/gui/preferences.py` |
 | Convert tabs / codecs UI | `src/gui/widgets.py` |
-| Slate dialog / viewer | `src/gui/slate_widgets.py`, `src/gui/ocio_gpu_plane.py`, `src/services/slate_model.py` |
+| Sequence player | `src/gui/player/` (`SequencePlayer`, transport, preview view) |
+| Slate dialog / viewer | `src/gui/slate_widgets.py` (composes player + overlay hooks), `src/gui/ocio_gpu_plane.py`, `src/services/slate_model.py` |
 | Background convert | `src/services/worker.py` |
 
 ## Commands (local)
@@ -143,7 +145,9 @@ config version 2.5 cannot load on library 2.4. Fix: `make ensure-ocio` or
    `make resources`. Do not hand-edit `src/rc_resources.py`.
 6. **Presets / settings** — `QSettings` under org `VFXTools` / app `EXRConverter`.
    Post-convert toggles: `ui/copy_path_after` (default **true**), `ui/open_after`,
-   `ui/show_folder_after`. Player: `player/mode` (`system`|`custom`), `player/path`.
+   `ui/show_folder_after`. **Open result:** video → external player prefs;
+   Video → EXR → built-in `SequencePlayerWindow`. Player prefs: `player/mode`
+   (`system`|`custom`), `player/path`.
 7. **Nuitka** — Release builds strip many Qt modules (WebEngine, Svg, Pdf, …).
    Prefer PySide6-Essentials APIs already used in the tree. Bundle includes
    `resources/ocio` and package data for `av`, OIIO, OCIO, fileseq.
