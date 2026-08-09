@@ -44,12 +44,10 @@ class FrameCache(QObject):
     ) -> None:
         super().__init__(parent)
         if budget_bytes is None:
-            from PySide6.QtCore import QSettings
-
-            from ..core.constants import APP_NAME, APP_ORG
+            from .app_settings import get_app_settings
             from .cache_prefs import cache_budget_bytes
 
-            budget_bytes = cache_budget_bytes(QSettings(APP_ORG, APP_NAME))
+            budget_bytes = cache_budget_bytes(get_app_settings().qsettings)
         self._budget = budget_bytes
         self._lock = threading.Lock()
         self._store: OrderedDict[int, np.ndarray] = OrderedDict()

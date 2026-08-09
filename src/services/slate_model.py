@@ -19,10 +19,18 @@ and dedup (no signal storms when a setter receives the same value).
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from PySide6.QtCore import QObject, QSettings, Signal
+from PySide6.QtGui import QUndoStack
 
 from ..render.burnin import burnin_fields_from_slate
+from .slate_commands import (
+    SetBurninFieldsCommand,
+    SetSlateFieldsCommand,
+    SetSlateFlagCommand,
+    SetWatermarkParamsCommand,
+)
 
 _BURNIN_KEYS = (
     "top_left",
@@ -73,6 +81,55 @@ def _load_slate_field(s: QSettings, key: str, env: str | None, default: str) -> 
     return default
 
 
+def _settings_bool(s: QSettings, key: str, default: bool = False) -> bool:
+    """Coerce QSettings bool without treating the string ``\"false\"`` as True."""
+    try:
+        return bool(s.value(key, default, type=bool))
+    except (TypeError, ValueError):
+        raw = s.value(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off", ""):
+            return False
+    return bool(default)
+
+
+def _settings_int(s: QSettings, key: str, default: int = 0) -> int:
+    raw = s.value(key, default)
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw)
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return default
+    return default
+
+
+def _settings_float(s: QSettings, key: str, default: float = 0.0) -> float:
+    raw = s.value(key, default)
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        try:
+            return float(raw.strip())
+        except ValueError:
+            return default
+    return default
+
+
 class SlateModel(QObject):
     """Reactive container for slate / burn-in / watermark state.
 
@@ -89,21 +146,31 @@ class SlateModel(QObject):
         super().__init__(parent)
         self._settings = settings
         self._mode = mode
+        # Document-owned undo stack (slate editor + tab toggles). Not used for
+        # convert paths / OCIO / app preferences.
+        self._undo = QUndoStack(self)
 
-        self._slate_enabled = bool(settings.value(f"{mode}/slate_enabled", False))
-        self._burnin_enabled = bool(settings.value(f"{mode}/burnin_enabled", False))
-        self._watermark_enabled = bool(settings.value(f"{mode}/watermark_enabled", False))
+        self._slate_enabled = _settings_bool(settings, f"{mode}/slate_enabled", False)
+        self._burnin_enabled = _settings_bool(settings, f"{mode}/burnin_enabled", False)
+        self._watermark_enabled = _settings_bool(
+            settings, f"{mode}/watermark_enabled", False
+        )
+        # Migrate older profiles that only had slate/wm_enabled.
+        if not self._watermark_enabled and _settings_bool(
+            settings, "slate/wm_enabled", False
+        ):
+            self._watermark_enabled = True
 
         # Slate metadata: per-field persistence keys live under ``slate/...``
         # so they survive across modes (slate text is not mode-specific).
         self._slate_data: dict[str, str] = {}
         for key, env, default in _SLATE_FIELDS:
             self._slate_data[key] = _load_slate_field(settings, key, env, default)
-        self._slate_version = int(settings.value("slate/version_num", 1))
-        self._slate_fps = float(settings.value("slate/fps", 24.0))
+        self._slate_version = _settings_int(settings, "slate/version_num", 1)
+        self._slate_fps = _settings_float(settings, "slate/fps", 24.0)
         self._slate_resolution = (
-            int(settings.value("slate/res_w", 1920)),
-            int(settings.value("slate/res_h", 1080)),
+            _settings_int(settings, "slate/res_w", 1920),
+            _settings_int(settings, "slate/res_h", 1080),
         )
 
         self._thumbnail_b64: str = ""
@@ -112,27 +179,32 @@ class SlateModel(QObject):
             self._burnin_fields[k] = str(settings.value(f"slate/burnin_{k}", "") or "")
 
         self._watermark_params: dict = dict(_DEFAULT_WATERMARK)
-        self._watermark_params["enabled"] = bool(int(settings.value("slate/wm_enabled", 0)))
+        self._watermark_params["enabled"] = _settings_bool(settings, "slate/wm_enabled", False)
         self._watermark_params["text"] = str(
             settings.value("slate/wm_text", _DEFAULT_WATERMARK["text"])
         )
-        self._watermark_params["opacity"] = int(
-            settings.value("slate/wm_opacity", _DEFAULT_WATERMARK["opacity"])
+        self._watermark_params["opacity"] = _settings_int(
+            settings, "slate/wm_opacity", int(_DEFAULT_WATERMARK["opacity"])
         )
-        self._watermark_params["size_pct"] = float(
-            settings.value("slate/wm_size", _DEFAULT_WATERMARK["size_pct"])
+        self._watermark_params["size_pct"] = _settings_float(
+            settings, "slate/wm_size", float(_DEFAULT_WATERMARK["size_pct"])
         )
-        self._watermark_params["angle"] = float(
-            settings.value("slate/wm_angle", _DEFAULT_WATERMARK["angle"])
+        self._watermark_params["angle"] = _settings_float(
+            settings, "slate/wm_angle", float(_DEFAULT_WATERMARK["angle"])
         )
-        self._watermark_params["tiled"] = bool(
-            int(settings.value("slate/wm_tiled", int(_DEFAULT_WATERMARK["tiled"])))
+        self._watermark_params["tiled"] = _settings_bool(
+            settings, "slate/wm_tiled", bool(_DEFAULT_WATERMARK["tiled"])
         )
 
     @property
     def settings(self) -> QSettings:
         """Underlying :class:`QSettings` for persistence (slate + cache prefs)."""
         return self._settings
+
+    @property
+    def undo_stack(self) -> QUndoStack:
+        """Undo stack for slate / burn-in / watermark document edits."""
+        return self._undo
 
     # ------------------------------------------------------------------
     # Flags (master switches surfaced as tab-level checkboxes)
@@ -150,25 +222,45 @@ class SlateModel(QObject):
     def watermark_enabled(self) -> bool:
         return self._watermark_enabled
 
-    def set_slate_enabled(self, value: bool) -> None:
-        if bool(value) == self._slate_enabled:
+    def set_slate_enabled(self, value: bool, *, record_undo: bool = False) -> None:
+        after = bool(value)
+        if after == self._slate_enabled:
             return
-        self._slate_enabled = bool(value)
+        if record_undo:
+            self._undo.push(
+                SetSlateFlagCommand(self, "slate", self._slate_enabled, after)
+            )
+            return
+        self._slate_enabled = after
         self._settings.setValue(f"{self._mode}/slate_enabled", self._slate_enabled)
         self.changed.emit("slate_enabled")
 
-    def set_burnin_enabled(self, value: bool) -> None:
-        if bool(value) == self._burnin_enabled:
+    def set_burnin_enabled(self, value: bool, *, record_undo: bool = False) -> None:
+        after = bool(value)
+        if after == self._burnin_enabled:
             return
-        self._burnin_enabled = bool(value)
+        if record_undo:
+            self._undo.push(
+                SetSlateFlagCommand(self, "burnin", self._burnin_enabled, after)
+            )
+            return
+        self._burnin_enabled = after
         self._settings.setValue(f"{self._mode}/burnin_enabled", self._burnin_enabled)
         self.changed.emit("burnin_enabled")
 
-    def set_watermark_enabled(self, value: bool) -> None:
-        if bool(value) == self._watermark_enabled:
+    def set_watermark_enabled(self, value: bool, *, record_undo: bool = False) -> None:
+        after = bool(value)
+        if after == self._watermark_enabled:
             return
-        self._watermark_enabled = bool(value)
+        if record_undo:
+            self._undo.push(
+                SetSlateFlagCommand(self, "watermark", self._watermark_enabled, after)
+            )
+            return
+        self._watermark_enabled = after
         self._settings.setValue(f"{self._mode}/watermark_enabled", self._watermark_enabled)
+        # Keep legacy slate/wm_enabled in sync for older readers.
+        self._settings.setValue("slate/wm_enabled", int(self._watermark_enabled))
         self.changed.emit("watermark_enabled")
 
     # ------------------------------------------------------------------
@@ -192,12 +284,42 @@ class SlateModel(QObject):
     def slate_resolution(self) -> tuple[int, int]:
         return self._slate_resolution
 
+    def capture_slate_snapshot(self) -> dict[str, Any]:
+        """Serializable slate metadata snapshot for undo / presets."""
+        return {
+            "fields": dict(self._slate_data),
+            "version": int(self._slate_version),
+            "fps": float(self._slate_fps),
+            "resolution": (int(self._slate_resolution[0]), int(self._slate_resolution[1])),
+        }
+
+    def apply_slate_snapshot(
+        self, snap: dict[str, Any], *, record_undo: bool = False
+    ) -> None:
+        """Restore a :meth:`capture_slate_snapshot` dict."""
+        fields = dict(snap.get("fields") or {})
+        version = snap.get("version")
+        fps = snap.get("fps")
+        resolution = snap.get("resolution")
+        res_t: tuple[int, int] | None = None
+        if resolution is not None and len(resolution) >= 2:
+            res_t = (int(resolution[0]), int(resolution[1]))
+        self.set_slate_fields(
+            fields,
+            version=int(version) if version is not None else None,
+            fps=float(fps) if fps is not None else None,
+            resolution=res_t,
+            record_undo=record_undo,
+        )
+
     def set_slate_fields(
         self,
         fields: dict[str, str],
         version: int | None = None,
         fps: float | None = None,
         resolution: tuple[int, int] | None = None,
+        *,
+        record_undo: bool = False,
     ) -> None:
         """Bulk update the slate metadata from a flat dict + optional extras."""
         merged = dict(self._slate_data)
@@ -207,19 +329,31 @@ class SlateModel(QObject):
         next_version = int(version) if version is not None else self._slate_version
         next_fps = float(fps) if fps is not None else self._slate_fps
         next_res = tuple(resolution) if resolution is not None else self._slate_resolution
+        next_res_t = (int(next_res[0]), int(next_res[1]))
 
         if (
             merged == self._slate_data
             and next_version == self._slate_version
             and next_fps == self._slate_fps
-            and next_res == self._slate_resolution
+            and next_res_t == self._slate_resolution
         ):
+            return
+
+        if record_undo:
+            before = self.capture_slate_snapshot()
+            after = {
+                "fields": merged,
+                "version": next_version,
+                "fps": next_fps,
+                "resolution": next_res_t,
+            }
+            self._undo.push(SetSlateFieldsCommand(self, before, after))
             return
 
         self._slate_data = merged
         self._slate_version = next_version
         self._slate_fps = next_fps
-        self._slate_resolution = (int(next_res[0]), int(next_res[1]))
+        self._slate_resolution = next_res_t
 
         s = self._settings
         for key in self._slate_data:
@@ -288,25 +422,34 @@ class SlateModel(QObject):
     def burnin_fields(self) -> dict[str, str]:
         return dict(self._burnin_fields)
 
-    def set_burnin_fields(self, fields: dict[str, str]) -> None:
+    def set_burnin_fields(
+        self, fields: dict[str, str], *, record_undo: bool = False
+    ) -> None:
         clean = {k: str(fields.get(k, "") or "") for k in _BURNIN_KEYS}
         if clean == self._burnin_fields:
+            return
+        if record_undo:
+            self._undo.push(
+                SetBurninFieldsCommand(self, dict(self._burnin_fields), clean)
+            )
             return
         self._burnin_fields = clean
         for k, v in clean.items():
             self._settings.setValue(f"slate/burnin_{k}", v)
         self.changed.emit("burnin_fields")
 
-    def reset_burnin_from_slate(self, input_path: str = "") -> None:
+    def reset_burnin_from_slate(
+        self, input_path: str = "", *, record_undo: bool = True
+    ) -> None:
         """Fill burn-in fields from current slate data via the existing helper.
 
         Called from a 'Fill from slate' button in the form.  Replaces the
-        manual values; the user can edit afterwards.
+        manual values; the user can edit afterwards. Undoable by default.
         """
         if not self._slate_data:
             return
         fields = burnin_fields_from_slate(self.slate_data_for_render(), input_path)
-        self.set_burnin_fields(fields)
+        self.set_burnin_fields(fields, record_undo=record_undo)
 
     def effective_burnin_fields(self, input_path: str = "") -> dict[str, str]:
         """Burn-in text for rendering: manual cells first, slate-derived fallback.
@@ -339,16 +482,27 @@ class SlateModel(QObject):
         p["enabled"] = self._watermark_enabled
         return p
 
-    def set_watermark_params(self, params: dict) -> None:
+    def set_watermark_params(
+        self, params: dict, *, record_undo: bool = False
+    ) -> None:
         merged = dict(self._watermark_params)
         for k in _DEFAULT_WATERMARK:
             if k in params:
                 merged[k] = params[k]
         if merged == self._watermark_params:
             return
+        if record_undo:
+            self._undo.push(
+                SetWatermarkParamsCommand(
+                    self, dict(self._watermark_params), merged
+                )
+            )
+            return
         self._watermark_params = merged
         s = self._settings
-        s.setValue("slate/wm_enabled", int(bool(merged["enabled"])))
+        # Master enable is {mode}/watermark_enabled only — do not let params
+        # overwrite it from a stale ``enabled`` field in the dict.
+        s.setValue("slate/wm_enabled", int(self._watermark_enabled))
         s.setValue("slate/wm_text", str(merged["text"]))
         s.setValue("slate/wm_opacity", int(merged["opacity"]))
         s.setValue("slate/wm_size", float(merged["size_pct"]))

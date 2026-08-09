@@ -14,7 +14,8 @@ import PyOpenColorIO as OCIO
 from .exr_io import read_image, write_exr
 from .ocio_utils import (
     get_compositing_space,
-    get_overlay_authoring_space,
+    get_interchange_space,
+    get_internal_overlay_authoring_space,
     linearize_overlay,
     load_config_from_source_info,
     make_cpu_processor,
@@ -183,16 +184,30 @@ def _bake_slate_to_display(
 
     Steps mirror the per-frame worker:
 
-    1. sRGB → working (linearise the QPainter-rendered slate)
+    1. sRGB paint → working via app-anchor linearise (not the user config)
     2. composite the slate-watermark overlay (already in working space)
-    3. working → display
+    3. working → display on the **user** config
 
     Returns float32 RGB in display space, ready for ``rgb48le`` encoding.
     """
-    rgb = np.ascontiguousarray(slate_rgba_srgb[:, :, :3], dtype=np.float32)
+    import numpy as np
+
+    from .ocio_utils import linearize_overlay
+
+    # Keep float precision (no uint8 round-trip). linearize_overlay accepts
+    # float32 RGBA in 0–1 sRGB authoring encoding.
+    slate = np.asarray(slate_rgba_srgb, dtype=np.float32)
+    if slate.shape[-1] == 3:
+        a = np.ones(slate.shape[:2] + (1,), dtype=np.float32)
+        slate = np.concatenate([slate, a], axis=-1)
+    lin = linearize_overlay(
+        ocio_cfg,
+        slate,
+        src_space=overlay_authoring_space,
+        working_space=working_space,
+    )
+    rgb = np.ascontiguousarray(lin[..., :3], dtype=np.float32)
     h, w = rgb.shape[:2]
-    cpu_to_working = make_cpu_processor(ocio_cfg, overlay_authoring_space, working_space)
-    cpu_to_working.apply(OCIO.PackedImageDesc(rgb, w, h, 3))
 
     if slate_overlay_working is not None and slate_overlay_working.shape[:2] == (h, w):
         rgb = _alpha_over_rgb(rgb, slate_overlay_working)
@@ -532,22 +547,27 @@ def run_exr_to_video(
         log(f"Sequence: {basename} ({total} frames, {res_info})")
 
     # Resolve compositing colorspace and pre-linearise overlays --------------
-    # Overlays are baked in a wide-gamut scene-linear space (ACES2065-1 / AP0
-    # when available) so the alpha-over never clips the user's footage.
+    # User frames: ocio_cfg src → working → dst (user config only).
+    # App paint (slate/burn-in/watermark): always linearised on the app-anchor
+    # OCIO config (guaranteed texture_paint + aces_interchange), then bridged
+    # into *working_space* via interchange when the user config supports it.
     working_space = get_compositing_space(ocio_cfg)
-    overlay_auth = get_overlay_authoring_space(ocio_cfg)
+    overlay_auth = get_internal_overlay_authoring_space()
     if log:
-        log(f"Compositing space: {working_space}  (overlay auth: {overlay_auth})")
+        log(f"Compositing space: {working_space}  (overlay auth on app anchor: {overlay_auth})")
+        if not get_interchange_space(ocio_cfg):
+            log(
+                "User OCIO config has no aces_interchange; overlay bridge is "
+                "best-effort (prefer an ACES CG/Studio config for exact joins)."
+            )
 
     burnin_working: np.ndarray | None = None
     if burnin_overlay is not None:
-        burnin_working = linearize_overlay(
-            ocio_cfg, burnin_overlay, src_space=overlay_auth, working_space=working_space
-        )
+        burnin_working = linearize_overlay(ocio_cfg, burnin_overlay, working_space=working_space)
     slate_overlay_working: np.ndarray | None = None
     if slate_overlay is not None:
         slate_overlay_working = linearize_overlay(
-            ocio_cfg, slate_overlay, src_space=overlay_auth, working_space=working_space
+            ocio_cfg, slate_overlay, working_space=working_space
         )
 
     n_workers = workers if workers > 0 else _DEFAULT_WORKERS
@@ -706,7 +726,7 @@ def _e2v_serial(
 ) -> None:
     cpu_to_working = make_cpu_processor(ocio_cfg, src_space, working_space)
     cpu_to_display = make_cpu_processor(ocio_cfg, working_space, dst_space)
-    auth_space = overlay_auth_space or get_overlay_authoring_space(ocio_cfg)
+    auth_space = overlay_auth_space or get_internal_overlay_authoring_space()
     if log:
         log(f"OCIO: {src_space} \u2192 {working_space} \u2192 {dst_space}  (single-threaded)")
 
@@ -729,7 +749,7 @@ def _e2v_serial(
             slate_display = _bake_slate_to_display(
                 slate_frame,
                 ocio_cfg,
-                overlay_auth_space or get_overlay_authoring_space(ocio_cfg),
+                auth_space,
                 working_space,
                 dst_space,
                 slate_overlay_working,

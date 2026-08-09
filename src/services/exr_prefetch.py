@@ -57,9 +57,11 @@ def _read_exr_frame(path: str, transform: FrameTransform | None) -> np.ndarray |
         # Keep unclamped headroom even without OCIO (float16 can hold >1.0).
         return np.ascontiguousarray(rgb, dtype=np.float16)
     try:
-        return transform(rgb)
+        out = transform(rgb)
     except Exception:
-        return np.ascontiguousarray(rgb, dtype=np.float16)
+        return None
+    # None = OCIO failed; never cache source as float "working-space".
+    return out
 
 
 class ExrPrefetchService(QObject):

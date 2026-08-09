@@ -1,16 +1,27 @@
 """Video frame prefetch for the sequence player (PyAV decode → FrameCache).
 
 Single-threaded decoder: PyAV containers are not safe for parallel consumers.
-When playing forward, frames are decoded sequentially without re-seeking.
-Scrubs / jumps seek by timestamp then decode to the target index.
+
+Playback / scrub strategy (FFmpeg / PyAV best practice)
+-------------------------------------------------------
+- ``container.seek(pts, stream=…, backward=True, any_frame=False)`` lands on the
+  previous **keyframe**, not the exact target. Callers must **decode forward**
+  until presentation time / frame index matches.
+- Keep a long-lived ``decode()`` iterator so multi-frame packets / B-frame
+  reorder buffers are not discarded mid-GOP.
+- Forward play stays sequential (no re-seek) when the next requested index is
+  near the decoder tip.
+- Scrub lookback is kept small: every reverse jump costs a keyframe seek +
+  decode-forward.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
@@ -25,15 +36,21 @@ FrameTransform = Callable[[np.ndarray], "np.ndarray | None"]
 
 _HARD_LOOKAHEAD_FRAMES = 120
 _MIN_LOOKAHEAD_FRAMES = 8
-# Re-seek when the requested index is more than this far behind the decoder tip.
-_SEEK_BACK_THRESHOLD = 2
+# Decode this many frames forward instead of seeking (cheap sequential path).
+_FORWARD_DECODE_LIMIT = 48
+# Scrubbing: avoid reverse seeks that thrash the GOP decoder.
+_SCRUB_LOOKBACK_FRAMES = 2
+# Safety cap when walking from a keyframe toward a target (long GOPs).
+_MAX_DECODE_STEPS = 600
 
 
 class _VideoDecoder:
-    """Stateful sequential PyAV decoder with best-effort seek."""
+    """Stateful sequential PyAV decoder with keyframe-seek + decode-forward."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, fps: float = 0.0) -> None:
         import av
+
+        from ..core.video import stream_fps
 
         self.path = path
         self._av = av
@@ -42,19 +59,29 @@ class _VideoDecoder:
             self.container.close()
             raise RuntimeError(f"No video stream in {path}")
         self.stream = self.container.streams.video[0]
+        # Slice / frame threading helps H.264/HEVC scrub latency.
         try:
-            self.fps = float(self.stream.average_rate) if self.stream.average_rate else 24.0
+            self.stream.thread_type = "AUTO"
         except Exception:
-            self.fps = 24.0
-        if self.fps <= 0:
-            self.fps = 24.0
-        # Next 1-based frame index the sequential decoder will produce.
-        self._next_idx = 1
+            pass
+
+        # Prefer the same rate the player used for the 1…N timeline (probe).
+        probed = float(fps) if fps and fps > 0 else 0.0
+        self.fps = probed if probed > 0 else (stream_fps(self.stream) or 24.0)
+        self._time_base = self.stream.time_base
+        self._start_pts = int(self.stream.start_time or 0)
+
+        # Persistent decoder iterator (invalidated on seek / reopen).
+        self._frame_iter: Iterator | None = None
+        # Next 1-based index that sequential ``_next_decoded`` will assign when
+        # counting (set after first post-seek frame via PTS).
+        self._next_idx: int | None = None
         self._last_rgb: np.ndarray | None = None
         self._last_idx: int | None = None
-        self._post_seek = False
+        self._eof = False
 
     def close(self) -> None:
+        self._frame_iter = None
         try:
             self.container.close()
         except Exception:
@@ -69,52 +96,155 @@ class _VideoDecoder:
             arr = frame.to_ndarray(format="rgb24")
             return np.ascontiguousarray(arr.astype(np.float32) * (1.0 / 255.0))
 
-    def _seek_to_index(self, idx_1based: int) -> None:
-        """Best-effort seek so the next decoded frame is near *idx_1based*."""
-        target = max(1, int(idx_1based))
-        # Seek slightly early so we can decode forward to the exact frame.
-        seek_idx = max(0, target - 1)
+    def _pts_to_index(self, pts: int | None) -> int:
+        """Map a presentation timestamp to a 1-based timeline index."""
+        if pts is None or self._time_base is None:
+            return 1
         try:
-            # Prefer stream time_base pts when available.
-            tb = self.stream.time_base
-            rate = self.stream.average_rate
-            if tb is not None and rate is not None and float(rate) > 0:
-                sec = seek_idx / float(rate)
-                pts = int(sec / float(tb))
-                self.container.seek(pts, stream=self.stream, any_frame=False, backward=True)
-            else:
-                # Fallback: global timestamp in AV_TIME_BASE units.
-                import av
+            rel = float((int(pts) - self._start_pts) * self._time_base)
+        except Exception:
+            return 1
+        if rel < 0:
+            rel = 0.0
+        # floor(t * fps + ε) + 1 — stable at frame boundaries.
+        return max(1, int(math.floor(rel * self.fps + 1e-6)) + 1)
 
+    def _index_to_pts(self, idx_1based: int) -> int:
+        """Stream PTS for the start of *idx_1based* (1-based)."""
+        idx = max(1, int(idx_1based))
+        if self._time_base is None:
+            # AV_TIME_BASE units when no stream time_base (rare).
+            import av
+
+            return int((idx - 1) / self.fps * av.time_base)
+        sec = (idx - 1) / self.fps
+        return self._start_pts + int(round(sec / float(self._time_base)))
+
+    def _frame_index(self, frame) -> int:
+        pts = getattr(frame, "pts", None)
+        if pts is not None:
+            return self._pts_to_index(int(pts))
+        # Some decoders only expose ``time`` (seconds).
+        t = getattr(frame, "time", None)
+        if t is not None:
+            try:
+                rel = float(t)
+                if self._time_base is not None and self._start_pts:
+                    rel = max(0.0, rel - float(self._start_pts * self._time_base))
+                return max(1, int(math.floor(rel * self.fps + 1e-6)) + 1)
+            except Exception:
+                pass
+        return self._next_idx or 1
+
+    def _reopen(self) -> None:
+        try:
+            self.container.close()
+        except Exception:
+            pass
+        self.container = self._av.open(self.path)
+        self.stream = self.container.streams.video[0]
+        try:
+            self.stream.thread_type = "AUTO"
+        except Exception:
+            pass
+        self._time_base = self.stream.time_base
+        self._start_pts = int(self.stream.start_time or 0)
+        # Keep the timeline clock from construction (probe); only re-read if
+        # we never had a rate.
+        if self.fps <= 0:
+            from ..core.video import stream_fps
+
+            self.fps = stream_fps(self.stream) or 24.0
+        self._frame_iter = None
+        self._next_idx = None
+        self._last_rgb = None
+        self._last_idx = None
+        self._eof = False
+
+    def _seek_to_index(self, idx_1based: int) -> None:
+        """Keyframe-seek just before *idx_1based*; next decode establishes index."""
+        target = max(1, int(idx_1based))
+        try:
+            if target <= 1:
+                # Start of stream — prefer stream timeline origin.
+                if self._time_base is not None:
+                    self.container.seek(
+                        self._start_pts,
+                        stream=self.stream,
+                        any_frame=False,
+                        backward=True,
+                    )
+                else:
+                    self.container.seek(0, any_frame=False, backward=True)
+            else:
+                pts = self._index_to_pts(target)
                 self.container.seek(
-                    int(seek_idx / self.fps * av.time_base),
+                    pts,
+                    stream=self.stream,
                     any_frame=False,
                     backward=True,
                 )
         except Exception:
             log.debug("Video seek failed for frame %s; reopening", target, exc_info=True)
+            self._reopen()
             try:
-                self.container.close()
+                if target > 1 and self._time_base is not None:
+                    self.container.seek(
+                        self._index_to_pts(target),
+                        stream=self.stream,
+                        any_frame=False,
+                        backward=True,
+                    )
             except Exception:
-                pass
-            self.container = self._av.open(self.path)
-            self.stream = self.container.streams.video[0]
-        self._next_idx = 1
+                log.debug("Retry seek failed for frame %s", target, exc_info=True)
+
+        try:
+            flush = getattr(self.stream.codec_context, "flush_buffers", None)
+            if callable(flush):
+                flush()
+        except Exception:
+            pass
+
+        # Invalidate iterator so the next demux starts at the new position.
+        self._frame_iter = None
+        self._next_idx = None
         self._last_rgb = None
         self._last_idx = None
-        # After seek, we don't know the exact index until we count from start
-        # or use packet pts. For MVP: if we seeked to near start of file for
-        # frame 1, sequential count works; for mid-seek, approximate by
-        # decoding one frame and assigning target.
-        if target <= 1:
-            self._next_idx = 1
+        self._eof = False
+
+    def _ensure_iter(self) -> Iterator:
+        if self._frame_iter is None:
+            self._frame_iter = self.container.decode(self.stream)
+        return self._frame_iter
+
+    def _next_decoded(self) -> tuple[int, np.ndarray] | None:
+        """Pull one frame; return ``(1-based index, rgb float32)`` or None at EOF."""
+        if self._eof:
+            return None
+        it = self._ensure_iter()
+        try:
+            frame = next(it)
+        except StopIteration:
+            self._eof = True
+            self._frame_iter = None
+            return None
+        except Exception:
+            log.debug("Video decode error", exc_info=True)
+            self._eof = True
+            self._frame_iter = None
+            return None
+
+        if self._next_idx is None:
+            cur = self._frame_index(frame)
+            self._next_idx = cur + 1
         else:
-            # Mark that the next decoded frame should be treated as *target*
-            # after draining the first post-seek frame (often a keyframe early).
-            self._next_idx = target
-            self._post_seek = True
-            return
-        self._post_seek = False
+            cur = self._next_idx
+            self._next_idx = cur + 1
+
+        rgb = self._frame_to_rgb_f32(frame)
+        self._last_idx = cur
+        self._last_rgb = rgb
+        return cur, rgb
 
     def get_frame(self, idx_1based: int) -> np.ndarray | None:
         """Return float32 RGB for 1-based frame index, or None on failure."""
@@ -122,53 +252,42 @@ class _VideoDecoder:
         if self._last_idx == idx and self._last_rgb is not None:
             return self._last_rgb
 
-        # Sequential hit: keep decoding forward.
         need_seek = False
-        if self._last_idx is None:
+        if self._eof:
+            need_seek = True
+        elif self._last_idx is None:
+            # Cold start: sequential from 1 is cheaper than seek for early frames.
             need_seek = idx > 1
-        elif idx < self._last_idx - 0:  # going backward
+        elif idx < self._last_idx:
             need_seek = True
-        elif idx > self._last_idx + 30:
-            # Big forward jump — seek rather than decode 30+ frames.
-            need_seek = True
-        elif idx < self._next_idx - _SEEK_BACK_THRESHOLD:
+        elif idx > self._last_idx + _FORWARD_DECODE_LIMIT:
             need_seek = True
 
         if need_seek:
             self._seek_to_index(idx)
+        elif idx == self._last_idx and self._last_rgb is not None:
+            return self._last_rgb
 
-        # Decode until we reach the requested index.
-        guard = 0
-        max_guard = max(64, idx - (self._last_idx or 0) + 8)
-        while guard < max_guard:
-            guard += 1
-            try:
-                for frame in self.container.decode(self.stream):
-                    rgb = self._frame_to_rgb_f32(frame)
-                    if getattr(self, "_post_seek", False):
-                        # First frame after mid-file seek ≈ requested index.
-                        self._post_seek = False
-                        self._last_idx = idx
-                        self._next_idx = idx + 1
-                        self._last_rgb = rgb
-                        if self._last_idx == idx:
-                            return rgb
-                        continue
-                    cur = self._next_idx
-                    self._next_idx = cur + 1
-                    self._last_idx = cur
-                    self._last_rgb = rgb
-                    if cur == idx:
-                        return rgb
-                    if cur > idx:
-                        # Overshot (shouldn't for sequential); return what we have.
-                        return rgb
-                # EOF
+        # After keyframe seek, walk forward until we hit (or pass) the target.
+        # Never label the first post-seek keyframe as *idx* unless PTS agrees.
+        steps = 0
+        while steps < _MAX_DECODE_STEPS:
+            steps += 1
+            got = self._next_decoded()
+            if got is None:
                 break
-            except Exception:
-                log.debug("Video decode error at frame %s", idx, exc_info=True)
-                break
-        return self._last_rgb if self._last_idx == idx else None
+            cur, rgb = got
+            if cur == idx:
+                return rgb
+            if cur > idx:
+                # Overshot (coarse PTS mapping / VFR). Return nearest decoded.
+                return rgb
+            # cur < idx: keep decoding toward target
+            continue
+
+        if self._last_idx == idx:
+            return self._last_rgb
+        return None
 
 
 def _decode_one(
@@ -177,6 +296,7 @@ def _decode_one(
     transform: FrameTransform | None,
     decoder_holder: dict,
     lock: threading.Lock,
+    fps: float = 0.0,
 ) -> np.ndarray | None:
     """Worker entry: decode one frame via a shared locked decoder."""
     with lock:
@@ -185,7 +305,7 @@ def _decode_one(
             if dec is not None:
                 dec.close()
             try:
-                dec = _VideoDecoder(path)
+                dec = _VideoDecoder(path, fps=fps)
             except Exception:
                 log.exception("Failed to open video for prefetch: %s", path)
                 decoder_holder["dec"] = None
@@ -199,11 +319,16 @@ def _decode_one(
     if rgb is None:
         return None
     if transform is None:
+        # No OCIO: cache source-referred float (viewer treats float as working
+        # only when a transform was configured — keep passthrough for no-OCIO).
         return np.ascontiguousarray(rgb, dtype=np.float16)
     try:
-        return transform(rgb)
+        out = transform(rgb)
     except Exception:
-        return np.ascontiguousarray(rgb, dtype=np.float16)
+        log.debug("frame_transform raised frame=%s", frame, exc_info=True)
+        return None
+    # None = transform failed deliberately (do not poison cache as working).
+    return out
 
 
 class VideoPrefetchService(QObject):
@@ -218,6 +343,7 @@ class VideoPrefetchService(QObject):
         cache: FrameCache,
         shot_frames: list[int],
         *,
+        fps: float = 0.0,
         lookback_ratio: float = DEFAULT_LOOKBACK_RATIO,
         frame_transform: FrameTransform | None = None,
         parent: QObject | None = None,
@@ -228,6 +354,10 @@ class VideoPrefetchService(QObject):
         self._shot_frames = sorted(shot_frames)
         self._frame_index = {f: i for i, f in enumerate(self._shot_frames)}
         self._frame_set = set(self._shot_frames)
+        # Same rate as SequencePlayer timeline / probe_video (seek clock).
+        self._fps = float(fps) if fps and fps > 0 else 0.0
+        # lookback_ratio kept for API parity with EXR; scrub uses a fixed small
+        # reverse window (seek cost) instead of a large lookback ratio.
         self._lookback_ratio = max(0.0, min(1.0, lookback_ratio))
         self._frame_transform = frame_transform
 
@@ -235,6 +365,8 @@ class VideoPrefetchService(QObject):
         self._playing = False
         self._paused = False
         self._generation = 0
+        # Latest scrub / play target — drop stale queue work when this moves.
+        self._wanted: int | None = None
 
         self._queue: deque[int] = deque()
         self._queued: set[int] = set()
@@ -273,17 +405,24 @@ class VideoPrefetchService(QObject):
     def set_context(self, current_frame: int, *, playing: bool = False) -> None:
         self._current = current_frame
         self._playing = playing
+        self._wanted = current_frame
         self._rebuild_queue()
         self._schedule_kick()
 
     def request_immediate(self, frame: int) -> bool:
         if frame not in self._frame_set:
             return False
+        self._wanted = frame
         if self._cache.contains(frame):
             return True
         if frame in self._inflight:
             return True
-        if frame in self._queue:
+        # Scrub coalesce: drop other pending work so the worker serves the
+        # playhead next (in-flight decode still finishes — cannot cancel mid-GOP).
+        if not self._playing:
+            self._queue.clear()
+            self._queued.clear()
+        elif frame in self._queue:
             self._queue.remove(frame)
             self._queued.discard(frame)
         self._queue.appendleft(frame)
@@ -305,7 +444,9 @@ class VideoPrefetchService(QObject):
         capacity = min(self._cache_capacity(), _HARD_LOOKAHEAD_FRAMES + 32)
         if self._playing:
             return 0, min(capacity, _HARD_LOOKAHEAD_FRAMES)
-        lookback = min(int(capacity * self._lookback_ratio), max(0, capacity - 1))
+        # Scrub: tiny lookback (reverse seeks are expensive), prioritise ahead
+        # so the decoder can stay sequential after landing on the playhead.
+        lookback = min(_SCRUB_LOOKBACK_FRAMES, max(0, capacity - 1))
         lookahead = max(1, capacity - lookback)
         return lookback, min(lookahead, _HARD_LOOKAHEAD_FRAMES)
 
@@ -314,7 +455,16 @@ class VideoPrefetchService(QObject):
         if idx is None:
             return None
         n = len(self._shot_frames)
-        return self._shot_frames[(idx + offset) % n]
+        if n == 0:
+            return None
+        j = idx + offset
+        if self._playing:
+            # Looping transport: warm the wrap target while playing.
+            return self._shot_frames[j % n]
+        # Scrub: no wrap — reverse/forward seeks across the loop point thrash.
+        if j < 0 or j >= n:
+            return None
+        return self._shot_frames[j]
 
     def _rebuild_queue(self) -> None:
         if self._paused:
@@ -365,6 +515,14 @@ class VideoPrefetchService(QObject):
             self._queued.discard(frame)
             if self._cache.contains(frame) or frame in self._inflight:
                 continue
+            # While scrubbing, skip stale queue entries far from the playhead
+            # so a fast drag does not backfill abandoned positions first.
+            if (
+                not self._playing
+                and self._wanted is not None
+                and abs(frame - self._wanted) > _FORWARD_DECODE_LIMIT
+            ):
+                continue
             fut = self._pool.submit(
                 _decode_one,
                 self._path,
@@ -372,6 +530,7 @@ class VideoPrefetchService(QObject):
                 self._frame_transform,
                 self._decoder_holder,
                 self._decoder_lock,
+                self._fps,
             )
             self._inflight[frame] = fut
             fut.add_done_callback(lambda f, fr=frame, g=gen: self._on_done(fr, f, g))

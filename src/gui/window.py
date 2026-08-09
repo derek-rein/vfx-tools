@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import PyOpenColorIO as OCIO_mod
-from PySide6.QtCore import QSettings, Qt, QThread, QUrl
+from PySide6.QtCore import Qt, QThread, QUrl
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -37,8 +37,6 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.constants import (
-    APP_NAME,
-    APP_ORG,
     APP_VERSION,
     GITHUB_REPO,
     IMAGE_SEQUENCE_EXTS,
@@ -47,7 +45,13 @@ from ..core.constants import (
 from ..core.ocio_utils import color_space_families, config_source_info
 from ..services.presets import delete_preset, list_presets, load_preset, save_preset
 from ..services.worker import ConvertWorker
-from .preferences import PreferencesDialog, open_video_with_player, reveal_in_file_manager
+from .preferences import (
+    PLAYER_MODE_BUILTIN,
+    PreferencesDialog,
+    open_video_with_player,
+    player_mode,
+    reveal_in_file_manager,
+)
 from .size_grip import SizeGrip
 from .widgets import ConvertTab, OcioConfigPanel
 
@@ -121,7 +125,11 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(":/icon.png"))
         self.setMinimumSize(700, 640)
         self.setAcceptDrops(True)
-        self._settings = QSettings(APP_ORG, APP_NAME)
+        from ..services.app_settings import get_app_settings
+
+        # Process-wide settings façade (single QSettings backend).
+        self._app_settings = get_app_settings()
+        self._settings = self._app_settings.qsettings
         self._thread: QThread | None = None
         self._worker: ConvertWorker | None = None
         self._ocio_cfg = None
@@ -194,8 +202,8 @@ class MainWindow(QMainWindow):
         after_row.addWidget(self._copy_path_cb)
         self._open_after_cb = QCheckBox("Open result")
         self._open_after_cb.setToolTip(
-            "EXR → Video: open the finished file in your preferred player "
-            "(File → Preferences).\n"
+            "EXR → Video: open the finished file with the preferred player "
+            "(File → Preferences; default is the built-in player).\n"
             "Video → EXR: open the sequence in the built-in player window "
             "(with playback cache)."
         )
@@ -252,12 +260,10 @@ class MainWindow(QMainWindow):
         self._clear_log.clicked.connect(self._log.clear)
         self._tabs.currentChanged.connect(lambda i: self._settings.setValue("ui/tab", i))
         self._tabs.currentChanged.connect(lambda _: self._update_go_state())
-        self._tabs.currentChanged.connect(lambda _: self._update_slate_menu_enabled())
         self._v2e_tab.log_message.connect(self._append_log)
         self._e2v_tab.log_message.connect(self._append_log)
         self._v2e_tab.readiness_changed.connect(lambda _: self._update_go_state())
         self._e2v_tab.readiness_changed.connect(lambda _: self._update_go_state())
-        self._update_slate_menu_enabled()
         self._go.setEnabled(self._active_tab().is_ready())
 
         self._reload_ocio()
@@ -332,11 +338,6 @@ class MainWindow(QMainWindow):
         self._presets_menu = mb.addMenu("&Presets")
         self._presets_menu.aboutToShow.connect(self._populate_presets_menu)
 
-        self._slate_menu = mb.addMenu("&Slate")
-        self._edit_slate_action = QAction("Edit Slate && Overlays\u2026", self)
-        self._edit_slate_action.triggered.connect(self._open_slate_dialog)
-        self._slate_menu.addAction(self._edit_slate_action)
-
         help_menu = mb.addMenu("&Help")
 
         update_action = QAction("Check for &Updates\u2026", self)
@@ -370,28 +371,6 @@ class MainWindow(QMainWindow):
         """Open the latest GitHub release page in the system browser."""
         url = QUrl(f"https://github.com/{GITHUB_REPO}/releases/latest")
         QDesktopServices.openUrl(url)
-
-    # -- Slate menu --
-
-    def _update_slate_menu_enabled(self) -> None:
-        """Slate / burn-in / watermark are EXR → Video only (never Video → EXR)."""
-        e2v = self._tabs.currentIndex() == 1
-        self._slate_menu.setEnabled(e2v)
-        self._edit_slate_action.setEnabled(e2v)
-        if e2v:
-            self._edit_slate_action.setToolTip("Edit slate, burn-in, and watermark overlays")
-        else:
-            self._edit_slate_action.setToolTip(
-                "Slate / burn-in / watermark apply only on EXR → Video (not ingest)."
-            )
-
-    def _open_slate_dialog(self) -> None:
-        if self._tabs.currentIndex() != 1:
-            self._append_log(
-                "Slate / burn-in / watermark are EXR → Video only — not used on Video → EXR."
-            )
-            return
-        self._active_tab()._open_slate_dialog()
 
     # -- Presets --
 
@@ -770,11 +749,16 @@ class MainWindow(QMainWindow):
         if self._open_after_cb.isChecked():
             if mode == "exr2video" and target and Path(target).is_file():
                 try:
-                    msg = open_video_with_player(target, self._settings)
+                    if player_mode(self._settings) == PLAYER_MODE_BUILTIN:
+                        msg = self._open_video_result(target)
+                    else:
+                        msg = open_video_with_player(target, self._settings)
                     notes.append(msg)
                     self._append_log(f"{msg.capitalize()}: {target}")
                 except OSError as e:
                     self._append_log(f"Could not open player: {e}")
+                except Exception as e:
+                    self._append_log(f"Could not open video player: {e}")
             elif mode == "video2exr" and target:
                 try:
                     msg = self._open_sequence_result(target)
@@ -847,8 +831,6 @@ class MainWindow(QMainWindow):
         Do **not** trust ``oiio:ColorSpace`` alone (OIIO often tags any
         scene-linear EXR as ``lin_rec709``).
         """
-        from .player.player_window import SequencePlayerWindow
-
         open_path = self._resolve_v2e_open_path(path)
         # Known write colorspace from convert start (authoritative).
         src_cs = str(getattr(self, "_output_dst_space", "") or "")
@@ -865,33 +847,77 @@ class MainWindow(QMainWindow):
                 src_cs = probe_pixel_colorspace(open_path)
             except Exception:
                 src_cs = ""
+        src_cs = self._resolve_player_src_colorspace(src_cs)
+        self._log_player_ocio("Sequence player", src_cs)
+        fps = float(getattr(self, "_output_fps", 0) or 0) or 24.0
+        return self._show_result_player(
+            open_path,
+            src_colorspace=src_cs,
+            fps=fps,
+            media_kind="sequence",
+            status_label="sequence player",
+        )
+
+    def _open_video_result(self, path: str) -> str:
+        """Open a converted video in the built-in player (Preferences: built-in).
+
+        Encode destination space is used as OCIO source (same as convert write).
+        """
+        src_cs = str(getattr(self, "_output_dst_space", "") or "")
+        if not src_cs:
+            try:
+                src_cs = str(self._e2v_tab.dst_btn.current_space() or "")
+            except Exception:
+                src_cs = ""
+        src_cs = self._resolve_player_src_colorspace(src_cs)
+        self._log_player_ocio("Video player", src_cs)
+        fps = float(getattr(self, "_output_fps", 0) or 0) or 0.0
+        return self._show_result_player(
+            path,
+            src_colorspace=src_cs,
+            fps=fps,
+            media_kind="video",
+            status_label="built-in player",
+        )
+
+    def _resolve_player_src_colorspace(self, src_cs: str) -> str:
         if src_cs and self._ocio_cfg is not None:
             try:
                 from ..core.ocio_utils import find_equivalent_space
 
                 resolved = find_equivalent_space(self._ocio_cfg, src_cs)
                 if resolved:
-                    src_cs = resolved
+                    return resolved
             except Exception:
                 pass
+        return src_cs
+
+    def _log_player_ocio(self, label: str, src_cs: str) -> None:
         if self._ocio_cfg is None:
             self._append_log(
-                "Sequence player: no OCIO config — frames will show without a display transform."
+                f"{label}: no OCIO config — frames will show without a display transform."
             )
-        else:
-            try:
-                from ..core.ocio_utils import get_compositing_space
+            return
+        try:
+            from ..core.ocio_utils import get_compositing_space
 
-                working = get_compositing_space(self._ocio_cfg)
-                self._append_log(
-                    f"Sequence player OCIO: {src_cs or '?'} → {working} → display/view"
-                )
-            except Exception:
-                self._append_log(f"Sequence player OCIO source: {src_cs or '?'}")
+            working = get_compositing_space(self._ocio_cfg)
+            self._append_log(f"{label} OCIO: {src_cs or '?'} → {working} → display/view")
+        except Exception:
+            self._append_log(f"{label} OCIO source: {src_cs or '?'}")
 
-        fps = float(getattr(self, "_output_fps", 0) or 0) or 24.0
+    def _show_result_player(
+        self,
+        open_path: str,
+        *,
+        src_colorspace: str,
+        fps: float,
+        media_kind: str,
+        status_label: str,
+    ) -> str:
+        """Show or reuse the standalone :class:`SequencePlayerWindow`."""
+        from .player.player_window import SequencePlayerWindow
 
-        # Reuse a live window so repeated converts don't stack players.
         win = self._result_player_win
         if win is not None:
             try:
@@ -899,13 +925,14 @@ class MainWindow(QMainWindow):
                 win.reload(
                     open_path,
                     ocio_cfg=self._ocio_cfg,
-                    src_colorspace=src_cs,
+                    src_colorspace=src_colorspace,
                     fps=fps,
+                    media_kind=media_kind,
                 )
                 win.show()
                 win.raise_()
                 win.activateWindow()
-                return f"opened in sequence player ({src_cs or 'no OCIO src'})"
+                return f"opened in {status_label} ({src_colorspace or 'no OCIO src'})"
             except RuntimeError:
                 self._result_player_win = None
 
@@ -913,16 +940,17 @@ class MainWindow(QMainWindow):
             open_path,
             settings=self._settings,
             ocio_cfg=self._ocio_cfg,
-            src_colorspace=src_cs,
+            src_colorspace=src_colorspace,
             fps=fps,
             parent=self,
+            media_kind=media_kind,
         )
         win.destroyed.connect(self._on_result_player_destroyed)
         self._result_player_win = win
         win.show()
         win.raise_()
         win.activateWindow()
-        return f"opened in sequence player ({src_cs or 'no OCIO src'})"
+        return f"opened in {status_label} ({src_colorspace or 'no OCIO src'})"
 
     def _on_result_player_destroyed(self, *_args: object) -> None:
         self._result_player_win = None
@@ -1098,8 +1126,15 @@ class MainWindow(QMainWindow):
     # -- State snapshot/restore (for presets) --
 
     def snapshot_state(self) -> dict:
-        """Capture parameters only — no input/output paths."""
+        """Capture convert **document** params only — no I/O paths or geometry.
+
+        Written as a versioned preset via :func:`~src.services.presets.save_preset`.
+        """
+        from ..services.presets import SCHEMA_VERSION
+
         return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "convert_preset",
             "tab": self._tabs.currentIndex(),
             "ocio_source": self._ocio_panel.current_source_key(),
             "ocio_file": self._ocio_panel._file_path,
@@ -1117,7 +1152,13 @@ class MainWindow(QMainWindow):
         }
 
     def restore_state(self, data: dict) -> None:
-        """Restore parameters only — input/output paths are left untouched."""
+        """Restore convert params only — input/output paths are left untouched."""
+        from ..services.presets import normalize_preset
+
+        try:
+            data = normalize_preset(dict(data or {}))
+        except ValueError:
+            data = dict(data or {})
         if "tab" in data:
             self._tabs.setCurrentIndex(data["tab"])
         if "ocio_source" in data:

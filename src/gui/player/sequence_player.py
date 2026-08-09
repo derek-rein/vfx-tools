@@ -135,6 +135,8 @@ class SequencePlayer(QWidget):
         self._gain = 1.0
         self._gamma = 1.0
         self._display_view_pairs: list[tuple[str, str]] = []
+        # Prefer colorimetric / un-tone-mapped view for video-originated media.
+        self._prefer_video_monitoring = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -226,22 +228,17 @@ class SequencePlayer(QWidget):
     # Public API
     # ------------------------------------------------------------------
 
-    def load_sequence(
+    def _begin_media_load(
         self,
-        input_path: str,
         *,
-        fps: float = 24.0,
-        ocio_cfg: object | None = None,
-        src_colorspace: str = "",
+        ocio_cfg: object | None,
+        src_colorspace: str,
+        fps: float = 0.0,
         resolution: tuple[int, int] | None = None,
-    ) -> bool:
-        """Resolve *input_path* as an EXR sequence and start prefetch.
-
-        Returns ``True`` when at least one frame was found.
-        """
+    ) -> None:
+        """Shared teardown + OCIO/budget reset before load_sequence / load_video."""
         self.shutdown_prefetch_only()
         self._shot_cache.clear()
-        # Refresh budget from Preferences each load (no in-player slider).
         self._shot_cache.budget_bytes = cache_budget_bytes(self._settings)
         self._ocio_cfg = ocio_cfg
         self._src_colorspace = src_colorspace or ""
@@ -251,18 +248,64 @@ class SequencePlayer(QWidget):
         self._viewer_display_proc = None
         self._ec_exposure_prop = None
         self._ec_gamma_prop = None
-
-        if fps > 0:
-            self.set_fps(fps)
-        if resolution is not None and resolution[0] > 0 and resolution[1] > 0:
-            self.set_resolution(resolution[0], resolution[1])
-
         self._exr_seq = None
         self._video_path = None
         self._shot_frames = []
         self._shot_frames_set = set()
         self._first_shot = None
         self._last_shot = None
+        self._playback_wait_frame = None
+        if fps > 0:
+            self.set_fps(fps)
+        if resolution is not None and resolution[0] > 0 and resolution[1] > 0:
+            self.set_resolution(resolution[0], resolution[1])
+
+    def _finish_media_load(self) -> bool:
+        """Wire timeline + display after frames / colorspace are known.
+
+        Returns ``False`` if frame range was never established (fail closed).
+        """
+        if self._first_shot is None or self._last_shot is None:
+            log.error("Media load finished without a frame range")
+            self._repopulate_display_views()
+            self._sync_gpu_view_settings()
+            return False
+        self._timeline.set_range(self._first_shot, self._last_shot)
+        self._timeline.set_marker_frames({})
+        self._current_frame = self._first_shot
+        self._timeline.set_value(self._current_frame)
+        self._repopulate_display_views()
+        self._sync_gpu_view_settings()
+        self._sync_prefetch()
+        self.refresh()
+        return True
+
+    def load_sequence(
+        self,
+        input_path: str,
+        *,
+        fps: float = 24.0,
+        ocio_cfg: object | None = None,
+        src_colorspace: str = "",
+        resolution: tuple[int, int] | None = None,
+        prefer_video_monitoring: bool = False,
+    ) -> bool:
+        """Resolve *input_path* as an EXR sequence and start prefetch.
+
+        Returns ``True`` when at least one frame was found.
+
+        *prefer_video_monitoring*: if the config exposes a video-oriented view
+        via viewing rules / encodings (``getDefaultView(display, videoCS)``),
+        select it; otherwise keep the config default. Leave false for
+        camera/scene-linear EXR.
+        """
+        self._prefer_video_monitoring = bool(prefer_video_monitoring)
+        self._begin_media_load(
+            ocio_cfg=ocio_cfg,
+            src_colorspace=src_colorspace,
+            fps=fps,
+            resolution=resolution,
+        )
 
         if not input_path:
             self._repopulate_display_views()
@@ -270,7 +313,7 @@ class SequencePlayer(QWidget):
             return False
 
         try:
-            from ...core.sequence import find_exr_sequence_info, probe_pixel_colorspace
+            from ...core.sequence import find_exr_sequence_info, resolve_sequence_src_colorspace
 
             paths, _name, frames, _pad, seq = find_exr_sequence_info(input_path)
             if not frames:
@@ -283,21 +326,11 @@ class SequencePlayer(QWidget):
             self._last_shot = self._shot_frames[-1]
             self._exr_seq = seq
 
-            # Resolve pixel space: caller (post-convert) wins; else file metadata.
-            # Prefer exrconverter:dstColorSpace — oiio:ColorSpace is often mangled.
-            if not self._src_colorspace and paths:
-                probed = probe_pixel_colorspace(paths[0])
-                if probed:
-                    self._src_colorspace = probed
-            if self._src_colorspace and self._ocio_cfg is not None:
-                try:
-                    from ...core.ocio_utils import find_equivalent_space
-
-                    resolved = find_equivalent_space(self._ocio_cfg, self._src_colorspace)
-                    if resolved:
-                        self._src_colorspace = resolved
-                except Exception:
-                    pass
+            # Caller (post-convert dst / tab) preferred; else file attrs.
+            probe_path = paths[0] if paths else input_path
+            self._src_colorspace = resolve_sequence_src_colorspace(
+                probe_path, self._ocio_cfg, preferred=self._src_colorspace
+            )
             log.info(
                 "SequencePlayer load: src=%r working=%r frames=%s–%s",
                 self._src_colorspace,
@@ -311,11 +344,8 @@ class SequencePlayer(QWidget):
             self._sync_gpu_view_settings()
             return False
 
-        self._timeline.set_range(self._first_shot, self._last_shot)
-        self._timeline.set_marker_frames({})
-        self._current_frame = self._first_shot
-        self._timeline.set_value(self._current_frame)
-
+        # Same OCIO path as the slate editor: worker applies src→working into
+        # the RAM cache; the GPU/CPU viewer only does working→display.
         self._prefetch = ExrPrefetchService(
             self._exr_seq,
             self._shot_cache,
@@ -325,12 +355,7 @@ class SequencePlayer(QWidget):
             parent=self,
         )
         self._prefetch.frame_loaded.connect(self._on_prefetch_frame_loaded)
-
-        self._repopulate_display_views()
-        self._sync_gpu_view_settings()
-        self._sync_prefetch()
-        self.refresh()
-        return True
+        return self._finish_media_load()
 
     def load_video(
         self,
@@ -344,24 +369,15 @@ class SequencePlayer(QWidget):
         """Open a video file for cache-first playback (same viewer as sequences).
 
         Frame indices are 1-based over an estimated frame count from the probe.
+        Colour: decode → worker ``src→working`` → display/view (slate contract).
+        Tries the config's video-monitoring view (viewing rules) when present.
         """
-        self.shutdown_prefetch_only()
-        self._shot_cache.clear()
-        self._shot_cache.budget_bytes = cache_budget_bytes(self._settings)
-        self._ocio_cfg = ocio_cfg
-        self._src_colorspace = src_colorspace or ""
-        self._ocio_proc_cache.clear()
-        self._working_space = ""
-        self._last_viewer_display = None
-        self._viewer_display_proc = None
-        self._ec_exposure_prop = None
-        self._ec_gamma_prop = None
-        self._exr_seq = None
-        self._video_path = None
-        self._shot_frames = []
-        self._shot_frames_set = set()
-        self._first_shot = None
-        self._last_shot = None
+        self._prefer_video_monitoring = True
+        self._begin_media_load(
+            ocio_cfg=ocio_cfg,
+            src_colorspace=src_colorspace,
+            resolution=resolution,
+        )
 
         if not path:
             self._repopulate_display_views()
@@ -369,7 +385,7 @@ class SequencePlayer(QWidget):
             return False
 
         try:
-            from ...core.video import probe_video
+            from ...core.video import probe_video, resolve_video_src_colorspace
 
             w, h, probed_fps, n_frames = probe_video(path)
         except Exception:
@@ -383,9 +399,10 @@ class SequencePlayer(QWidget):
         if use_fps <= 0:
             use_fps = 24.0
         self.set_fps(use_fps)
-        if resolution is not None and resolution[0] > 0 and resolution[1] > 0:
-            self.set_resolution(resolution[0], resolution[1])
-        elif w > 0 and h > 0:
+        # Probe size when caller did not pass a positive resolution.
+        if w > 0 and h > 0 and (
+            resolution is None or resolution[0] <= 0 or resolution[1] <= 0
+        ):
             self.set_resolution(int(w), int(h))
 
         self._video_path = path
@@ -394,43 +411,28 @@ class SequencePlayer(QWidget):
         self._first_shot = 1
         self._last_shot = n_frames
 
-        if self._src_colorspace and self._ocio_cfg is not None:
-            try:
-                from ...core.ocio_utils import find_equivalent_space
-
-                resolved = find_equivalent_space(self._ocio_cfg, self._src_colorspace)
-                if resolved:
-                    self._src_colorspace = resolved
-            except Exception:
-                pass
-
+        self._src_colorspace = resolve_video_src_colorspace(
+            path, self._ocio_cfg, preferred=self._src_colorspace
+        )
         log.info(
-            "SequencePlayer load_video: %s frames=%s fps=%.3f src=%r",
+            "SequencePlayer load_video: %s frames=%s fps=%.3f src=%r working=%r",
             path,
             n_frames,
             use_fps,
             self._src_colorspace,
+            self._resolve_working_space(),
         )
-
-        self._timeline.set_range(self._first_shot, self._last_shot)
-        self._timeline.set_marker_frames({})
-        self._current_frame = self._first_shot
-        self._timeline.set_value(self._current_frame)
 
         self._prefetch = VideoPrefetchService(
             path,
             self._shot_cache,
             self._shot_frames,
+            fps=use_fps,
             frame_transform=self._build_worker_frame_transform(),
             parent=self,
         )
         self._prefetch.frame_loaded.connect(self._on_prefetch_frame_loaded)
-
-        self._repopulate_display_views()
-        self._sync_gpu_view_settings()
-        self._sync_prefetch()
-        self.refresh()
-        return True
+        return self._finish_media_load()
 
     def clear(self) -> None:
         """Stop playback, drop cache, and reset to an empty timeline."""
@@ -643,16 +645,15 @@ class SequencePlayer(QWidget):
             self._display_view_combo.blockSignals(False)
             return
 
-        from ...core.ocio_utils import list_displays, list_views
+        from ...core.ocio_utils import (
+            default_display_view,
+            list_displays,
+            list_views,
+            preferred_video_monitoring_view,
+        )
 
-        default_display = ""
-        default_view = ""
+        default_display, default_view = default_display_view(self._ocio_cfg)
         default_idx = 0
-        try:
-            default_display = self._ocio_cfg.getDefaultDisplay()
-            default_view = self._ocio_cfg.getDefaultView(default_display)
-        except Exception:
-            pass
 
         try:
             displays = list_displays(self._ocio_cfg)
@@ -671,6 +672,19 @@ class SequencePlayer(QWidget):
                     idx += 1
         except Exception:
             pass
+
+        # Soft prefer: ask the config (viewing rules / video encodings) for a
+        # monitoring view. No hard-coded view names — if the config has none,
+        # keep getDefaultView(display) from above.
+        if self._prefer_video_monitoring and self._display_view_pairs:
+            pref_d, pref_v = preferred_video_monitoring_view(
+                self._ocio_cfg, default_display
+            )
+            if pref_v:
+                for i, (d, v) in enumerate(self._display_view_pairs):
+                    if v == pref_v and (not pref_d or d == pref_d):
+                        default_idx = i
+                        break
 
         if self._display_view_combo.count() > 0:
             self._display_view_combo.setCurrentIndex(default_idx)
@@ -888,7 +902,8 @@ class SequencePlayer(QWidget):
             nxt = self._timeline.first_frame
         return nxt
 
-    def _needs_exr_cache(self, frame: int) -> bool:
+    def _needs_disk_cache(self, frame: int) -> bool:
+        """True when *frame* is a media frame that must hit the RAM cache."""
         if self._hooks is not None and self._hooks.is_synthetic_frame(frame):
             return False
         return frame in self._shot_frames_set
@@ -921,7 +936,7 @@ class SequencePlayer(QWidget):
         cur = self._timeline.value()
         nxt = self._next_playback_frame(cur)
 
-        if self._needs_exr_cache(nxt) and not self._shot_cache.contains(nxt):
+        if self._needs_disk_cache(nxt) and not self._shot_cache.contains(nxt):
             self._playback_wait_frame = nxt
             self._shuttle.stop_timer()
             if self._prefetch is not None:
@@ -988,6 +1003,9 @@ class SequencePlayer(QWidget):
     def _composite_shot_with_pixels(self, frame: int, rgb) -> None:
         import numpy as np
 
+        # Cache contract (slate + video browsers share this player):
+        #   uint16  → source-referred, transform on GUI thread
+        #   float*  → already working-space (worker src→working), display only
         if rgb.dtype == np.uint16:
             self._comp_f32 = rgb.astype(np.float32) / 65535.0
             self._comp_src_space = self._src_colorspace or ""
@@ -1048,8 +1066,10 @@ class SequencePlayer(QWidget):
             try:
                 cpu.apply(OCIO.PackedImageDesc(buf, w, h, 3))
             except Exception:
+                # Never cache untransformed pixels as float working-space —
+                # that poisons display (video looks washed/crushed).
                 log.exception("Worker src→working OCIO apply failed")
-                return np.ascontiguousarray(rgb_f32, dtype=np.float16)
+                return None
             return buf.astype(np.float16)
 
         return _transform

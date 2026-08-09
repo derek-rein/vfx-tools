@@ -84,8 +84,8 @@ uv run python main.py video2exr -i plate.mov --frame-range 1-100 --workers 4
 | `-i` / `--input` | *(required)* | Input video file |
 | `-o` / `--output-dir` | `<input_dir>/<stem>/` | Directory for EXR frames |
 | `--ocio` | bundled / `$OCIO` | Config file path |
-| `--src` | auto | Source color space (probe + aliases; falls back toward Rec.709-ish) |
-| `--dst` | `ACEScg` / scene_linear | Destination scene space |
+| `--src` | auto | Stream color tags / codec ranking → **`Output - Rec.709`** (alias-resolved). Not an OIIO still probe. |
+| `--dst` | `ACEScg` / scene_linear | Destination scene space (role fallbacks; not media probing) |
 | `--exr-compression` | `dwaa` | `none`, `rle`, `zip`, `zips`, `piz`, `pxr24`, `b44`, `b44a`, `dwaa`, `dwab` |
 | `--dwa-level` | library | DWA level for `dwaa`/`dwab` (`0` = lossless) |
 | `--zip-level` | library | ZIP level 1–9 for `zip`/`zips` |
@@ -182,8 +182,11 @@ Research notes for true cross-platform 12-bit ProRes (not shipped):
 ## Color management notes
 
 - **Transforms** are applied with **PyOpenColorIO** (not OIIO’s colorconvert).
-- Omitted `--src` / `--dst` use probing + role fallbacks and
-  `find_equivalent_space` so names still resolve across configs.
+- Omitted **`--src`**: **video2exr** uses stream TRC/primaries/codec candidates
+  then **`Output - Rec.709`**; **exr2video** uses still metadata / format
+  (scene-linear vs sRGB-ish). Omitted **`--dst`**: fixed defaults + roles
+  (`ACEScg` / scene_linear for video→EXR; Rec.709 for EXR→video), not media
+  probing. Names remap via `find_equivalent_space` when needed.
 - Packaged app needs **OpenColorIO 2.5+** for the bundled ACES Studio v4 config.
   From source: `make ensure-ocio` if OIIO rewired you to 2.4.
 

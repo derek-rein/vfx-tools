@@ -15,6 +15,84 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.8.0] — 2026-08-09
+
+### Changed
+
+- **OCIO app anchor for overlays:** slate / burn-in / watermark paint is always
+  linearised on a private ACES CG/Studio config the app controls (guaranteed
+  `texture_paint` + `aces_interchange` / ACES2065-1), then bridged into the
+  user config’s compositing space via interchange when available. User
+  source/destination convert still uses only the selected (Nuke / show / file)
+  config — internal transforms no longer depend on it having sRGB or AP0.
+
+### Added
+
+- **Built-in video player in Preferences:** **File → Preferences → Video player**
+  offers **Built-in player** (default), System default, or Custom application.
+  With **Open result** after EXR → Video, built-in opens the finished file in the
+  same OCIO `SequencePlayer` window used for sequences (cache strip, GPU display).
+- **AppSettings service:** process-wide typed QSettings façade
+  (`src/services/app_settings.py`) with a key registry; browsers and the main
+  window share one backend instead of ad-hoc `QSettings` factories.
+- **Versioned convert presets:** JSON presets carry `schema_version` / `kind`;
+  load normalizes legacy files and strips accidental I/O paths.
+- **Slate undo/redo:** in the slate editor, ⌘/Ctrl+Z and Shift+⌘/Ctrl+Z undo/redo
+  **feature toggles** (slate / burn-in / watermark) and **Fill from slate**
+  (burn-in bulk fill) via a model-owned `QUndoStack`. Free-text / spinner field
+  edits persist live but are not stacked as document commands. Convert paths,
+  OCIO config, and app preferences are not on the stack. Shortcuts do not steal
+  text-field undo while a line edit has focus.
+
+### Removed
+
+- **Slate menu** on the main menu bar. Edit slate / burn-in / watermark from
+  the **EXR → Video** tab (checkbox + edit button) as before.
+
+### Fixed
+
+- **Video / V2E open-result looks crushed dark:** convert Rec.709 → ACEScg was
+  correct; the player used the config-wide default view (often ACES 2.0 SDR
+  RRT), which crushes Rec.709-originated SDR. Video preview and Video→EXR
+  **Open result** now soft-prefer a **video-monitoring** view from the config
+  when viewing rules / ``sdr-video`` encodings provide one
+  (``getDefaultView(display, videoCS)`` — no hard-coded view names). If the
+  config has no such view, the config default is unchanged. Slate/camera EXR
+  still uses the config default.
+- **Multi-sequence identity:** convert tab, async open, and session restore keep
+  the selected sequence via its first-frame path (not the parent folder alone);
+  source color auto-detect probes that sequence, not sorted ``[0]`` in mixed
+  folders. Sequence browser Preview follows the current list/grid selection.
+- **Slate editor undo vs typing:** ⌘/Ctrl+Z prefers the focused line edit’s
+  text undo before document commands.
+- **Sequence preview colour:** unmapped OIIO tags no longer skip ``src→working``.
+- **File browser state restore:** Video → EXR and EXR → Video input browsers now
+  persist full layout and session separately (`ui/video_browser_*` vs
+  `ui/sequence_browser_*`): List/Grid/Preview, Inspect on/off, splitters, table
+  columns, last folder, selection, and directory-tree expansion/scroll. Window
+  **size and position** are shared (`ui/browser_geometry`). When Browse opens
+  the same folder as last time, the dialog reopens as left (tree, tabs, Inspect).
+  The video browser now saves layout on close (it previously only remembered
+  view mode).
+- **Video playback / scrubbing:** browser and sequence-player video decode no
+  longer labels the post-seek **keyframe** as the requested frame. Seek lands
+  on the previous I-frame, then the decoder walks forward by presentation time
+  to the exact index (FFmpeg/PyAV standard path). Forward play stays sequential;
+  scrub coalesces the queue and limits reverse lookback so scrubbing does not
+  thrash GOPs or jump frames.
+- **Video preview colour:** `load_video` resolves a real OCIO source space
+  (tab selection, else file metadata, else Rec.709) before building the same
+  src→working worker transform the slate editor uses, so display/view is no
+  longer applied to display-encoded video as if it were scene-linear.
+- **Preview cache OCIO failures:** if `src→working` raises or returns `None`,
+  the frame is not stored as float working-space (avoids washed/crushed
+  display). Applies to video and EXR prefetch.
+- **Browser Preview OCIO:** file browsers take an explicit preview context
+  (config + source space + fps) instead of reading private attributes from
+  `parent()`. Video browser cache strip matches sequence browser (Preferences).
+
+---
+
 ## [0.7.0] — 2026-08-09
 
 ### Added
@@ -400,7 +478,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/derek-rein/exr-converter/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/derek-rein/exr-converter/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/derek-rein/exr-converter/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/derek-rein/exr-converter/compare/v0.5.4...v0.6.0

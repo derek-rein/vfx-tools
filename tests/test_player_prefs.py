@@ -8,6 +8,7 @@ import pytest
 from PySide6.QtCore import QSettings
 
 from src.gui.preferences import (
+    PLAYER_MODE_BUILTIN,
     PLAYER_MODE_CUSTOM,
     PLAYER_MODE_SYSTEM,
     open_video_with_player,
@@ -24,8 +25,8 @@ def settings(tmp_path, monkeypatch):
     return s
 
 
-def test_defaults_are_system(settings):
-    assert player_mode(settings) == PLAYER_MODE_SYSTEM
+def test_defaults_are_builtin(settings):
+    assert player_mode(settings) == PLAYER_MODE_BUILTIN
     assert player_path(settings) == ""
 
 
@@ -35,9 +36,19 @@ def test_set_and_load_custom(settings):
     assert player_path(settings) == "/Applications/IINA.app"
 
 
-def test_invalid_mode_falls_back_to_system(settings):
-    settings.setValue("player/mode", "nope")
+def test_set_and_load_system(settings):
+    set_player_prefs(settings, PLAYER_MODE_SYSTEM, "")
     assert player_mode(settings) == PLAYER_MODE_SYSTEM
+
+
+def test_set_and_load_builtin(settings):
+    set_player_prefs(settings, PLAYER_MODE_BUILTIN, "")
+    assert player_mode(settings) == PLAYER_MODE_BUILTIN
+
+
+def test_invalid_mode_falls_back_to_builtin(settings):
+    settings.setValue("player/mode", "nope")
+    assert player_mode(settings) == PLAYER_MODE_BUILTIN
 
 
 def test_open_system_default(settings, tmp_path):
@@ -69,6 +80,17 @@ def test_open_custom_missing_falls_back(settings, tmp_path):
     media = tmp_path / "out.mov"
     media.write_bytes(b"x")
     set_player_prefs(settings, PLAYER_MODE_CUSTOM, str(tmp_path / "missing-player"))
+    with patch("src.gui.preferences.QDesktopServices.openUrl") as open_url:
+        msg = open_video_with_player(media, settings)
+    assert "system default" in msg
+    open_url.assert_called_once()
+
+
+def test_open_builtin_via_helper_falls_back_to_system(settings, tmp_path):
+    """Builtin is handled by MainWindow; helper falls back safely."""
+    media = tmp_path / "out.mov"
+    media.write_bytes(b"x")
+    set_player_prefs(settings, PLAYER_MODE_BUILTIN, "")
     with patch("src.gui.preferences.QDesktopServices.openUrl") as open_url:
         msg = open_video_with_player(media, settings)
     assert "system default" in msg
