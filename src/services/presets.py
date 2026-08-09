@@ -25,6 +25,7 @@ SCHEMA_VERSION = 1
 # Safe preset filenames only — no path separators or traversal.
 _PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
 
+
 def _preset_dir() -> Path:
     base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
     d = Path(base) / "presets"

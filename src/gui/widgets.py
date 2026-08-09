@@ -4661,9 +4661,7 @@ class ConvertTab(QWidget):
             sel_name = ""
             if self._input_seq is not None:
                 sel_name = self._input_seq.basename().rstrip("._")
-            dlg = SequenceBrowserDialog(
-                start, select_name=sel_name, parent=self, preview=preview
-            )
+            dlg = SequenceBrowserDialog(start, select_name=sel_name, parent=self, preview=preview)
             accepted = dlg.exec() == QDialog.DialogCode.Accepted
             # Prefer first-frame path so multi-sequence folders open the
             # row the user selected (directory alone always picks sorted[0]).
@@ -4756,9 +4754,7 @@ class ConvertTab(QWidget):
             return
         from ..core.video import resolve_video_src_colorspace
 
-        preferred = resolve_video_src_colorspace(
-            video_path, getattr(self, "_ocio_cfg", None)
-        )
+        preferred = resolve_video_src_colorspace(video_path, getattr(self, "_ocio_cfg", None))
         if preferred and self.src_btn.try_select(preferred):
             self.log_message.emit(f"Auto-detected source color space: {preferred}")
             self.src_btn.setStyleSheet("background-color: #3a3020;")

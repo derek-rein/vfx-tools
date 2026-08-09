@@ -226,9 +226,7 @@ class TestResolveVideoSrcColorspace:
         from src.core.video import resolve_video_src_colorspace
 
         cfg = OCIO.Config.CreateFromFile(str(next(Path("resources").rglob("*.ocio"))))
-        hit = resolve_video_src_colorspace(
-            "", cfg, preferred="Output - Rec.709"
-        )
+        hit = resolve_video_src_colorspace("", cfg, preferred="Output - Rec.709")
         assert hit
         assert "709" in hit or "Rec" in hit
 

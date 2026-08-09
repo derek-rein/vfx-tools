@@ -400,9 +400,7 @@ class SequencePlayer(QWidget):
             use_fps = 24.0
         self.set_fps(use_fps)
         # Probe size when caller did not pass a positive resolution.
-        if w > 0 and h > 0 and (
-            resolution is None or resolution[0] <= 0 or resolution[1] <= 0
-        ):
+        if w > 0 and h > 0 and (resolution is None or resolution[0] <= 0 or resolution[1] <= 0):
             self.set_resolution(int(w), int(h))
 
         self._video_path = path
@@ -677,9 +675,7 @@ class SequencePlayer(QWidget):
         # monitoring view. No hard-coded view names — if the config has none,
         # keep getDefaultView(display) from above.
         if self._prefer_video_monitoring and self._display_view_pairs:
-            pref_d, pref_v = preferred_video_monitoring_view(
-                self._ocio_cfg, default_display
-            )
+            pref_d, pref_v = preferred_video_monitoring_view(self._ocio_cfg, default_display)
             if pref_v:
                 for i, (d, v) in enumerate(self._display_view_pairs):
                     if v == pref_v and (not pref_d or d == pref_d):

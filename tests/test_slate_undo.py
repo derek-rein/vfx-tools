@@ -47,8 +47,6 @@ def test_fill_burnin_undoable(tmp_path, qapp):
     )
     m.set_burnin_fields({"top_left": "KEEP"}, record_undo=False)
     m.reset_burnin_from_slate(record_undo=True)
-    assert m.burnin_fields["top_left"] != "KEEP" or any(
-        v for v in m.burnin_fields.values()
-    )
+    assert m.burnin_fields["top_left"] != "KEEP" or any(v for v in m.burnin_fields.values())
     m.undo_stack.undo()
     assert m.burnin_fields["top_left"] == "KEEP"

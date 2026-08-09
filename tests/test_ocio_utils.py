@@ -208,9 +208,7 @@ class TestLinearizeOverlay:
         bridged = ocio_utils.linearize_overlay(user, rgba, working_space=comp)
         direct = rgba[..., :3].astype(np.float32) / 255.0
         direct = np.ascontiguousarray(direct)
-        ocio_utils.make_cpu_processor(user, auth, comp).apply(
-            OCIO.PackedImageDesc(direct, w, h, 3)
-        )
+        ocio_utils.make_cpu_processor(user, auth, comp).apply(OCIO.PackedImageDesc(direct, w, h, 3))
         assert np.allclose(bridged[..., :3], direct, rtol=1e-4, atol=1e-5)
 
 

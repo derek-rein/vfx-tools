@@ -61,9 +61,7 @@ class TestResolveSequenceSrcColorspace:
         cfg = OCIO.Config.CreateFromFile(str(next(Path("resources").rglob("*.ocio"))))
         bad = "lin_rec709_not_in_config_xyz"
         monkeypatch.setattr(seq_mod, "probe_pixel_colorspace", lambda _p: bad)
-        hit = seq_mod.resolve_sequence_src_colorspace(
-            str(tmp_path / "x.exr"), cfg, preferred=""
-        )
+        hit = seq_mod.resolve_sequence_src_colorspace(str(tmp_path / "x.exr"), cfg, preferred="")
         # Must be config-valid (fallback ACEScg/scene_linear), never the raw tag.
         assert hit
         assert bad not in hit

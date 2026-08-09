@@ -152,13 +152,9 @@ class SlateModel(QObject):
 
         self._slate_enabled = _settings_bool(settings, f"{mode}/slate_enabled", False)
         self._burnin_enabled = _settings_bool(settings, f"{mode}/burnin_enabled", False)
-        self._watermark_enabled = _settings_bool(
-            settings, f"{mode}/watermark_enabled", False
-        )
+        self._watermark_enabled = _settings_bool(settings, f"{mode}/watermark_enabled", False)
         # Migrate older profiles that only had slate/wm_enabled.
-        if not self._watermark_enabled and _settings_bool(
-            settings, "slate/wm_enabled", False
-        ):
+        if not self._watermark_enabled and _settings_bool(settings, "slate/wm_enabled", False):
             self._watermark_enabled = True
 
         # Slate metadata: per-field persistence keys live under ``slate/...``
@@ -227,9 +223,7 @@ class SlateModel(QObject):
         if after == self._slate_enabled:
             return
         if record_undo:
-            self._undo.push(
-                SetSlateFlagCommand(self, "slate", self._slate_enabled, after)
-            )
+            self._undo.push(SetSlateFlagCommand(self, "slate", self._slate_enabled, after))
             return
         self._slate_enabled = after
         self._settings.setValue(f"{self._mode}/slate_enabled", self._slate_enabled)
@@ -240,9 +234,7 @@ class SlateModel(QObject):
         if after == self._burnin_enabled:
             return
         if record_undo:
-            self._undo.push(
-                SetSlateFlagCommand(self, "burnin", self._burnin_enabled, after)
-            )
+            self._undo.push(SetSlateFlagCommand(self, "burnin", self._burnin_enabled, after))
             return
         self._burnin_enabled = after
         self._settings.setValue(f"{self._mode}/burnin_enabled", self._burnin_enabled)
@@ -253,9 +245,7 @@ class SlateModel(QObject):
         if after == self._watermark_enabled:
             return
         if record_undo:
-            self._undo.push(
-                SetSlateFlagCommand(self, "watermark", self._watermark_enabled, after)
-            )
+            self._undo.push(SetSlateFlagCommand(self, "watermark", self._watermark_enabled, after))
             return
         self._watermark_enabled = after
         self._settings.setValue(f"{self._mode}/watermark_enabled", self._watermark_enabled)
@@ -293,9 +283,7 @@ class SlateModel(QObject):
             "resolution": (int(self._slate_resolution[0]), int(self._slate_resolution[1])),
         }
 
-    def apply_slate_snapshot(
-        self, snap: dict[str, Any], *, record_undo: bool = False
-    ) -> None:
+    def apply_slate_snapshot(self, snap: dict[str, Any], *, record_undo: bool = False) -> None:
         """Restore a :meth:`capture_slate_snapshot` dict."""
         fields = dict(snap.get("fields") or {})
         version = snap.get("version")
@@ -422,25 +410,19 @@ class SlateModel(QObject):
     def burnin_fields(self) -> dict[str, str]:
         return dict(self._burnin_fields)
 
-    def set_burnin_fields(
-        self, fields: dict[str, str], *, record_undo: bool = False
-    ) -> None:
+    def set_burnin_fields(self, fields: dict[str, str], *, record_undo: bool = False) -> None:
         clean = {k: str(fields.get(k, "") or "") for k in _BURNIN_KEYS}
         if clean == self._burnin_fields:
             return
         if record_undo:
-            self._undo.push(
-                SetBurninFieldsCommand(self, dict(self._burnin_fields), clean)
-            )
+            self._undo.push(SetBurninFieldsCommand(self, dict(self._burnin_fields), clean))
             return
         self._burnin_fields = clean
         for k, v in clean.items():
             self._settings.setValue(f"slate/burnin_{k}", v)
         self.changed.emit("burnin_fields")
 
-    def reset_burnin_from_slate(
-        self, input_path: str = "", *, record_undo: bool = True
-    ) -> None:
+    def reset_burnin_from_slate(self, input_path: str = "", *, record_undo: bool = True) -> None:
         """Fill burn-in fields from current slate data via the existing helper.
 
         Called from a 'Fill from slate' button in the form.  Replaces the
@@ -482,9 +464,7 @@ class SlateModel(QObject):
         p["enabled"] = self._watermark_enabled
         return p
 
-    def set_watermark_params(
-        self, params: dict, *, record_undo: bool = False
-    ) -> None:
+    def set_watermark_params(self, params: dict, *, record_undo: bool = False) -> None:
         merged = dict(self._watermark_params)
         for k in _DEFAULT_WATERMARK:
             if k in params:
@@ -492,11 +472,7 @@ class SlateModel(QObject):
         if merged == self._watermark_params:
             return
         if record_undo:
-            self._undo.push(
-                SetWatermarkParamsCommand(
-                    self, dict(self._watermark_params), merged
-                )
-            )
+            self._undo.push(SetWatermarkParamsCommand(self, dict(self._watermark_params), merged))
             return
         self._watermark_params = merged
         s = self._settings
