@@ -103,6 +103,30 @@ from ..core.ocio_utils import (
 )
 from ..core.sequence import probe_exr_colorspace, probe_exr_metadata, scan_exr_sequences
 from ..core.video import probe_video_metadata, scan_video_files
+from .browser_state import (
+    SEQ_BROWSER_KEYS,
+    VID_BROWSER_KEYS,
+    VIEW_GRID,
+    VIEW_LIST,
+    VIEW_PREVIEW,
+    BrowserPreviewContext,
+    browser_qsettings,
+    coerce_view_mode,
+    collect_expanded_dirs,
+    dirs_equal,
+    expand_path_chain,
+    load_favorite_paths,
+    load_shared_geometry,
+    normalize_dir,
+    parse_int_list,
+    parse_str_list,
+    restore_tree_expanded,
+    save_favorite_paths,
+    save_shared_geometry,
+    set_tree_vscroll,
+    settings_bool,
+    tree_vscroll_value,
+)
 from .preferences import (
     file_manager_label,
     path_is_revealable,
@@ -728,7 +752,6 @@ class _PlacesSidebar(QWidget):
     """Sidebar listing OS locations and user-defined favorite directories."""
 
     navigate_requested = Signal(str)
-    _FAVORITES_KEY = "browser/favorites"
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -779,15 +802,7 @@ class _PlacesSidebar(QWidget):
         self._list.addItem(header)
         self._fav_start = self._list.count()
 
-        settings = QSettings()
-        raw = settings.value(self._FAVORITES_KEY, [])
-        if isinstance(raw, str):
-            favs: list[str] = [raw] if raw else []
-        elif isinstance(raw, (list, tuple)):
-            favs = [str(x) for x in raw]
-        else:
-            favs = []
-        for fav_path in favs:
+        for fav_path in load_favorite_paths():
             if Path(fav_path).is_dir():
                 self._add_fav_item(fav_path)
 
@@ -877,7 +892,7 @@ class _PlacesSidebar(QWidget):
             path = self._list.item(i).data(Qt.ItemDataRole.UserRole)
             if path:
                 favs.append(path)
-        QSettings().setValue(self._FAVORITES_KEY, favs)
+        save_favorite_paths(favs)
 
 
 def _setup_dir_tree(tree: QTreeView, fs_model: QFileSystemModel, places: _PlacesSidebar) -> None:
@@ -1344,14 +1359,14 @@ class _SearchableTree(QWidget):
 # Image sequence browser dialog (list / grid + metadata inspector)
 # ---------------------------------------------------------------------------
 
-_SEQ_BROWSER_VIEW_KEY = "ui/sequence_browser_view"
-_SEQ_BROWSER_VIEW_LIST = "list"
-_SEQ_BROWSER_VIEW_GRID = "grid"
-_SEQ_BROWSER_VIEW_PREVIEW = "preview"
-_VID_BROWSER_VIEW_KEY = "ui/video_browser_view"
-_VID_BROWSER_VIEW_LIST = "list"
-_VID_BROWSER_VIEW_GRID = "grid"
-_VID_BROWSER_VIEW_PREVIEW = "preview"
+# View mode string constants (aliases for browser_state; keep local names for
+# call-site readability inside the dialog classes).
+_SEQ_BROWSER_VIEW_LIST = VIEW_LIST
+_SEQ_BROWSER_VIEW_GRID = VIEW_GRID
+_SEQ_BROWSER_VIEW_PREVIEW = VIEW_PREVIEW
+_VID_BROWSER_VIEW_LIST = VIEW_LIST
+_VID_BROWSER_VIEW_GRID = VIEW_GRID
+_VID_BROWSER_VIEW_PREVIEW = VIEW_PREVIEW
 
 
 def _configure_path_line_edit(edit: QLineEdit) -> None:
@@ -1401,11 +1416,6 @@ class _ElidingLabel(QLabel):
         QLabel.setText(self, elided)
 
 
-_SEQ_BROWSER_GEOMETRY_KEY = "ui/sequence_browser_geometry"
-_SEQ_BROWSER_OUTER_SPLIT_KEY = "ui/sequence_browser_outer_splitter"
-_SEQ_BROWSER_CONTENT_SPLIT_KEY = "ui/sequence_browser_content_splitter"
-_SEQ_BROWSER_COL_WIDTHS_KEY = "ui/sequence_browser_column_widths"
-_SEQ_BROWSER_HEADER_STATE_KEY = "ui/sequence_browser_header_state"
 _SEQ_THUMB_EDGE = 160
 _SEQ_THUMB_ICON = QSize(160, 100)
 
@@ -1474,10 +1484,14 @@ class SequenceBrowserDialog(QDialog):
         start_dir: str = "",
         select_name: str = "",
         parent: QWidget | None = None,
+        *,
+        preview: BrowserPreviewContext | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Browse Image Sequences")
         self.resize(1120, 560)
+        self._keys = SEQ_BROWSER_KEYS
+        self._preview_ctx = preview or BrowserPreviewContext()
         self._selected_dir: str = ""
         self._selected_name: str = ""
         # First-frame path of the selected sequence (preferred for set_input so
@@ -1486,6 +1500,8 @@ class SequenceBrowserDialog(QDialog):
         self._seq_data: list[dict] = []
         self._auto_select_name = select_name
         self._syncing_selection = False
+        self._same_path_session = False
+        self._pending_preview = False
         self._thumb_gen = 0
         self._thumb_cache: dict[str, QPixmap] = {}
         self._placeholder_icon = self._make_placeholder_icon()
@@ -1704,26 +1720,44 @@ class SequenceBrowserDialog(QDialog):
         self._grid.installEventFilter(self)
         self._grid.viewport().installEventFilter(self)
         self.installEventFilter(self)
-        # Restore view mode (list default) before connecting to avoid a double apply.
-        # Don't cold-start into Preview (needs a folder scan first).
-        saved_view = str(QSettings().value(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_LIST) or "")
-        self._last_browse_mode = (
-            _SEQ_BROWSER_VIEW_GRID
-            if saved_view == _SEQ_BROWSER_VIEW_GRID
-            else _SEQ_BROWSER_VIEW_LIST
+
+        # Session restore: layout + inspect always; tree/selection when same dir.
+        settings = browser_qsettings()
+        keys = self._keys
+        saved_dir = str(settings.value(keys.last_dir, "") or "")
+        start_norm = normalize_dir(start_dir) if start_dir else ""
+        self._same_path_session = bool(start_norm) and dirs_equal(start_dir, saved_dir)
+        saved_view = coerce_view_mode(settings.value(keys.view, VIEW_LIST))
+        # Prefer list/grid for the initial stack; Preview applies after scan.
+        self._pending_preview = saved_view == VIEW_PREVIEW
+        last_browse = coerce_view_mode(
+            settings.value(keys.last_browse, saved_view), allow_preview=False
         )
-        if self._last_browse_mode == _SEQ_BROWSER_VIEW_GRID:
-            self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_GRID)
+        if saved_view == VIEW_GRID:
+            last_browse = VIEW_GRID
+        elif saved_view == VIEW_LIST:
+            last_browse = VIEW_LIST
+        self._last_browse_mode = last_browse if last_browse in (VIEW_LIST, VIEW_GRID) else VIEW_LIST
+        if self._last_browse_mode == VIEW_GRID:
+            self._view_seg.setCurrentData(VIEW_GRID)
             self._view_stack.setCurrentIndex(1)
         else:
-            self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_LIST)
+            self._view_seg.setCurrentData(VIEW_LIST)
             self._view_stack.setCurrentIndex(0)
         self._view_seg.currentIndexChanged.connect(self._on_view_changed)
 
-        # Default Inspect on without relying on toggled side effects for selection.
-        self._inspect_cb.setChecked(True)
-        self._toggle_inspect(True)
+        # Inspect from last session (default on for sequences).
+        inspect_on = settings_bool(settings, keys.inspect, True)
+        self._inspect_cb.blockSignals(True)
+        self._inspect_cb.setChecked(inspect_on)
+        self._inspect_cb.blockSignals(False)
+        self._toggle_inspect(inspect_on)
         self._inspect_cb.toggled.connect(self._toggle_inspect)
+
+        # When reopening the same folder, prefer last in-dialog selection if the
+        # caller did not already pin a sequence name from the convert tab.
+        if self._same_path_session and not self._auto_select_name:
+            self._auto_select_name = str(settings.value(keys.selected, "") or "")
 
         # Geometry / splitters / column widths from last session.
         self._restore_browser_layout()
@@ -1737,8 +1771,24 @@ class SequenceBrowserDialog(QDialog):
         except Exception:
             log.exception("Could not pre-create sequence player for browser")
 
-        if start_dir and Path(start_dir).is_dir():
-            self._navigate_to(start_dir)
+        start_folder = ""
+        if start_dir:
+            d = Path(start_dir)
+            if d.is_file():
+                # First-frame path from convert tab — open its parent folder.
+                if not self._auto_select_name:
+                    self._auto_select_name = d.name.split(".")[0] if "." in d.name else d.stem
+                d = d.parent
+            if d.is_dir():
+                start_folder = str(d)
+        if start_folder:
+            self._navigate_to(start_folder, restore_tree=self._same_path_session)
+        elif self._same_path_session and saved_dir and Path(saved_dir).is_dir():
+            self._navigate_to(saved_dir, restore_tree=True)
+
+        if self._pending_preview and self._seq_data:
+            self._view_seg.setCurrentData(VIEW_PREVIEW)
+        self._pending_preview = False
 
     def _schedule_layout_save(self) -> None:
         """Debounce layout persistence while the user drags splitters/columns."""
@@ -1747,36 +1797,28 @@ class SequenceBrowserDialog(QDialog):
             timer.start()
 
     def _restore_browser_layout(self) -> None:
-        """Restore dialog geometry, splitter sizes, and list header state."""
-        settings = QSettings()
-        geo = settings.value(_SEQ_BROWSER_GEOMETRY_KEY)
+        """Restore dialog geometry (shared), splitter sizes, and list header state."""
+        settings = browser_qsettings()
+        keys = self._keys
+        geo = load_shared_geometry(settings)
         if geo is not None:
             try:
                 self.restoreGeometry(geo)
             except Exception:
                 pass
 
-        outer = settings.value(_SEQ_BROWSER_OUTER_SPLIT_KEY)
-        if outer is not None:
-            try:
-                sizes = [int(x) for x in outer]  # type: ignore[arg-type]
-                if len(sizes) == 2 and all(s > 0 for s in sizes):
-                    self._outer_splitter.setSizes(sizes)
-            except Exception:
-                pass
+        outer = parse_int_list(settings.value(keys.outer_split))
+        if outer is not None and len(outer) == 2 and all(s > 0 for s in outer):
+            self._outer_splitter.setSizes(outer)
 
-        content = settings.value(_SEQ_BROWSER_CONTENT_SPLIT_KEY)
+        content = parse_int_list(settings.value(keys.content_split))
         if content is not None and self._meta_panel.isVisible():
-            try:
-                sizes = [int(x) for x in content]  # type: ignore[arg-type]
-                if len(sizes) == 2 and sizes[0] > 0 and sizes[1] >= 0:
-                    self._content_splitter.setSizes(sizes)
-            except Exception:
-                pass
+            if len(content) == 2 and content[0] > 0 and content[1] >= 0:
+                self._content_splitter.setSizes(content)
 
         th = self._table.horizontalHeader()
         # Prefer Qt native header state (widths + interactive modes).
-        header_state = settings.value(_SEQ_BROWSER_HEADER_STATE_KEY)
+        header_state = settings.value(keys.header_state)
         if header_state is not None:
             try:
                 th.restoreState(header_state)
@@ -1790,31 +1832,43 @@ class SequenceBrowserDialog(QDialog):
                 header_state = None
         if header_state is None:
             # Legacy fallback: plain width list.
-            widths = settings.value(_SEQ_BROWSER_COL_WIDTHS_KEY)
+            widths = parse_int_list(settings.value(keys.col_widths))
             if widths is not None:
-                try:
-                    cols = [int(x) for x in widths]  # type: ignore[arg-type]
-                    for i, w in enumerate(cols):
-                        if i == 0:
-                            continue
-                        if i < self._table.columnCount() and w >= 48:
-                            th.resizeSection(i, w)
-                except Exception:
-                    pass
+                for i, w in enumerate(widths):
+                    if i == 0:
+                        continue
+                    if i < self._table.columnCount() and w >= 48:
+                        th.resizeSection(i, w)
 
     def _save_browser_layout(self) -> None:
-        """Persist dialog geometry, splitter sizes, and list header state."""
-        settings = QSettings()
-        settings.setValue(_SEQ_BROWSER_GEOMETRY_KEY, self.saveGeometry())
-        settings.setValue(_SEQ_BROWSER_OUTER_SPLIT_KEY, self._outer_splitter.sizes())
+        """Persist shared geometry + per-mode layout and session state."""
+        settings = browser_qsettings()
+        keys = self._keys
+        save_shared_geometry(self.saveGeometry(), settings)
+        settings.setValue(keys.outer_split, self._outer_splitter.sizes())
         # Only store content split when Inspect is open (hidden pane is 0-width).
         if self._meta_panel.isVisible():
-            settings.setValue(_SEQ_BROWSER_CONTENT_SPLIT_KEY, self._content_splitter.sizes())
+            settings.setValue(keys.content_split, self._content_splitter.sizes())
         th = self._table.horizontalHeader()
-        settings.setValue(_SEQ_BROWSER_HEADER_STATE_KEY, th.saveState())
+        settings.setValue(keys.header_state, th.saveState())
         # Also keep a simple width list for debugging / older readers.
         widths = [th.sectionSize(i) for i in range(self._table.columnCount())]
-        settings.setValue(_SEQ_BROWSER_COL_WIDTHS_KEY, widths)
+        settings.setValue(keys.col_widths, widths)
+        settings.setValue(keys.inspect, self._inspect_cb.isChecked())
+        mode = self._view_seg.currentData() or VIEW_LIST
+        settings.setValue(keys.view, str(mode))
+        settings.setValue(
+            keys.last_browse,
+            str(self._last_browse_mode or VIEW_LIST),
+        )
+        directory = self._path_edit.text().strip() or self._selected_dir
+        if directory:
+            settings.setValue(keys.last_dir, normalize_dir(directory) or directory)
+        if self._selected_name:
+            settings.setValue(keys.selected, self._selected_name)
+        settings.setValue(keys.tree_expanded, collect_expanded_dirs(self._tree, self._fs_model))
+        settings.setValue(keys.tree_vscroll, tree_vscroll_value(self._tree))
+        settings.sync()
 
     def _on_table_section_resized(self, logical_index: int, _old: int, new_size: int) -> None:
         """If a side column grows so much that Name would starve, clamp it."""
@@ -1862,17 +1916,34 @@ class SequenceBrowserDialog(QDialog):
             return self._selected_frame_path
         return self._selected_dir
 
-    def _navigate_to(self, directory: str) -> None:
+    def _navigate_to(self, directory: str, *, restore_tree: bool = False) -> None:
         # Stay on Preview if active — scan reloads the first sequence of the new folder.
+        expand_path_chain(self._tree, self._fs_model, directory)
         idx = self._fs_model.index(directory)
         if idx.isValid():
             self._tree.setCurrentIndex(idx)
             self._tree.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
-            self._tree.expand(idx)
+        if restore_tree:
+            self._restore_tree_session(directory)
         self._path_edit.setText(directory)
         self._places.set_current_dir(directory)
         self._searchable_tree.set_search_root(directory)
         self._scan_directory(directory)
+
+    def _restore_tree_session(self, directory: str) -> None:
+        """Re-expand folders + scroll from last session (same-path reopen)."""
+        settings = browser_qsettings()
+        keys = self._keys
+        paths = parse_str_list(settings.value(keys.tree_expanded))
+        restore_tree_expanded(self._tree, self._fs_model, paths, focus_path=directory)
+        vscroll = settings.value(keys.tree_vscroll)
+        try:
+            scroll_val = int(vscroll) if vscroll is not None else -1
+        except (TypeError, ValueError):
+            scroll_val = -1
+        if scroll_val >= 0:
+            # After model/layout settle so the bar range is meaningful.
+            QTimer.singleShot(0, lambda v=scroll_val: set_tree_vscroll(self._tree, v))
 
     def _on_tree_clicked(self, index) -> None:
         path = self._fs_model.filePath(index)
@@ -1891,8 +1962,10 @@ class SequenceBrowserDialog(QDialog):
 
     def _on_view_changed(self, _index: int) -> None:
         mode = self._view_seg.currentData()
+        settings = browser_qsettings()
         if mode == _SEQ_BROWSER_VIEW_PREVIEW:
-            QSettings().setValue(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_PREVIEW)
+            settings.setValue(self._keys.view, _SEQ_BROWSER_VIEW_PREVIEW)
+            settings.setValue(self._keys.last_browse, str(self._last_browse_mode or VIEW_LIST))
             self._view_stack.setCurrentIndex(2)
             self._load_preview_sequence()
             return
@@ -1902,12 +1975,14 @@ class SequenceBrowserDialog(QDialog):
         if mode == _SEQ_BROWSER_VIEW_GRID:
             self._last_browse_mode = _SEQ_BROWSER_VIEW_GRID
             self._view_stack.setCurrentIndex(1)
-            QSettings().setValue(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_GRID)
+            settings.setValue(self._keys.view, _SEQ_BROWSER_VIEW_GRID)
+            settings.setValue(self._keys.last_browse, _SEQ_BROWSER_VIEW_GRID)
             self._queue_thumbnails()
         else:
             self._last_browse_mode = _SEQ_BROWSER_VIEW_LIST
             self._view_stack.setCurrentIndex(0)
-            QSettings().setValue(_SEQ_BROWSER_VIEW_KEY, _SEQ_BROWSER_VIEW_LIST)
+            settings.setValue(self._keys.view, _SEQ_BROWSER_VIEW_LIST)
+            settings.setValue(self._keys.last_browse, _SEQ_BROWSER_VIEW_LIST)
 
     def _scan_directory(self, directory: str) -> None:
         # Invalidate in-flight thumbnail jobs for the previous folder.
@@ -2219,6 +2294,7 @@ class SequenceBrowserDialog(QDialog):
         # is shown so the first QOpenGLWidget is not added post-show (Qt 6.4+
         # native-window recreate crash). Cache budget strip stays in Preferences.
         self._player = SequencePlayer(
+            settings=browser_qsettings(),
             show_cache_ui=False,
             prefer_gpu=True,
             parent=self._preview_page,
@@ -2239,9 +2315,24 @@ class SequenceBrowserDialog(QDialog):
             self._stop_preview_playback(clear_only=True)
             return
 
-        # Always first sequence in the scan list.
-        self._apply_selection(0)
-        s = self._seq_data[0]
+        # Preview the current selection (table/grid), not always sorted[0].
+        row = 0
+        try:
+            if self._view_stack.currentIndex() == 1 and self._grid.currentRow() >= 0:
+                item = self._grid.currentItem()
+                if item is not None:
+                    row = int(item.data(Qt.ItemDataRole.UserRole) or self._grid.row(item))
+            else:
+                rows = self._table.selectionModel().selectedRows()
+                if rows:
+                    row = rows[0].row()
+                elif self._table.currentRow() >= 0:
+                    row = self._table.currentRow()
+        except Exception:
+            row = 0
+        row = max(0, min(row, len(self._seq_data) - 1))
+        self._apply_selection(row)
+        s = self._seq_data[row]
         path = str(s.get("first_frame") or "")
         if not path:
             path = self._first_frame_for_sequence(
@@ -2252,23 +2343,8 @@ class SequenceBrowserDialog(QDialog):
             self._status.setText("Could not resolve first frame for preview")
             return
 
-        ocio_cfg = None
-        src_cs = ""
-        fps = 24.0
-        host = self.parent()
-        if host is not None:
-            ocio_cfg = getattr(host, "_ocio_cfg", None)
-            src_btn = getattr(host, "src_btn", None)
-            if src_btn is not None and hasattr(src_btn, "current_space"):
-                try:
-                    src_cs = str(src_btn.current_space() or "")
-                except Exception:
-                    src_cs = ""
-            if hasattr(host, "get_fps"):
-                try:
-                    fps = float(host.get_fps())
-                except Exception:
-                    fps = 24.0
+        ctx = self._preview_ctx
+        fps = float(ctx.fps) if ctx.fps and ctx.fps > 0 else 24.0
 
         try:
             player = self._ensure_player()
@@ -2280,9 +2356,9 @@ class SequenceBrowserDialog(QDialog):
         try:
             ok = player.load_sequence(
                 path,
-                fps=fps if fps > 0 else 24.0,
-                ocio_cfg=ocio_cfg,
-                src_colorspace=src_cs,
+                fps=fps,
+                ocio_cfg=ctx.ocio_cfg,
+                src_colorspace=ctx.src_colorspace or "",
             )
         except Exception as e:
             log.exception("Preview load failed for %s", path)
@@ -2404,14 +2480,9 @@ class SequenceBrowserDialog(QDialog):
             if total <= 0:
                 total = max(self._content_splitter.width(), 640)
             meta_w = 260
-            saved = QSettings().value(_SEQ_BROWSER_CONTENT_SPLIT_KEY)
-            if saved is not None:
-                try:
-                    sizes = [int(x) for x in saved]  # type: ignore[arg-type]
-                    if len(sizes) == 2 and sizes[1] >= 120:
-                        meta_w = sizes[1]
-                except Exception:
-                    pass
+            saved = parse_int_list(browser_qsettings().value(self._keys.content_split))
+            if saved is not None and len(saved) == 2 and saved[1] >= 120:
+                meta_w = saved[1]
             self._content_splitter.setSizes([max(total - meta_w, 400), meta_w])
             row = self._current_selected_row()
             if row >= 0:
@@ -2420,6 +2491,7 @@ class SequenceBrowserDialog(QDialog):
             # Give the full content width back to the sequence view.
             total = sum(self._content_splitter.sizes()) or max(self._content_splitter.width(), 640)
             self._content_splitter.setSizes([total, 0])
+        self._schedule_layout_save()
 
     def _current_selected_row(self) -> int:
         if self._view_stack.currentIndex() == 1:
@@ -2462,16 +2534,26 @@ class VideoBrowserDialog(QDialog):
 
     _COLUMNS = ["Name", "Resolution", "Codec", "FPS", "Frames", "Duration"]
 
-    def __init__(self, start_dir: str = "", parent: QWidget | None = None):
+    def __init__(
+        self,
+        start_dir: str = "",
+        parent: QWidget | None = None,
+        *,
+        preview: BrowserPreviewContext | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Browse Video Files")
         self.resize(1060, 520)
+        self._keys = VID_BROWSER_KEYS
+        self._preview_ctx = preview or BrowserPreviewContext()
         self._selected_path: str = ""
         self._file_data: list[dict[str, str]] = []
         self._auto_select_path: str = ""
         self._player = None
         self._previewing = False
         self._last_browse_mode = _VID_BROWSER_VIEW_LIST
+        self._same_path_session = False
+        self._pending_preview = False
         self._thumb_gen = 0
         self._thumb_cache: dict[str, QPixmap] = {}
         self._placeholder_icon = self._make_vid_placeholder_icon()
@@ -2662,40 +2744,156 @@ class VideoBrowserDialog(QDialog):
         self._outer_splitter.setSizes([240, 820])
         layout.addWidget(self._outer_splitter, 1)
 
+        # Debounced layout save (mirrors sequence browser).
+        self._layout_save_timer = QTimer(self)
+        self._layout_save_timer.setSingleShot(True)
+        self._layout_save_timer.setInterval(400)
+        self._layout_save_timer.timeout.connect(self._save_browser_layout)
+        th = self._table.horizontalHeader()
+        th.sectionResized.connect(lambda *_: self._schedule_layout_save())
+        self._outer_splitter.splitterMoved.connect(lambda *_: self._schedule_layout_save())
+        self._content_splitter.splitterMoved.connect(lambda *_: self._schedule_layout_save())
+
         self._tree.clicked.connect(self._on_tree_clicked)
         self._table.itemSelectionChanged.connect(self._on_table_selection)
         self._table.cellDoubleClicked.connect(lambda _r, _c: self.accept())
         self._grid.itemSelectionChanged.connect(self._on_grid_selection)
         self._grid.itemDoubleClicked.connect(self._on_grid_double_clicked)
         self._path_edit.returnPressed.connect(self._on_path_entered)
-        self._inspect_cb.toggled.connect(self._toggle_inspect)
-        saved = str(QSettings().value(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_LIST) or "")
-        self._last_browse_mode = (
-            _VID_BROWSER_VIEW_GRID if saved == _VID_BROWSER_VIEW_GRID else _VID_BROWSER_VIEW_LIST
-        )
-        if self._last_browse_mode == _VID_BROWSER_VIEW_GRID:
-            self._view_seg.setCurrentData(_VID_BROWSER_VIEW_GRID)
-            self._view_stack.setCurrentIndex(1)
-        else:
-            self._view_seg.setCurrentData(_VID_BROWSER_VIEW_LIST)
-            self._view_stack.setCurrentIndex(0)
-        self._view_seg.currentIndexChanged.connect(self._on_view_changed)
         self._table.installEventFilter(self)
         self._table.viewport().installEventFilter(self)
         self._grid.installEventFilter(self)
         self._grid.viewport().installEventFilter(self)
         self.installEventFilter(self)
 
+        settings = browser_qsettings()
+        keys = self._keys
+        # Resolve start folder + optional file to select.
+        start_folder = ""
         if start_dir:
             d = Path(start_dir)
             if d.is_file():
                 self._auto_select_path = str(d)
                 d = d.parent
             if d.is_dir():
-                self._navigate_to(str(d))
+                start_folder = str(d)
+
+        saved_dir = str(settings.value(keys.last_dir, "") or "")
+        self._same_path_session = bool(start_folder) and dirs_equal(start_folder, saved_dir)
+        saved_view = coerce_view_mode(settings.value(keys.view, VIEW_LIST))
+        self._pending_preview = saved_view == VIEW_PREVIEW
+        last_browse = coerce_view_mode(
+            settings.value(keys.last_browse, saved_view), allow_preview=False
+        )
+        if saved_view == VIEW_GRID:
+            last_browse = VIEW_GRID
+        elif saved_view == VIEW_LIST:
+            last_browse = VIEW_LIST
+        self._last_browse_mode = last_browse if last_browse in (VIEW_LIST, VIEW_GRID) else VIEW_LIST
+        if self._last_browse_mode == VIEW_GRID:
+            self._view_seg.setCurrentData(VIEW_GRID)
+            self._view_stack.setCurrentIndex(1)
+        else:
+            self._view_seg.setCurrentData(VIEW_LIST)
+            self._view_stack.setCurrentIndex(0)
+        self._view_seg.currentIndexChanged.connect(self._on_view_changed)
+
+        inspect_on = settings_bool(settings, keys.inspect, True)
+        self._inspect_cb.blockSignals(True)
+        self._inspect_cb.setChecked(inspect_on)
+        self._inspect_cb.blockSignals(False)
+        self._toggle_inspect(inspect_on)
+        self._inspect_cb.toggled.connect(self._toggle_inspect)
+
+        if self._same_path_session and not self._auto_select_path:
+            self._auto_select_path = str(settings.value(keys.selected, "") or "")
+
+        self._restore_browser_layout()
+
+        if start_folder:
+            self._navigate_to(start_folder, restore_tree=self._same_path_session)
+        elif self._same_path_session and saved_dir and Path(saved_dir).is_dir():
+            self._navigate_to(saved_dir, restore_tree=True)
+
+        if self._pending_preview and self._file_data:
+            self._view_seg.setCurrentData(VIEW_PREVIEW)
+        self._pending_preview = False
 
     def selected_path(self) -> str:
         return self._selected_path
+
+    def _schedule_layout_save(self) -> None:
+        timer = getattr(self, "_layout_save_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _restore_browser_layout(self) -> None:
+        """Restore shared geometry + per-mode splitters / video table header."""
+        settings = browser_qsettings()
+        keys = self._keys
+        geo = load_shared_geometry(settings)
+        if geo is not None:
+            try:
+                self.restoreGeometry(geo)
+            except Exception:
+                pass
+
+        outer = parse_int_list(settings.value(keys.outer_split))
+        if outer is not None and len(outer) == 2 and all(s > 0 for s in outer):
+            self._outer_splitter.setSizes(outer)
+
+        content = parse_int_list(settings.value(keys.content_split))
+        if content is not None and self._meta_panel.isVisible():
+            if len(content) == 2 and content[0] > 0 and content[1] >= 0:
+                self._content_splitter.setSizes(content)
+
+        th = self._table.horizontalHeader()
+        header_state = settings.value(keys.header_state)
+        if header_state is not None:
+            try:
+                th.restoreState(header_state)
+                th.setStretchLastSection(False)
+                th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                for col in range(1, self._table.columnCount()):
+                    th.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            except Exception:
+                header_state = None
+        if header_state is None:
+            widths = parse_int_list(settings.value(keys.col_widths))
+            if widths is not None:
+                for i, w in enumerate(widths):
+                    if i == 0:
+                        continue
+                    if i < self._table.columnCount() and w >= 48:
+                        th.resizeSection(i, w)
+
+    def _save_browser_layout(self) -> None:
+        """Persist shared geometry + video-browser layout and session state."""
+        settings = browser_qsettings()
+        keys = self._keys
+        save_shared_geometry(self.saveGeometry(), settings)
+        settings.setValue(keys.outer_split, self._outer_splitter.sizes())
+        if self._meta_panel.isVisible():
+            settings.setValue(keys.content_split, self._content_splitter.sizes())
+        th = self._table.horizontalHeader()
+        settings.setValue(keys.header_state, th.saveState())
+        widths = [th.sectionSize(i) for i in range(self._table.columnCount())]
+        settings.setValue(keys.col_widths, widths)
+        settings.setValue(keys.inspect, self._inspect_cb.isChecked())
+        mode = self._view_seg.currentData() or VIEW_LIST
+        settings.setValue(keys.view, str(mode))
+        settings.setValue(
+            keys.last_browse,
+            str(self._last_browse_mode or VIEW_LIST),
+        )
+        directory = self._path_edit.text().strip()
+        if directory:
+            settings.setValue(keys.last_dir, normalize_dir(directory) or directory)
+        if self._selected_path:
+            settings.setValue(keys.selected, self._selected_path)
+        settings.setValue(keys.tree_expanded, collect_expanded_dirs(self._tree, self._fs_model))
+        settings.setValue(keys.tree_vscroll, tree_vscroll_value(self._tree))
+        settings.sync()
 
     def _make_vid_placeholder_icon(self) -> QIcon:
         pm = QPixmap(_SEQ_THUMB_ICON)
@@ -2707,8 +2905,10 @@ class VideoBrowserDialog(QDialog):
             return self._player
         from .player.sequence_player import SequencePlayer
 
+        # Cache budget is Preferences-only (same as sequence browser / 0.7.0).
         self._player = SequencePlayer(
-            show_cache_ui=True,
+            settings=browser_qsettings(),
+            show_cache_ui=False,
             prefer_gpu=True,
             parent=self._preview_page,
         )
@@ -2717,8 +2917,10 @@ class VideoBrowserDialog(QDialog):
 
     def _on_view_changed(self, _index: int) -> None:
         mode = self._view_seg.currentData()
+        settings = browser_qsettings()
         if mode == _VID_BROWSER_VIEW_PREVIEW:
-            QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_PREVIEW)
+            settings.setValue(self._keys.view, _VID_BROWSER_VIEW_PREVIEW)
+            settings.setValue(self._keys.last_browse, str(self._last_browse_mode or VIEW_LIST))
             self._view_stack.setCurrentIndex(2)
             self._load_preview_video()
             return
@@ -2727,12 +2929,14 @@ class VideoBrowserDialog(QDialog):
         if mode == _VID_BROWSER_VIEW_GRID:
             self._last_browse_mode = _VID_BROWSER_VIEW_GRID
             self._view_stack.setCurrentIndex(1)
-            QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_GRID)
+            settings.setValue(self._keys.view, _VID_BROWSER_VIEW_GRID)
+            settings.setValue(self._keys.last_browse, _VID_BROWSER_VIEW_GRID)
             self._queue_video_thumbnails()
         else:
             self._last_browse_mode = _VID_BROWSER_VIEW_LIST
             self._view_stack.setCurrentIndex(0)
-            QSettings().setValue(_VID_BROWSER_VIEW_KEY, _VID_BROWSER_VIEW_LIST)
+            settings.setValue(self._keys.view, _VID_BROWSER_VIEW_LIST)
+            settings.setValue(self._keys.last_browse, _VID_BROWSER_VIEW_LIST)
 
     def _load_preview_video(self) -> None:
         self._previewing = True
@@ -2751,17 +2955,7 @@ class VideoBrowserDialog(QDialog):
             self._stop_preview_playback(clear_only=True)
             return
 
-        ocio_cfg = None
-        src_cs = ""
-        host = self.parent()
-        if host is not None:
-            ocio_cfg = getattr(host, "_ocio_cfg", None)
-            src_btn = getattr(host, "src_btn", None)
-            if src_btn is not None and hasattr(src_btn, "current_space"):
-                try:
-                    src_cs = str(src_btn.current_space() or "")
-                except Exception:
-                    src_cs = ""
+        ctx = self._preview_ctx
 
         try:
             player = self._ensure_player()
@@ -2773,8 +2967,8 @@ class VideoBrowserDialog(QDialog):
         try:
             ok = player.load_video(
                 path,
-                ocio_cfg=ocio_cfg,
-                src_colorspace=src_cs,
+                ocio_cfg=ctx.ocio_cfg,
+                src_colorspace=ctx.src_colorspace or "",
             )
         except Exception as e:
             log.exception("Video preview load failed for %s", path)
@@ -2844,6 +3038,7 @@ class VideoBrowserDialog(QDialog):
         if not self._selected_path:
             return
         self._shutdown_player()
+        self._save_browser_layout()
         super().accept()
 
     def reject(self) -> None:
@@ -2851,11 +3046,13 @@ class VideoBrowserDialog(QDialog):
             self._view_seg.setCurrentData(self._last_browse_mode)
             return
         self._shutdown_player()
+        self._save_browser_layout()
         super().reject()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self._thumb_gen += 1
         self._shutdown_player()
+        self._save_browser_layout()
         super().closeEvent(event)
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
@@ -2876,16 +3073,31 @@ class VideoBrowserDialog(QDialog):
                     return True
         return super().eventFilter(obj, event)
 
-    def _navigate_to(self, directory: str) -> None:
+    def _navigate_to(self, directory: str, *, restore_tree: bool = False) -> None:
+        expand_path_chain(self._tree, self._fs_model, directory)
         idx = self._fs_model.index(directory)
         if idx.isValid():
             self._tree.setCurrentIndex(idx)
             self._tree.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
-            self._tree.expand(idx)
+        if restore_tree:
+            self._restore_tree_session(directory)
         self._path_edit.setText(directory)
         self._places.set_current_dir(directory)
         self._searchable_tree.set_search_root(directory)
         self._scan_directory(directory)
+
+    def _restore_tree_session(self, directory: str) -> None:
+        settings = browser_qsettings()
+        keys = self._keys
+        paths = parse_str_list(settings.value(keys.tree_expanded))
+        restore_tree_expanded(self._tree, self._fs_model, paths, focus_path=directory)
+        vscroll = settings.value(keys.tree_vscroll)
+        try:
+            scroll_val = int(vscroll) if vscroll is not None else -1
+        except (TypeError, ValueError):
+            scroll_val = -1
+        if scroll_val >= 0:
+            QTimer.singleShot(0, lambda v=scroll_val: set_tree_vscroll(self._tree, v))
 
     def _on_tree_clicked(self, index) -> None:
         path = self._fs_model.filePath(index)
@@ -3075,7 +3287,11 @@ class VideoBrowserDialog(QDialog):
         self._meta_panel.setVisible(checked)
         if checked:
             total = sum(sizes) if sum(sizes) > 0 else max(self._content_splitter.width(), 640)
-            self._content_splitter.setSizes([max(200, total - 260), 260])
+            meta_w = 260
+            saved = parse_int_list(browser_qsettings().value(self._keys.content_split))
+            if saved is not None and len(saved) == 2 and saved[1] >= 120:
+                meta_w = saved[1]
+            self._content_splitter.setSizes([max(200, total - meta_w), meta_w])
             rows = self._table.selectionModel().selectedRows()
             if rows:
                 self._show_metadata(rows[0].row())
@@ -3084,6 +3300,10 @@ class VideoBrowserDialog(QDialog):
                     if f.get("path") == self._selected_path:
                         self._show_metadata(row)
                         break
+        else:
+            total = sum(sizes) if sum(sizes) > 0 else max(self._content_splitter.width(), 640)
+            self._content_splitter.setSizes([total, 0])
+        self._schedule_layout_save()
 
     def _show_metadata(self, row: int) -> None:
         if row < 0 or row >= len(self._file_data):
@@ -4203,9 +4423,14 @@ class ConvertTab(QWidget):
             self.log_message.emit("Slate & overlay data updated")
 
     def _infer_fps_from_input(self) -> float:
-        """Return frame rate from the validated input. 0.0 if unavailable."""
-        if self._video_info is not None:
-            return self._video_info.fps
+        """Return frame rate from video probe or EXR→Video tab FPS control."""
+        if self._video_info is not None and self._video_info.fps > 0:
+            return float(self._video_info.fps)
+        if self.fps_widget is not None:
+            try:
+                return float(self.get_fps() or 0.0)
+            except Exception:
+                return 0.0
         return 0.0
 
     def _detect_input_resolution(self) -> tuple[int, int]:
@@ -4410,10 +4635,24 @@ class ConvertTab(QWidget):
         else:
             self._pick_output()
 
+    def _browser_preview_context(self) -> BrowserPreviewContext:
+        """OCIO/rate for browser Preview — explicit inject, not parent poking."""
+        fps = 24.0
+        try:
+            fps = float(self.get_fps() or 24.0)
+        except Exception:
+            fps = 24.0
+        return BrowserPreviewContext(
+            ocio_cfg=getattr(self, "_ocio_cfg", None),
+            src_colorspace=self.src_btn.current_space() if self.src_btn.is_valid() else "",
+            fps=fps if fps > 0 else 24.0,
+        )
+
     def _pick_input(self) -> None:
+        preview = self._browser_preview_context()
         if self._mode == "video2exr":
             start = self.input_path.text().strip() or str(Path.home())
-            dlg = VideoBrowserDialog(start, parent=self)
+            dlg = VideoBrowserDialog(start, parent=self, preview=preview)
             if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_path():
                 # Async probe — large MXFs must not freeze after Browse returns.
                 self.set_input_async(dlg.selected_path())
@@ -4422,7 +4661,7 @@ class ConvertTab(QWidget):
             sel_name = ""
             if self._input_seq is not None:
                 sel_name = self._input_seq.basename().rstrip("._")
-            dlg = SequenceBrowserDialog(start, select_name=sel_name, parent=self)
+            dlg = SequenceBrowserDialog(start, select_name=sel_name, parent=self, preview=preview)
             accepted = dlg.exec() == QDialog.DialogCode.Accepted
             # Prefer first-frame path so multi-sequence folders open the
             # row the user selected (directory alone always picks sorted[0]).
@@ -4513,22 +4752,10 @@ class ConvertTab(QWidget):
         """Guess the source colorspace from video codec/format and select it."""
         if self._mode != "video2exr":
             return
-        from ..core.video import guess_video_colorspace_candidates
+        from ..core.video import resolve_video_src_colorspace
 
-        candidates = guess_video_colorspace_candidates(video_path)
-        if not candidates:
-            return
-        ocio_cfg = getattr(self, "_ocio_cfg", None)
-        preferred = candidates[0]
-        if ocio_cfg is not None:
-            from ..core.ocio_utils import resolve_alias
-
-            for name in candidates:
-                resolved = resolve_alias(ocio_cfg, name)
-                if resolved:
-                    preferred = resolved
-                    break
-        if self.src_btn.try_select(preferred):
+        preferred = resolve_video_src_colorspace(video_path, getattr(self, "_ocio_cfg", None))
+        if preferred and self.src_btn.try_select(preferred):
             self.log_message.emit(f"Auto-detected source color space: {preferred}")
             self.src_btn.setStyleSheet("background-color: #3a3020;")
             QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
@@ -4589,17 +4816,30 @@ class ConvertTab(QWidget):
             self.dst_btn.setStyleSheet("background-color: #3a3020;")
             QTimer.singleShot(500, self, lambda: self.dst_btn.setStyleSheet(""))
 
-    def _auto_detect_colorspace(self, exr_dir: str) -> None:
-        """Probe or infer source colorspace for the loaded image sequence."""
+    def _auto_detect_colorspace(self, path_or_dir: str) -> None:
+        """Probe or infer source colorspace for the loaded image sequence.
+
+        *path_or_dir* should be the selected sequence's first frame when possible
+        (multi-seq folders: directory alone re-probes sorted[0]).
+        """
         if self._mode != "exr2video":
             return
-        from ..core.sequence import sequence_looks_scene_referred
+        from ..core.sequence import (
+            probe_pixel_colorspace,
+            sequence_looks_scene_referred,
+        )
 
-        cs = probe_exr_colorspace(exr_dir)
+        p = Path(path_or_dir)
+        if p.is_file():
+            cs = probe_pixel_colorspace(str(p))
+        else:
+            cs = probe_exr_colorspace(path_or_dir)
         if not cs:
             # Display-encoded stills (PNG/JPG/…) rarely carry OCIO tags — default sRGB.
+            # Use the *selected* path (file or dir), not the parent alone: mixed
+            # folders prefer EXR when probing a directory.
             try:
-                scene = sequence_looks_scene_referred(exr_dir)
+                scene = sequence_looks_scene_referred(path_or_dir)
             except Exception:
                 scene = True
             if scene:
@@ -4745,7 +4985,12 @@ class ConvertTab(QWidget):
             frames = list(result.get("frame_nums") or [])
             pad = "#" * seq.zfill()
             display = f"{seq.dirname()}{seq.basename()}{pad}{seq.extension()}"
-            actual = seq.dirname().rstrip("/") or path
+            # Identity-safe: first frame, not the parent directory alone.
+            try:
+                fs = sorted(seq.frameSet())
+                actual = str(seq.frame(fs[0])) if fs else (path or seq.dirname().rstrip("/"))
+            except Exception:
+                actual = path or seq.dirname().rstrip("/")
         else:
             return
 
@@ -4771,7 +5016,8 @@ class ConvertTab(QWidget):
         elif self._input_seq is not None:
             exr_dir = self._input_seq.dirname().rstrip("/")
             self._auto_fill_video_output(exr_dir)
-            self._auto_detect_colorspace(exr_dir)
+            # Probe the *selected* sequence (first frame), not sorted[0] in the dir.
+            self._auto_detect_colorspace(actual or exr_dir)
 
         self._persist_input_path(actual)
         self.log_message.emit(f"Input ready: {display}")
@@ -4851,12 +5097,11 @@ class ConvertTab(QWidget):
         else:
             exr_dir = self._input_seq.dirname().rstrip("/")
             self._auto_fill_video_output(exr_dir)
-            self._auto_detect_colorspace(exr_dir)
+            self._auto_detect_colorspace(self.get_input_path() or exr_dir)
 
-        # Persist the real filesystem path (not the display pattern) and flush
-        # so a hard kill does not leave an empty restore on next launch.
-        actual = path if self._video_info is not None else self._input_seq.dirname().rstrip("/")
-        self._persist_input_path(actual)
+        # Persist an identity-safe path: video file, or first frame of the
+        # selected sequence (directory alone always re-resolves to sorted[0]).
+        self._persist_input_path(self.get_input_path())
 
         self._emit_readiness()
         return True
@@ -4867,10 +5112,20 @@ class ConvertTab(QWidget):
             self._frame_range_edit.setText(self._full_input_range)
 
     def get_input_path(self) -> str:
-        """Return the validated filesystem path from the model, or ``""``."""
+        """Return the validated filesystem path from the model, or ``""``.
+
+        For image sequences returns the **first frame path** so multi-sequence
+        folders keep the user's selection through convert / slate / restore.
+        """
         if self._video_info is not None:
             return self._video_info.path
         if self._input_seq is not None:
+            try:
+                frames = sorted(self._input_seq.frameSet())
+                if frames:
+                    return str(self._input_seq.frame(frames[0]))
+            except Exception:
+                pass
             return self._input_seq.dirname().rstrip("/")
         return ""
 

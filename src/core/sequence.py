@@ -160,6 +160,43 @@ def probe_exr_colorspace(directory: str) -> str:
     return ""
 
 
+def resolve_sequence_src_colorspace(
+    filepath: str,
+    ocio_cfg: object | None,
+    preferred: str = "",
+) -> str:
+    """Return a **config-valid** source space for sequence preview.
+
+    Prefers *preferred* when it maps into *ocio_cfg*, else file attributes via
+    :func:`probe_pixel_colorspace` + :func:`~src.core.ocio_utils.find_equivalent_space`.
+    Never returns an unmapped probe tag (e.g. mangled ``lin_rec709``) when a
+    config is present — that would skip ``src→working`` and poison the player
+    cache. Without a config, returns preferred or the raw probe for display only.
+    """
+    from .constants import DEFAULT_SRC_E2V
+    from .ocio_utils import find_equivalent_space
+
+    preferred = (preferred or "").strip()
+    if ocio_cfg is None:
+        return preferred or (probe_pixel_colorspace(filepath) if filepath else "")
+
+    if preferred:
+        hit = find_equivalent_space(ocio_cfg, preferred)
+        if hit:
+            return hit
+    if filepath:
+        probed = probe_pixel_colorspace(filepath)
+        if probed:
+            hit = find_equivalent_space(ocio_cfg, probed)
+            if hit:
+                return hit
+    for fallback in (DEFAULT_SRC_E2V, "ACEScg", "ACES2065-1", "scene_linear"):
+        hit = find_equivalent_space(ocio_cfg, fallback)
+        if hit:
+            return hit
+    return ""
+
+
 def probe_exr_metadata(filepath: str) -> dict[str, str]:
     """Return a dict of human-readable image metadata from the first frame."""
     result: dict[str, str] = {}

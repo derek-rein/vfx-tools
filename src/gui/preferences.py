@@ -28,19 +28,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..services.app_settings import Keys
 from ..services.cache_prefs import (
     load_cache_budget_pct,
     save_cache_budget_pct,
     total_ram_bytes,
 )
 
-# QSettings keys
-PLAYER_MODE_KEY = "player/mode"
-PLAYER_PATH_KEY = "player/path"
-THUMBNAIL_FRAME_KEY = "slate/thumbnail_frame"
+# QSettings keys (canonical registry: app_settings.Keys)
+PLAYER_MODE_KEY = Keys.PLAYER_MODE
+PLAYER_PATH_KEY = Keys.PLAYER_PATH
+THUMBNAIL_FRAME_KEY = Keys.SLATE_THUMBNAIL_FRAME
 
+# Built-in SequencePlayer is the default for Open result (EXR → Video).
+PLAYER_MODE_BUILTIN = "builtin"
 PLAYER_MODE_SYSTEM = "system"
 PLAYER_MODE_CUSTOM = "custom"
+_PLAYER_MODES = frozenset({PLAYER_MODE_BUILTIN, PLAYER_MODE_SYSTEM, PLAYER_MODE_CUSTOM})
 
 # Integer prefs for which source frame becomes the slate thumbnail.
 THUMBNAIL_FRAME_FIRST = 0
@@ -54,9 +58,10 @@ THUMBNAIL_FRAME_CHOICES: tuple[tuple[int, str], ...] = (
 
 
 def player_mode(settings: QSettings) -> str:
-    mode = str(settings.value(PLAYER_MODE_KEY, PLAYER_MODE_SYSTEM) or PLAYER_MODE_SYSTEM)
-    if mode not in (PLAYER_MODE_SYSTEM, PLAYER_MODE_CUSTOM):
-        return PLAYER_MODE_SYSTEM
+    """Return preferred Open-result video player mode (default: built-in)."""
+    mode = str(settings.value(PLAYER_MODE_KEY, PLAYER_MODE_BUILTIN) or PLAYER_MODE_BUILTIN)
+    if mode not in _PLAYER_MODES:
+        return PLAYER_MODE_BUILTIN
     return mode
 
 
@@ -65,6 +70,8 @@ def player_path(settings: QSettings) -> str:
 
 
 def set_player_prefs(settings: QSettings, mode: str, path: str) -> None:
+    if mode not in _PLAYER_MODES:
+        mode = PLAYER_MODE_BUILTIN
     settings.setValue(PLAYER_MODE_KEY, mode)
     settings.setValue(PLAYER_PATH_KEY, path.strip())
 
@@ -118,7 +125,12 @@ def _is_macos_app_bundle(path: Path) -> bool:
 
 
 def open_video_with_player(path: str | Path, settings: QSettings) -> str:
-    """Open *path* with the user's preferred player.
+    """Open *path* with the user's preferred **external** player.
+
+    Handles ``system`` and ``custom`` modes only. For ``builtin``, the main
+    window should open :class:`~src.gui.player.player_window.SequencePlayerWindow`
+    (it needs a long-lived Qt parent/holder). Calling this with builtin falls
+    back to the system default handler.
 
     Returns a short status string suitable for the log / status bar.
     Falls back to the system default handler when custom is unset or fails.
@@ -137,6 +149,11 @@ def open_video_with_player(path: str | Path, settings: QSettings) -> str:
             # Fall through to system default so convert still "succeeds".
             _open_with_system_default(media)
             return f"custom player failed ({e}); opened with system default"
+
+    if mode == PLAYER_MODE_BUILTIN:
+        # Prefer MainWindow path; system default is a safe external fallback.
+        _open_with_system_default(media)
+        return "opened with system default (built-in unavailable here)"
 
     _open_with_system_default(media)
     return "opened with system default"
@@ -330,8 +347,8 @@ class PreferencesDialog(QDialog):
 
         hint = QLabel(
             "Used when <b>Open result</b> is checked after an EXR → video conversion. "
-            "Pick the system default, or point at any app/CLI player "
-            "(IINA, VLC, mpv, ffplay, …)."
+            "Default is the built-in player (same OCIO viewer as sequence Preview). "
+            "Or use the system default / a custom app (IINA, VLC, mpv, ffplay, …)."
         )
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.TextFormat.RichText)
@@ -339,6 +356,11 @@ class PreferencesDialog(QDialog):
         player_layout.addWidget(hint)
 
         self._mode_group = QButtonGroup(self)
+        self._builtin_radio = QRadioButton("Built-in player")
+        self._builtin_radio.setToolTip(
+            "Open the finished video in EXR Converter’s built-in SequencePlayer "
+            "(GPU OCIO display, cache strip, same transport as browser Preview)."
+        )
         self._system_radio = QRadioButton("System default")
         self._system_radio.setToolTip(
             "Open with the OS default application for this file type "
@@ -348,8 +370,10 @@ class PreferencesDialog(QDialog):
         self._custom_radio.setToolTip(
             "Launch a specific player app or executable with the output file."
         )
+        self._mode_group.addButton(self._builtin_radio)
         self._mode_group.addButton(self._system_radio)
         self._mode_group.addButton(self._custom_radio)
+        player_layout.addWidget(self._builtin_radio)
         player_layout.addWidget(self._system_radio)
         player_layout.addWidget(self._custom_radio)
 
@@ -399,10 +423,13 @@ class PreferencesDialog(QDialog):
         mode = player_mode(settings)
         if mode == PLAYER_MODE_CUSTOM:
             self._custom_radio.setChecked(True)
-        else:
+        elif mode == PLAYER_MODE_SYSTEM:
             self._system_radio.setChecked(True)
+        else:
+            self._builtin_radio.setChecked(True)
         self._path_edit.setText(player_path(settings))
         self._sync_custom_enabled()
+        self._builtin_radio.toggled.connect(self._sync_custom_enabled)
         self._system_radio.toggled.connect(self._sync_custom_enabled)
         self._custom_radio.toggled.connect(self._sync_custom_enabled)
 
@@ -495,13 +522,18 @@ class PreferencesDialog(QDialog):
             self._path_edit.setText(path)
 
     def _on_accept(self) -> None:
-        mode = PLAYER_MODE_CUSTOM if self._custom_radio.isChecked() else PLAYER_MODE_SYSTEM
+        if self._custom_radio.isChecked():
+            mode = PLAYER_MODE_CUSTOM
+        elif self._system_radio.isChecked():
+            mode = PLAYER_MODE_SYSTEM
+        else:
+            mode = PLAYER_MODE_BUILTIN
         path = self._path_edit.text().strip()
         if mode == PLAYER_MODE_CUSTOM and not path:
             QMessageBox.warning(
                 self,
                 "Preferences",
-                "Choose a custom player path, or switch to System default.",
+                "Choose a custom player path, or switch to Built-in / System default.",
             )
             return
         if mode == PLAYER_MODE_CUSTOM and path:

@@ -18,7 +18,9 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QKeySequence,
     QRegularExpressionValidator,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -229,8 +231,11 @@ def _exr_rgb_to_slate_authoring(
             import PyOpenColorIO as OCIO
 
             from ..core.ocio_utils import (
+                bridge_scene_rgb_to_config,
                 find_equivalent_space,
-                get_overlay_authoring_space,
+                get_app_anchor_config,
+                get_interchange_space,
+                get_internal_overlay_authoring_space,
                 get_working_space,
                 make_cpu_processor,
             )
@@ -250,14 +255,34 @@ def _exr_rgb_to_slate_authoring(
                 except Exception:
                     src = ""
             if src:
-                # Map aliases so "ACEScg" etc. resolve on ACES Studio configs.
                 resolved = find_equivalent_space(ocio_cfg, src) or src
-                auth = get_overlay_authoring_space(ocio_cfg)
-                if auth and resolved:
-                    cpu = make_cpu_processor(ocio_cfg, resolved, auth)
-                    h, w = arr.shape[:2]
-                    buf = np.ascontiguousarray(arr.copy(), dtype=np.float32)
-                    cpu.apply(OCIO.PackedImageDesc(buf, w, h, 3))
+                h, w = arr.shape[:2]
+                buf = np.ascontiguousarray(arr.copy(), dtype=np.float32)
+                # User media → AP0 on user config when possible, then app
+                # anchor AP0 → texture_paint (guaranteed sRGB for the slate).
+                user_ix = get_interchange_space(ocio_cfg)
+                anchor = get_app_anchor_config()
+                auth = get_internal_overlay_authoring_space()
+                anchor_ix = get_interchange_space(anchor)
+                if resolved and user_ix and anchor_ix and auth:
+                    if resolved != user_ix:
+                        make_cpu_processor(ocio_cfg, resolved, user_ix).apply(
+                            OCIO.PackedImageDesc(buf, w, h, 3)
+                        )
+                    # AP0 is interchangeable; finish on the app anchor.
+                    make_cpu_processor(anchor, anchor_ix, auth).apply(
+                        OCIO.PackedImageDesc(buf, w, h, 3)
+                    )
+                    return np.clip(buf, 0.0, 1.0)
+                if resolved and auth:
+                    # Fallback: try cross-config bridge or same-config transform.
+                    buf = bridge_scene_rgb_to_config(
+                        buf,
+                        src_config=ocio_cfg,
+                        src_space=resolved,
+                        dst_config=anchor,
+                        dst_space=auth,
+                    )
                     return np.clip(buf, 0.0, 1.0)
         except Exception:
             log.warning(
@@ -666,7 +691,7 @@ class SlateFormPanel(QWidget):
             return
         self._pushing_to_model = True
         try:
-            self._model.set_slate_enabled(bool(checked))
+            self._model.set_slate_enabled(bool(checked), record_undo=True)
         finally:
             self._pushing_to_model = False
         self.data_changed.emit(self.slate_data())
@@ -676,7 +701,7 @@ class SlateFormPanel(QWidget):
             return
         self._pushing_to_model = True
         try:
-            self._model.set_burnin_enabled(bool(checked))
+            self._model.set_burnin_enabled(bool(checked), record_undo=True)
         finally:
             self._pushing_to_model = False
         self.data_changed.emit(self.slate_data())
@@ -701,7 +726,7 @@ class SlateFormPanel(QWidget):
             return
         self._pushing_to_model = True
         try:
-            self._model.set_watermark_enabled(bool(checked))
+            self._model.set_watermark_enabled(bool(checked), record_undo=True)
         finally:
             self._pushing_to_model = False
         self.data_changed.emit(self.slate_data())
@@ -1049,6 +1074,32 @@ class SlateDialog(QDialog):
         self._form.data_changed.connect(lambda _: self._refresh_timer.start())
         self._model.changed.connect(self._on_model_section_changed)
 
+        # Document undo for slate toggles / fill — but never steal text-field undo.
+        stack = self._model.undo_stack
+
+        def _dispatch_undo() -> None:
+            from PySide6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit
+
+            w = QApplication.focusWidget()
+            if isinstance(w, (QLineEdit, QPlainTextEdit)):
+                w.undo()
+                return
+            stack.undo()
+
+        def _dispatch_redo() -> None:
+            from PySide6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit
+
+            w = QApplication.focusWidget()
+            if isinstance(w, (QLineEdit, QPlainTextEdit)):
+                w.redo()
+                return
+            stack.redo()
+
+        sc_u = QShortcut(QKeySequence.StandardKey.Undo, self)
+        sc_u.activated.connect(_dispatch_undo)
+        sc_r = QShortcut(QKeySequence.StandardKey.Redo, self)
+        sc_r.activated.connect(_dispatch_redo)
+
         QTimer.singleShot(0, self._apply_slate_visibility)
         QTimer.singleShot(0, self._on_form_refresh)
         QTimer.singleShot(0, self._player.fit_in_view)
@@ -1149,12 +1200,12 @@ class SlateDialog(QDialog):
         return self._working_space
 
     def _resolve_overlay_auth_space(self) -> str:
-        if self._ocio_cfg is None:
-            return SLATE_COLORSPACE
+        # App-authored paint always uses the anchor config's texture role —
+        # never the user's (possibly incomplete) show config.
         try:
-            from ..core.ocio_utils import get_overlay_authoring_space
+            from ..core.ocio_utils import get_internal_overlay_authoring_space
 
-            return get_overlay_authoring_space(self._ocio_cfg) or SLATE_COLORSPACE
+            return get_internal_overlay_authoring_space() or SLATE_COLORSPACE
         except Exception:
             log.exception("Could not resolve overlay authoring space")
             return SLATE_COLORSPACE

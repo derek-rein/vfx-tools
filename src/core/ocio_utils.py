@@ -572,13 +572,121 @@ def make_cpu_processor(config: OCIO.Config, src: str, dst: str) -> OCIO.CPUProce
     return config.getProcessor(src, dst).getDefaultCPUProcessor()
 
 
+# ---------------------------------------------------------------------------
+# App anchor config — guaranteed spaces for *internal* transforms
+# ---------------------------------------------------------------------------
+#
+# User configs (Nuke, $OCIO, show LUTs) are uncontrolled.  Anything the app
+# authors itself (slate / burn-in / watermark paint → scene-linear) must not
+# depend on them.  We keep a private ACES CG/Studio config as the **anchor**:
+#
+#   * texture_paint / sRGB authoring
+#   * aces_interchange → ACES2065-1 (AP0)
+#   * scene_linear → ACEScg
+#
+# Overlays are linearised on the anchor, then bridged into the user config's
+# compositing space via ``aces_interchange`` when the user config provides it
+# (same AP0 encoding by definition).  User src/dst convert still uses only
+# the user config.
+
+_app_anchor_config: OCIO.Config | None = None
+
+
+def get_app_anchor_config() -> OCIO.Config:
+    """Return a process-wide ACES config the app fully controls.
+
+    Preference order: OCIO CG built-in (lean, always in the library) → Studio
+    built-in → bundled Studio file → any recommended built-in.  Raises only if
+    the linked OpenColorIO cannot provide any ACES config (broken install).
+    """
+    global _app_anchor_config
+    if _app_anchor_config is not None:
+        return _app_anchor_config
+
+    preferred = (
+        "cg-config-v4.0.0_aces-v2.0_ocio-v2.5",
+        "cg-config-v2.2.0_aces-v1.3_ocio-v2.4",
+        "studio-config-v4.0.0_aces-v2.0_ocio-v2.5",
+        "studio-config-v2.2.0_aces-v1.3_ocio-v2.4",
+        "cg-config-latest",
+        "studio-config-latest",
+    )
+    for name in preferred:
+        try:
+            _app_anchor_config = OCIO.Config.CreateFromBuiltinConfig(name)
+            return _app_anchor_config
+        except Exception:
+            continue
+
+    # Bundled on-disk Studio (same family as library studio built-in).
+    try:
+        p = get_bundled_aces_studio_path()
+        if p is not None and p.is_file():
+            _app_anchor_config = _create_from_file(p)
+            return _app_anchor_config
+    except Exception:
+        pass
+
+    try:
+        for bname, _label, recommended in list_builtin_configs():
+            if not recommended:
+                continue
+            try:
+                _app_anchor_config = OCIO.Config.CreateFromBuiltinConfig(bname)
+                return _app_anchor_config
+            except Exception:
+                continue
+        for bname, _label, _rec in list_builtin_configs():
+            try:
+                _app_anchor_config = OCIO.Config.CreateFromBuiltinConfig(bname)
+                return _app_anchor_config
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "No OCIO app-anchor config available. OpenColorIO 2.5+ with ACES "
+        "built-ins is required for slate/overlay colour management."
+    )
+
+
+def _cs_name(config: OCIO.Config, name: str) -> str:
+    """Canonical colorspace name if *name* resolves, else ``\"\"``."""
+    if not name:
+        return ""
+    try:
+        cs = config.getColorSpace(name)
+        if cs is not None:
+            return cs.getName()
+    except Exception:
+        pass
+    return ""
+
+
+def get_interchange_space(config: OCIO.Config) -> str:
+    """Return ``aces_interchange`` / ACES2065-1 on *config*, or ``\"\"`` if absent."""
+    role = getattr(OCIO, "ROLE_INTERCHANGE_SCENE", "aces_interchange")
+    for name in (
+        role,
+        "aces_interchange",
+        "ACES2065-1",
+        "ACES - ACES2065-1",
+        "lin_ap0",
+    ):
+        hit = _cs_name(config, name)
+        if hit:
+            return hit
+    return ""
+
+
 def get_working_space(config: OCIO.Config) -> str:
     """Return the canonical name of the OCIO ``scene_linear`` role.
 
-    All compositing inside the conversion pipeline happens in this
-    scene-linear "working" colorspace.  Falls back to a few common
-    alternate role / colorspace names so this works on stock ACES,
-    Studio, and CG-Config builds.
+    Used for the **user** convert path (source → working → dest).  Falls back
+    to common alternate names.  For app-authored overlays prefer
+    :func:`get_app_anchor_config` + :func:`linearize_overlay` instead of
+    assuming this exists on an arbitrary show config.
     """
     candidates = (
         OCIO.ROLE_SCENE_LINEAR,
@@ -590,68 +698,39 @@ def get_working_space(config: OCIO.Config) -> str:
         "lin_rec709",
     )
     for name in candidates:
-        try:
-            cs = config.getColorSpace(name)
-            if cs is not None:
-                return cs.getName()
-        except Exception:
-            continue
+        hit = _cs_name(config, name)
+        if hit:
+            return hit
     raise RuntimeError("Could not resolve a scene-linear working colorspace from the OCIO config.")
 
 
 def get_compositing_space(config: OCIO.Config) -> str:
-    """Return the scene-linear space overlays are composited in.
+    """Scene-linear space used to alpha-over overlays onto user frames.
 
-    Slate / burn-in / watermark overlays are authored by QPainter in
-    display-encoded sRGB. To bake them onto frames we linearise them and
-    alpha-over in a scene-linear space. We deliberately prefer the widest
-    available scene-referred gamut — **ACES2065-1 (AP0)**, via the
-    ``aces_interchange`` role — so the user's footage is round-tripped through
-    a gamut that encloses all visible colour and the composite never clips or
-    shifts colours the user actually shot. Where overlay alpha is zero the
-    over is a no-op, so user pixels are preserved bit-for-bit.
-
-    Falls back to the config's ``scene_linear`` working space (e.g. ACEScg or
-    Linear Rec.709) for non-ACES configs that have no AP0 space.
+    Prefers **ACES2065-1** via ``aces_interchange`` when *config* has it (wide
+    gamut, matches app-anchor overlay linearisation).  Falls back to
+    ``scene_linear``.  Overlay **paint** linearisation itself always runs on
+    the app anchor — see :func:`linearize_overlay`.
     """
-    role = getattr(OCIO, "ROLE_INTERCHANGE_SCENE", "aces_interchange")
-    candidates = (
-        role,
-        "ACES2065-1",
-        "ACES - ACES2065-1",
-        "lin_ap0",
-        "aces2065_1",
-    )
-    for name in candidates:
-        try:
-            cs = config.getColorSpace(name)
-            if cs is not None:
-                return cs.getName()
-        except Exception:
-            continue
+    ix = get_interchange_space(config)
+    if ix:
+        return ix
     return get_working_space(config)
 
 
 def get_overlay_authoring_space(config: OCIO.Config) -> str:
-    """Return the colorspace overlays (slate / burnin / watermark) are painted in.
+    """sRGB-encoded paint space on *config* (roles first, then common names).
 
-    Overlays are authored in display-encoded sRGB (Qt's standard 8-bit
-    rendering).  We resolve this via OCIO **roles** first — the standard way
-    configs advertise their sRGB-encoded texture space:
-
-    * ``texture_paint`` — the semantically correct role for app-painted,
-      sRGB-encoded graphics (maps to ``sRGB - Texture`` in ACES configs);
-    * ``color_picking`` — the common sRGB fallback used by colour pickers.
-
-    Role names resolve through ``getColorSpace`` just like aliases.  If neither
-    role is present we fall back to common literal names, then the working
-    space.
+    For **internal** paint (slate / burn-in), call with
+    :func:`get_app_anchor_config` so the result is guaranteed.  User configs
+    may lack these roles.
     """
     texture_role = getattr(OCIO, "ROLE_TEXTURE_PAINT", "texture_paint")
     picking_role = getattr(OCIO, "ROLE_COLOR_PICKING", "color_picking")
     candidates = (
         texture_role,
         picking_role,
+        "sRGB Encoded Rec.709 (sRGB)",
         "sRGB - Texture",
         "sRGB Texture",
         "Utility - sRGB - Texture",
@@ -660,41 +739,160 @@ def get_overlay_authoring_space(config: OCIO.Config) -> str:
         "srgb",
     )
     for name in candidates:
-        try:
-            cs = config.getColorSpace(name)
-            if cs is not None:
-                return cs.getName()
-        except Exception:
-            continue
+        hit = _cs_name(config, name)
+        if hit:
+            return hit
     return get_working_space(config)
+
+
+def get_internal_overlay_authoring_space() -> str:
+    """Guaranteed sRGB paint space from the app anchor config."""
+    return get_overlay_authoring_space(get_app_anchor_config())
+
+
+def get_internal_interchange_space() -> str:
+    """Guaranteed ACES2065-1 (``aces_interchange``) from the app anchor config."""
+    anchor = get_app_anchor_config()
+    ix = get_interchange_space(anchor)
+    if not ix:
+        raise RuntimeError("App anchor OCIO config has no aces_interchange / ACES2065-1.")
+    return ix
+
+
+def _apply_rgb_processor(cpu: OCIO.CPUProcessor, rgb: np.ndarray) -> None:
+    """In-place RGB float32 HxWx3 via OCIO PackedImageDesc."""
+    h, w = rgb.shape[:2]
+    cpu.apply(OCIO.PackedImageDesc(rgb, w, h, 3))
+
+
+def bridge_scene_rgb_to_config(
+    rgb: np.ndarray,
+    *,
+    src_config: OCIO.Config,
+    src_space: str,
+    dst_config: OCIO.Config,
+    dst_space: str,
+) -> np.ndarray:
+    """Move scene-referred float RGB between configs via ``aces_interchange``.
+
+    When both configs define interchange (ACES2065-1), RGB is transformed to
+    AP0 on *src_config*, then from AP0 to *dst_space* on *dst_config*.  AP0
+    encodings are interchangeable by definition across ACES configs.
+
+    If either side lacks interchange, falls back to a same-config transform
+    when *src_config* is *dst_config*, or to an anchor-side path into a space
+    equivalent to *dst_space*.
+    """
+    import numpy as np
+
+    out = np.ascontiguousarray(rgb, dtype=np.float32)
+    if not src_space or not dst_space:
+        return out
+
+    src_ix = get_interchange_space(src_config)
+    dst_ix = get_interchange_space(dst_config)
+
+    # Fast path: already in the destination space on one shared config.
+    if src_config is dst_config and src_space == dst_space:
+        return out
+
+    if src_ix and dst_ix:
+        if src_space != src_ix:
+            _apply_rgb_processor(make_cpu_processor(src_config, src_space, src_ix), out)
+        # out is now AP0; dst_ix is also AP0 on the destination config.
+        if dst_space != dst_ix:
+            _apply_rgb_processor(make_cpu_processor(dst_config, dst_ix, dst_space), out)
+        return out
+
+    # Same config, no interchange — direct processor.
+    if src_config is dst_config:
+        _apply_rgb_processor(make_cpu_processor(src_config, src_space, dst_space), out)
+        return out
+
+    # Cross-config without shared interchange: try to finish on src_config
+    # into a space whose name exists on both, then stop (caller may only need
+    # encoding match for ACEScg / lin Rec.709).
+    dst_on_src = find_equivalent_space(src_config, dst_space) or _cs_name(src_config, dst_space)
+    if dst_on_src:
+        if src_space != dst_on_src:
+            _apply_rgb_processor(make_cpu_processor(src_config, src_space, dst_on_src), out)
+        return out
+
+    return out
 
 
 def linearize_overlay(
     config: OCIO.Config,
-    overlay_u8_rgba: np.ndarray,
+    overlay_rgba: np.ndarray,
     src_space: str = "",
     working_space: str = "",
 ) -> np.ndarray:
-    """Convert an sRGB-encoded RGBA overlay (uint8) into working-space float32.
+    """Convert sRGB-encoded RGBA overlay into user working-space float32.
 
-    Alpha is preserved unchanged (the OCIO transform only touches RGB).
+    Accepts ``uint8`` (0–255) or ``float32`` (0–1) RGBA.
+
+    **Always** linearises paint on the app anchor config (guaranteed
+    ``texture_paint`` → ``aces_interchange`` / ACES2065-1), then bridges into
+    the user *config*'s compositing space:
+
+    1. Anchor: authoring → AP0 (never uses the user config).
+    2. If the user config defines ``aces_interchange``, AP0 samples are valid
+       in that role (OCIO scene-referred interchange); transform
+       ``user_ix → working`` on the **user** config only when working is not
+       already interchange.
+    3. Else best-effort :func:`bridge_scene_rgb_to_config` (no silent name
+       equality across unrelated configs).
+
+    *config* is the **user** OCIO config.  *src_space* is ignored for the paint
+    step (call-site compatibility).  Alpha is preserved unchanged.
     """
     import numpy as np
 
-    if not src_space:
-        src_space = get_overlay_authoring_space(config)
-    if not working_space:
-        working_space = get_working_space(config)
+    anchor = get_app_anchor_config()
+    auth = get_overlay_authoring_space(anchor)
+    ap0 = get_interchange_space(anchor) or get_compositing_space(anchor)
 
-    rgb = overlay_u8_rgba[..., :3].astype(np.float32) / 255.0
+    arr = np.asarray(overlay_rgba)
+    if arr.dtype == np.uint8:
+        rgb = arr[..., :3].astype(np.float32) / 255.0
+        alpha = arr[..., 3].astype(np.float32) / 255.0
+    else:
+        rgb = np.clip(arr[..., :3].astype(np.float32), 0.0, None)
+        alpha = np.clip(arr[..., 3].astype(np.float32), 0.0, 1.0)
     rgb = np.ascontiguousarray(rgb)
-    h, w = rgb.shape[:2]
-    cpu = make_cpu_processor(config, src_space, working_space)
-    cpu.apply(OCIO.PackedImageDesc(rgb, w, h, 3))
 
-    out = np.empty(overlay_u8_rgba.shape, dtype=np.float32)
+    if not working_space:
+        try:
+            working_space = get_compositing_space(config)
+        except RuntimeError:
+            # Pathological user config — stay in anchor AP0.
+            working_space = ap0
+
+    # Canonical names on the user config (roles resolve to real spaces).
+    user_target = _cs_name(config, working_space) or working_space
+    user_ix = get_interchange_space(config)
+
+    # 1) App-owned: sRGB paint → AP0.
+    _apply_rgb_processor(make_cpu_processor(anchor, auth, ap0), rgb)
+
+    # 2) Bridge into user working / compositing space.
+    if user_ix and user_target:
+        # AP0 RGB is the aces_interchange encoding; identity when target is ix.
+        if user_target != user_ix:
+            _apply_rgb_processor(make_cpu_processor(config, user_ix, user_target), rgb)
+    elif user_target and user_target != ap0:
+        # No interchange on user config — try anchor→equivalent encoding.
+        rgb = bridge_scene_rgb_to_config(
+            rgb,
+            src_config=anchor,
+            src_space=ap0,
+            dst_config=config,
+            dst_space=user_target,
+        )
+
+    out = np.empty(arr.shape, dtype=np.float32)
     out[..., :3] = rgb
-    out[..., 3] = overlay_u8_rgba[..., 3].astype(np.float32) / 255.0
+    out[..., 3] = alpha
     return out
 
 
@@ -706,6 +904,118 @@ def list_displays(config: OCIO.Config) -> list[str]:
 def list_views(config: OCIO.Config, display: str) -> list[str]:
     """Return the view names available for *display*."""
     return list(config.getViews(display))
+
+
+def default_display_view(
+    config: OCIO.Config,
+    *,
+    color_space: str = "",
+) -> tuple[str, str]:
+    """Return ``(display, view)`` from the config defaults / viewing rules.
+
+    With *color_space*, uses OCIO 2 ``getDefaultView(display, colorSpace)`` so
+    viewing rules (e.g. ``Any Video`` vs ``Any Scene-linear``) pick the right
+    view. Without it, returns the config-wide default display/view.
+    """
+    display = ""
+    view = ""
+    try:
+        display = str(config.getDefaultDisplay() or "")
+    except Exception:
+        display = ""
+    if not display:
+        try:
+            names = list(config.getDisplays())
+            display = names[0] if names else ""
+        except Exception:
+            return "", ""
+    if color_space:
+        try:
+            # OCIO 2 overload: honour ViewingRules for this encoding/family.
+            view = str(config.getDefaultView(display, color_space) or "")
+        except Exception:
+            view = ""
+    if not view:
+        try:
+            view = str(config.getDefaultView(display) or "")
+        except Exception:
+            view = ""
+    return display, view
+
+
+# Color-space encodings that OCIO viewing rules treat as video (ACES CG/Studio).
+_VIDEO_ENCODINGS = frozenset(
+    {
+        "sdr-video",
+        "hdr-video",
+        "edr-video",
+        "display-linear",
+    }
+)
+
+
+def preferred_video_monitoring_view(
+    config: OCIO.Config,
+    display: str = "",
+) -> tuple[str, str]:
+    """Best-effort ``(display, view)`` for monitoring video-originated SDR.
+
+    Does **not** hard-code view names. Asks the config:
+
+    1. ``getDefaultView(display, colorSpace)`` for any colorspace whose
+       ``encoding`` is video-like (``sdr-video``, ``hdr-video``, …) — that is
+       how ACES configs route ``Any Video`` viewing rules to e.g.
+       ``Video (colorimetric)`` when present.
+    2. Else empty strings (caller keeps the config-wide default).
+
+    Unknown / older configs without encodings or the 2-arg API simply return
+    ``("", "")``.
+    """
+    if not display:
+        display, _ = default_display_view(config)
+    if not display:
+        return "", ""
+
+    try:
+        names = list(config.getColorSpaceNames())
+    except Exception:
+        return "", ""
+
+    # Prefer common Rec.709 display names first (stable across ACES configs),
+    # then any other video-encoded space — still only if the config defines them.
+    preferred_cs: list[str] = []
+    rest: list[str] = []
+    for name in names:
+        try:
+            cs = config.getColorSpace(name)
+            if cs is None:
+                continue
+            enc = (cs.getEncoding() or "").lower()
+        except Exception:
+            continue
+        if enc not in _VIDEO_ENCODINGS:
+            continue
+        low = name.lower()
+        if "rec.709" in low or "rec709" in low or "1886" in low:
+            preferred_cs.append(name)
+        else:
+            rest.append(name)
+
+    for cs_name in preferred_cs + rest:
+        try:
+            view = str(config.getDefaultView(display, cs_name) or "")
+        except Exception:
+            continue
+        if not view:
+            continue
+        # Only accept if that view is actually listed for this display.
+        try:
+            if view not in list(config.getViews(display)):
+                continue
+        except Exception:
+            continue
+        return display, view
+    return "", ""
 
 
 def make_display_processor(

@@ -38,15 +38,32 @@ def _decode_one_frame_dims(container) -> tuple[int, int]:
     return 0, 0
 
 
+def stream_fps(stream) -> float:
+    """Single clock for probe + preview decode (average → base → codec rate)."""
+    import av
+
+    for attr in ("average_rate", "base_rate", "guessed_rate"):
+        try:
+            rate = getattr(stream, attr, None)
+            if rate is not None and float(rate) > 0:
+                return float(rate)
+        except (AttributeError, TypeError, ValueError, av.error.FFmpegError):
+            continue
+    try:
+        rate = stream.codec_context.rate
+        if rate is not None and float(rate) > 0:
+            return float(rate)
+    except (AttributeError, TypeError, ValueError, av.error.FFmpegError):
+        pass
+    return 0.0
+
+
 def _stream_basics(stream) -> tuple[int, int, float, int, str, str]:
     """Pull (w, h, fps, n_frames, codec_name, pix_fmt) from a PyAV video stream."""
     import av
 
     w, h = _stream_dims(stream)
-    try:
-        fps = float(stream.average_rate) if stream.average_rate else 0.0
-    except (AttributeError, av.error.FFmpegError):
-        fps = 0.0
+    fps = stream_fps(stream)
     try:
         n_frames = stream.frames or 0
     except (AttributeError, av.error.FFmpegError):
@@ -231,6 +248,8 @@ def guess_video_colorspace_candidates(path: str) -> list[str]:
         codec = stream.codec_context.name
         pix_fmt = stream.codec_context.pix_fmt or ""
         color_trc = str(getattr(stream.codec_context, "color_trc", "") or "")
+        color_primaries = str(getattr(stream.codec_context, "color_primaries", "") or "")
+        color_space = str(getattr(stream.codec_context, "color_space", "") or "")
         meta = getattr(stream, "metadata", {}) or {}
         make = (meta.get("make") or meta.get("manufacturer") or "").lower()
         encoder = (meta.get("encoder") or "").lower()
@@ -239,31 +258,52 @@ def guess_video_colorspace_candidates(path: str) -> list[str]:
         return []
 
     is_10bit = "10" in pix_fmt or "12" in pix_fmt or "16" in pix_fmt
+    trc = color_trc.lower()
+    prim = color_primaries.lower()
+    csp = color_space.lower()
 
     # Apple Log (iPhone 15/16 Pro cinematic mode, ProRes Log) detection
     # The bundled ACES Studio config (and recent library studio configs) provide
     # "Apple Log" (with aliases) as an Input/Apple colorspace.
     apple_hint = (
         "apple" in (codec or "").lower()
-        or "apple" in color_trc.lower()
+        or "apple" in trc
         or "iphone" in make
         or "iphone" in encoder
         or "apple" in make
         or "apple" in encoder
     )
-    if "log" in color_trc.lower() or "log" in (codec or "").lower():
+    if "log" in trc or "log" in (codec or "").lower():
         if apple_hint:
             return ["Apple Log", "Cineon", "scene_linear"]
         return ["Cineon", "Apple Log", "scene_linear"]
-    if "linear" in color_trc.lower():
+    if "linear" in trc:
         return ["scene_linear"]
-    if "smpte2084" in color_trc.lower() or "2084" in color_trc:
-        return ["Output - Rec.2100-PQ"]
-    if "arib-std-b67" in color_trc.lower() or "hlg" in color_trc.lower():
-        return ["Output - Rec.2100-HLG"]
+    if "smpte2084" in trc or "2084" in trc or "pq" in trc:
+        return ["Output - Rec.2100-PQ", "Rec.2100-PQ - Display"]
+    if "arib-std-b67" in trc or "hlg" in trc:
+        return ["Output - Rec.2100-HLG", "Rec.2100-HLG - Display"]
 
     if codec == "ffv1" and is_10bit:
         return ["scene_linear"]
+
+    # BT.2020 primaries with SDR transfer → still often tagged Rec.709 TRC.
+    if "bt2020" in prim or "bt2020" in csp:
+        return [
+            "Output - Rec.2020",
+            "Rec.1886 Rec.2020 - Display",
+            "Output - Rec.709",
+            "sRGB - Display",
+        ]
+
+    # sRGB transfer / primaries (web / screen captures).
+    if "iec61966" in trc or "srgb" in trc or "srgb" in prim:
+        return [
+            "sRGB - Display",
+            "Output - sRGB",
+            "Output - Rec.709",
+            "Rec.1886 Rec.709 - Display",
+        ]
 
     return [
         "Output - Rec.709",
@@ -271,6 +311,38 @@ def guess_video_colorspace_candidates(path: str) -> list[str]:
         "Gamma 2.4 Rec.709 - Texture",
         "sRGB - Display",
     ]
+
+
+def resolve_video_src_colorspace(
+    path: str,
+    ocio_cfg: object | None,
+    preferred: str = "",
+) -> str:
+    """Return a config-valid source space for video preview / convert.
+
+    Prefers *preferred* (tab selection) when it maps into *ocio_cfg*, else
+    file metadata guesses, else ``DEFAULT_SRC_V2E``. Without a config, returns
+    *preferred* unchanged (or empty).
+    """
+    from .constants import DEFAULT_SRC_V2E
+    from .ocio_utils import find_equivalent_space
+
+    preferred = (preferred or "").strip()
+    if ocio_cfg is None:
+        return preferred
+
+    if preferred:
+        hit = find_equivalent_space(ocio_cfg, preferred)
+        if hit:
+            return hit
+
+    for name in (*guess_video_colorspace_candidates(path or ""), DEFAULT_SRC_V2E):
+        if not name:
+            continue
+        hit = find_equivalent_space(ocio_cfg, name)
+        if hit:
+            return hit
+    return ""
 
 
 _VIDEO_SUFFIXES = {

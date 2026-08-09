@@ -123,11 +123,13 @@ config version 2.5 cannot load on library 2.4. Fix: `make ensure-ocio` or
 
 ## Architecture notes agents should respect
 
-1. **Color pipeline** — Overlays (slate / burn-in / watermark) composite in a
-   scene-linear **working / compositing space** (prefer ACES2065-1 via
-   `aces_interchange`, else `scene_linear`), then OCIO to display for encode.
-   Do not “just paint in sRGB on top of linear” without going through the
-   existing helpers.
+1. **Color pipeline** — User src/dst convert uses the **active user config**
+   only. App-authored overlays (slate / burn-in / watermark) linearise on the
+   private **app anchor** OCIO config (`get_app_anchor_config()` — guaranteed
+   `texture_paint` + `aces_interchange` / ACES2065-1), then bridge into the
+   user compositing space via interchange when available
+   (`linearize_overlay`). Do not paint sRGB on linear without those helpers;
+   do not assume the user/Nuke config has sRGB or AP0.
 2. **Video I/O is PyAV** — encode/decode via FFmpeg libs bundled with the `av`
    wheel. **PyAV does not ship `ffplay`.** Do not assume system FFmpeg/ffplay
    exists on user machines. Playback after convert uses the user’s preferred
@@ -143,11 +145,14 @@ config version 2.5 cannot load on library 2.4. Fix: `make ensure-ocio` or
    full-res CPU `applyRGB` back on the playback hot path. Export remains CPU.
 5. **Generated resources** — edit `resources.qrc` / files under `resources/`, then
    `make resources`. Do not hand-edit `src/rc_resources.py`.
-6. **Presets / settings** — `QSettings` under org `VFXTools` / app `EXRConverter`.
-   Post-convert toggles: `ui/copy_path_after` (default **true**), `ui/open_after`,
-   `ui/show_folder_after`. **Open result:** video → external player prefs;
-   Video → EXR → built-in `SequencePlayerWindow`. Player prefs: `player/mode`
-   (`system`|`custom`), `player/path`.
+6. **Presets / settings / undo** — Prefer :class:`~src.services.app_settings.AppSettings`
+   (`get_app_settings()`) over ad-hoc `QSettings(APP_ORG, APP_NAME)`. Keys live in
+   `AppSettings.Keys` / domain modules. Layers: **app prefs** (player, cache,
+   post-convert), **session** (last paths/options), **convert presets** (versioned
+   JSON under AppData — no I/O paths), **slate document** (`SlateModel` + model-owned
+   `QUndoStack`; not convert paths/OCIO). Post-convert: `ui/copy_path_after` (default
+   **true**), `ui/open_after`, `ui/show_folder_after`. Open result: EXR→Video
+   `player/mode` (`builtin`|`system`|`custom`); Video→EXR uses built-in player window.
 7. **Nuitka** — Release builds strip many Qt modules (WebEngine, Svg, Pdf, …).
    Prefer PySide6-Essentials APIs already used in the tree. Bundle includes
    `resources/ocio` and package data for `av`, OIIO, OCIO, fileseq.

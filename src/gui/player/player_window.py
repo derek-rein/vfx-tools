@@ -20,8 +20,8 @@ _GEOMETRY_KEY = "ui/sequence_player_window_geometry"
 class SequencePlayerWindow(QDialog):
     """Non-modal window hosting :class:`SequencePlayer` with the cache strip.
 
-    Used for **Open result** after Video → EXR (and anywhere else we want a
-    full player outside the slate editor / browse dialog).
+    Used for **Open result** after Video → EXR (image sequences) and after
+    EXR → Video when Preferences selects the **built-in** player.
     """
 
     def __init__(
@@ -34,6 +34,7 @@ class SequencePlayerWindow(QDialog):
         fps: float = 24.0,
         parent: QWidget | None = None,
         title: str | None = None,
+        media_kind: str = "sequence",
     ) -> None:
         # parent=None so this is a true top-level window (not clipped / stacked
         # under the main window on multi-monitor setups).
@@ -57,8 +58,10 @@ class SequencePlayerWindow(QDialog):
             except Exception:
                 pass
 
-        label = title or Path(input_path).name or "Sequence Player"
-        self.setWindowTitle(f"Sequence Player — {label}")
+        kind = "video" if media_kind == "video" else "sequence"
+        prefix = "Video Player" if kind == "video" else "Sequence Player"
+        label = title or Path(input_path).name or prefix
+        self.setWindowTitle(f"{prefix} — {label}")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
@@ -81,9 +84,10 @@ class SequencePlayerWindow(QDialog):
             src_colorspace=src_colorspace,
             fps=fps,
             title=title,
+            media_kind=kind,
         )
         if not ok:
-            log.warning("Sequence player: no frames found for %s", input_path)
+            log.warning("Player: could not open %s (%s)", input_path, kind)
 
     def player(self) -> SequencePlayer:
         return self._player
@@ -96,14 +100,34 @@ class SequencePlayerWindow(QDialog):
         src_colorspace: str,
         fps: float,
         title: str | None,
+        media_kind: str = "sequence",
     ) -> bool:
-        label = title or Path(input_path).name or "Sequence Player"
-        self.setWindowTitle(f"Sequence Player — {label}")
+        kind = "video" if media_kind == "video" else "sequence"
+        prefix = "Video Player" if kind == "video" else "Sequence Player"
+        label = title or Path(input_path).name or prefix
+        self.setWindowTitle(f"{prefix} — {label}")
+
+        if kind == "video":
+            ok = self._player.load_video(
+                input_path,
+                fps=fps if fps > 0 else 0.0,
+                ocio_cfg=ocio_cfg,
+                src_colorspace=src_colorspace or "",
+            )
+            if ok:
+                self.setWindowTitle(f"{prefix} — {Path(input_path).name}")
+            else:
+                self.setWindowTitle(f"{prefix} — could not open ({label})")
+            return ok
+
+        # Open-result sequences after Video→EXR are linearized Rec.709 → ACEScg;
+        # prefer video-monitoring views so ACES RRT does not crush midtones.
         ok = self._player.load_sequence(
             input_path,
             fps=fps if fps > 0 else 24.0,
             ocio_cfg=ocio_cfg,
             src_colorspace=src_colorspace or "",
+            prefer_video_monitoring=True,
         )
         if ok:
             try:
@@ -112,11 +136,11 @@ class SequencePlayerWindow(QDialog):
                 _paths, name, frames, _pad, _seq = find_exr_sequence_info(input_path)
                 if name:
                     n = len(frames)
-                    self.setWindowTitle(f"Sequence Player — {name} ({n} frames)")
+                    self.setWindowTitle(f"{prefix} — {name} ({n} frames)")
             except Exception:
                 pass
         else:
-            self.setWindowTitle(f"Sequence Player — no frames ({label})")
+            self.setWindowTitle(f"{prefix} — no frames ({label})")
         return ok
 
     def reload(
@@ -127,14 +151,16 @@ class SequencePlayerWindow(QDialog):
         src_colorspace: str = "",
         fps: float = 24.0,
         title: str | None = None,
+        media_kind: str = "sequence",
     ) -> bool:
-        """Load a new sequence into this window (e.g. another convert finished)."""
+        """Load a new sequence or video into this window."""
         return self._load(
             input_path,
             ocio_cfg=ocio_cfg,
             src_colorspace=src_colorspace,
             fps=fps,
             title=title,
+            media_kind=media_kind,
         )
 
     def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]

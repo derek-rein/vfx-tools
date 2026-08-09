@@ -43,14 +43,33 @@ class TestPresetNameValidation:
 
 class TestPresetRoundTrip:
     def test_save_load_delete(self, preset_root):
-        path = presets_mod.save_preset("review_prores", {"codec": "prores", "fps": 24})
+        path = presets_mod.save_preset("review_prores", {"e2v_codec": "prores", "e2v_fps": 24})
         assert path.parent == preset_root.resolve()
         assert path.is_file()
         data = presets_mod.load_preset("review_prores")
-        assert data["codec"] == "prores"
+        assert data["e2v_codec"] == "prores"
+        assert data["schema_version"] == presets_mod.SCHEMA_VERSION
+        assert data["kind"] == "convert_preset"
         assert "review_prores" in presets_mod.list_presets()
         presets_mod.delete_preset("review_prores")
         assert "review_prores" not in presets_mod.list_presets()
+
+    def test_normalize_strips_paths(self):
+        data = presets_mod.normalize_preset(
+            {"v2e_src_space": "sRGB", "input": "/secret/path", "output": "/out"}
+        )
+        assert "input" not in data
+        assert "output" not in data
+        assert data["v2e_src_space"] == "sRGB"
+        assert data["schema_version"] == presets_mod.SCHEMA_VERSION
+
+    def test_legacy_load_gets_version(self, preset_root):
+        # Write pre-version flat file by hand
+        path = preset_root / "legacy.json"
+        path.write_text('{"e2v_codec": "h264"}', encoding="utf-8")
+        data = presets_mod.load_preset("legacy")
+        assert data["e2v_codec"] == "h264"
+        assert data["schema_version"] == presets_mod.SCHEMA_VERSION
 
     def test_save_rejects_traversal(self, preset_root):
         with pytest.raises(ValueError):

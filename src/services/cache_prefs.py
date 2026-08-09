@@ -13,9 +13,12 @@ import platform
 
 from PySide6.QtCore import QSettings
 
+from .app_settings import Keys
+
 DEFAULT_CACHE_BUDGET_PCT = 25
 DEFAULT_LOOKBACK_RATIO = 0.25  # 25% of prefetch window behind playhead
-SETTINGS_KEY_CACHE_BUDGET_PCT = "cache/budget_pct"
+# Re-export canonical key (single registry in app_settings.Keys).
+SETTINGS_KEY_CACHE_BUDGET_PCT = Keys.CACHE_BUDGET_PCT
 
 
 def _qsettings_int(settings: QSettings, key: str, default: int) -> int:

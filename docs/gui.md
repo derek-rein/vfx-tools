@@ -24,8 +24,8 @@ from a Read — see [nuke.md](./nuke.md).
 
 | Tab | Direction | Notes |
 |-----|-----------|--------|
-| **Video → EXR** | Decode video → OCIO → EXR sequence | **Ingest only** — never slate / burn-in / watermark (menu disabled on this tab). Output field uses ``name.####.exr``; that basename is written (not forced to the video stem). |
-| **EXR → Video** | Image sequence → OCIO → video | OpenEXR primary; also DPX, PNG, JPEG, WebP. Slate / burn-in / watermark available. Sequences must be ``name.####.ext`` (dot pad). |
+| **Video → EXR** | Decode video → OCIO → EXR sequence | **Ingest only** — never slate / burn-in / watermark. Output field uses ``name.####.exr``; that basename is written (not forced to the video stem). |
+| **EXR → Video** | Image sequence → OCIO → video | OpenEXR primary; also DPX, PNG, JPEG, WebP. Slate / burn-in / watermark via that tab’s controls. Sequences must be ``name.####.ext`` (dot pad). |
 
 Mode can be forced with `--mode video2exr|exr2video`, or inferred from `--open`
 (`auto`: image-sequence paths open **EXR → Video**, common video extensions open
@@ -53,25 +53,39 @@ an **sRGB** source color space; EXR/DPX default toward scene-linear / metadata.
 **Views:** the top bar has **List | Grid | Preview** plus **Inspect** (always
 available). **List** is the metadata table; **Grid** shows first-frame
 thumbnails (async OIIO downscale; EXR/DPX get a cheap display curve).
-**Preview** replaces the list/grid with an in-dialog player for the **first**
-sequence in the folder (typical VFX layout is one sequence per folder; if
-several exist, the first wins). Folder tree and path stay visible. Browser
-Preview uses the same GPU OCIO `SequencePlayer` as the slate editor (the GL
-widget is created with the dialog, before it is shown, so the window starts as
-an OpenGL surface). **Space** toggles Preview ↔ last list/grid mode; **Esc**
-leaves Preview; **Left/Right** step frames. Double-click or **Open** commits
-the selection into the convert tab. The slate editor reuses the player with
-live burn-in/watermark overlays.
+**Preview** plays the **currently selected** sequence (or the first listed row
+if nothing is selected). To preview another sequence, return to List/Grid,
+select it, then enter Preview again. Folder tree and path stay visible.
+Browser Preview uses the same GPU OCIO `SequencePlayer` as the slate editor
+(the GL widget is created with the dialog before show). **Space** toggles
+Preview ↔ last list/grid mode; **Esc** leaves Preview; **Left/Right** step
+frames. Double-click or **Open** commits the **selected** sequence via its
+**first-frame path** (not the folder alone), so multi-sequence directories keep
+the chosen basename through convert, restore, and slate. Typing only a
+directory still resolves to the preferred first sequence on disk (EXR, then
+DPX). The slate editor reuses the player with live burn-in/watermark overlays.
 
-Window size, splitter positions, list/grid mode, and list column widths are
-remembered in `QSettings` (`ui/sequence_browser_*`).
+**Browser layout memory** (both input browsers):
+
+| What | Shared or separate? | Keys |
+|------|---------------------|------|
+| Window size + position | **Shared** (Video ↔ Sequence) | `ui/browser_geometry` |
+| List \| Grid \| Preview, Inspect on/off, outer/content splitters, list column widths | **Per mode** | `ui/sequence_browser_*` / `ui/video_browser_*` |
+| Folder tree expansion, tree scroll, last folder + selection | **Per mode**, restored when Browse reopens the **same** start directory as last time | `…_tree_expanded`, `…_tree_vscroll`, `…_last_dir`, `…_selected` |
+
+If the convert tab’s current path maps to a **different** folder than the last
+browse session, layout prefs (size, splitters, view, Inspect, columns) still
+restore, but the tree focuses that new folder instead of replaying the previous
+expansion set.
 
 **Video browser** (Video → EXR input) mirrors the sequence browser with
 **List | Grid | Preview**. **Grid** shows first-frame video thumbnails (PyAV).
 **Preview** plays the selected file (or the first file in the folder) with the
-same player transport, cache strip, and OCIO controls. **Space** toggles
-Preview; **Esc** returns to list/grid. Folder path fields never expand the
-dialog when paths are long (text elides; width follows the layout).
+same player transport, cache strip, and OCIO controls. Video decode seeks to
+the previous keyframe then decodes forward to the exact frame (so scrubbing and
+play stay frame-accurate on long GOPs). **Space** toggles Preview; **Esc**
+returns to list/grid. Folder path fields never expand the dialog when paths are
+long (text elides; width follows the layout).
 
 ---
 
@@ -80,10 +94,26 @@ dialog when paths are long (text elides; width follows the layout).
 - Config picker: bundled **ACES Studio Config v4**, other built-ins, `$OCIO`, or
   a custom file. Incompatible Nuke/library configs may appear **greyed out** with
   a tooltip when the linked OpenColorIO cannot load them.
-- Source / destination spaces follow the active config; aliases are remapped
-  where possible (`find_equivalent_space`).
+- Source / destination spaces follow the **active (user) config**; aliases are
+  remapped where possible (`find_equivalent_space`).
+- **App-internal paint** (slate / burn-in / watermark) is linearised on a private
+  ACES **app anchor** config (CG/Studio built-in) with guaranteed `texture_paint`
+  and `aces_interchange` (ACES2065-1), then bridged into the user compositing
+  space via interchange when the user config provides it. Convert of *your*
+  footage still uses only the selected config.
 - Bundled ACES Studio needs **OpenColorIO 2.5+**. From source, run
   `make ensure-ocio` if OIIO rewired you to 2.4.
+
+---
+
+## Presets (`Presets` menu)
+
+Named **convert recipes** (JSON under app data) — color spaces, scale, codec key,
+EXR compression, OCIO source. **Not** included: input/output paths, window
+geometry, player/cache prefs, or full slate text (slate fields still use last
+session via Preferences / QSettings).
+
+Files are versioned (`schema_version`); older presets still load.
 
 ---
 
@@ -123,16 +153,16 @@ Checkboxes under the convert actions (persisted in `QSettings`):
 | Toggle | Default | Action |
 |--------|---------|--------|
 | **Copy path** | on | Copy the output path to the clipboard |
-| **Open result** | off | **EXR → Video:** open the finished file with the preferred video player (Preferences). **Video → EXR:** open the sequence in a built-in player window (GPU OCIO when available, with the playback cache strip). |
+| **Open result** | off | **EXR → Video:** open the finished file with the preferred video player (Preferences; default **built-in**). **Video → EXR:** open the sequence in the built-in player window (GPU OCIO when available, with the playback cache strip). |
 | **Show in folder** | off | Reveal the file or sequence folder in the OS file manager |
 
 ### Preferences (`File → Preferences…`)
 
 | Setting | Purpose |
 |---------|---------|
-| **Video player** | System default, or a custom app/CLI path (IINA, VLC, mpv, …). Used by **Open result** for video output. |
+| **Video player** | **Built-in player** (default), **System default**, or a **custom** app/CLI path (IINA, VLC, mpv, …). Used by **Open result** after EXR → Video. Built-in uses the same `SequencePlayer` as sequence Preview (GPU OCIO + cache strip). |
 | **Slate thumbnail frame** | First / middle / last frame of the EXR sequence for the slate still |
-| **Playback cache budget** | % of system RAM for decoded sequence frames (slate, browser Preview, post-convert sequence player) |
+| **Playback cache budget** | % of system RAM for decoded frames (slate, browser Preview, post-convert built-in player) |
 
 Settings org/app: `QSettings("VFXTools", "EXRConverter")`.
 
@@ -151,6 +181,16 @@ Opened from **EXR → Video** when editing slate / burn-in / watermark.
   Falls back to CPU OCIO if OpenGL is unavailable. Export is unchanged.
 - **Overlays:** burn-in and watermark are composited in scene-linear working
   space so the preview matches the convert path.
+- **Undo:** ⌘/Ctrl+Z and Shift+⌘/Ctrl+Z undo/redo **feature toggles** and
+  **Fill from slate** (burn-in bulk fill). Free-text / spinner edits still
+  persist live without stacking one undo step per keystroke. Convert paths
+  and OCIO are outside the undo stack.
+- **Video monitoring view:** for video Preview and Video→EXR **Open result**,
+  the player asks the OCIO config for a view via viewing rules / video encodings
+  (``getDefaultView(display, videoColorSpace)``) when available — e.g. ACES
+  configs often resolve that to a colorimetric video view. If the config has no
+  such rule, the config-wide default display/view is kept. Scene-linear camera
+  EXR in the slate editor always uses the config default.
 
 ---
 

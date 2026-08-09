@@ -434,24 +434,31 @@ def resolve_v2e_spaces(cfg, args: argparse.Namespace, log) -> tuple[str, str]:
     """Source/destination for video→EXR, with auto-detect when omitted."""
     src_arg = args.src
     if src_arg is None:
-        # Probe the file the way the GUI does.
+        # Same probe ranking as GUI preview / tab auto-detect.
         try:
-            from .core.video import guess_video_colorspace_candidates
+            from .core.video import resolve_video_src_colorspace
 
-            guesses = guess_video_colorspace_candidates(args.input)
+            resolved = resolve_video_src_colorspace(args.input, cfg, preferred="")
         except Exception:
-            guesses = []
-        fallbacks = list(guesses) + [
-            DEFAULT_SRC_V2E,
-            "Rec.1886 Rec.709 - Display",
-            "sRGB Encoded Rec.709 (sRGB)",
-            "sRGB - Display",
-            "sRGB",
-            "rec709",
-        ]
-        src = _resolve_space(cfg, None, fallbacks=fallbacks, role="color_picking", log=log)
-        if guesses:
+            resolved = ""
+        if resolved:
+            src = resolved
             log(f"Auto-detected source color space: {src}")
+        else:
+            src = _resolve_space(
+                cfg,
+                None,
+                fallbacks=[
+                    DEFAULT_SRC_V2E,
+                    "Rec.1886 Rec.709 - Display",
+                    "sRGB Encoded Rec.709 (sRGB)",
+                    "sRGB - Display",
+                    "sRGB",
+                    "rec709",
+                ],
+                role="color_picking",
+                log=log,
+            )
     else:
         src = _resolve_space(
             cfg,
@@ -489,10 +496,15 @@ def resolve_e2v_spaces(cfg, args: argparse.Namespace, log) -> tuple[str, str]:
     if src_arg is None:
         probed = ""
         try:
-            # Prefer directory for probe.
+            from .core.sequence import probe_pixel_colorspace
+
             p = Path(args.input)
-            probe_dir = str(p if p.is_dir() else p.parent)
-            probed = probe_exr_colorspace(probe_dir) or ""
+            if p.is_file():
+                # Frame path: probe *this* sequence, not sorted[0] in the folder.
+                probed = probe_pixel_colorspace(str(p)) or ""
+            else:
+                probe_dir = str(p if p.is_dir() else p.parent)
+                probed = probe_exr_colorspace(probe_dir) or ""
         except Exception:
             probed = ""
         if scene_linear:
