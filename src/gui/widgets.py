@@ -1365,6 +1365,42 @@ def _configure_path_line_edit(edit: QLineEdit) -> None:
     edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
 
+class _ElidingLabel(QLabel):
+    """Status/footer label that elides long text instead of forcing layout width.
+
+    Plain ``QLabel`` uses the full text for ``sizeHint``, which expands dialogs
+    when the status line contains a long path. This widget ignores content
+    width and shows an elided string (middle ellipsis) for the current width.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self.setMinimumWidth(40)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setWordWrap(False)
+
+    def setText(self, text: str | None) -> None:  # type: ignore[override]
+        self._full_text = str(text or "")
+        # Full text on hover when truncated.
+        self.setToolTip(self._full_text if len(self._full_text) > 24 else "")
+        self._apply_elide()
+
+    def text(self) -> str:  # type: ignore[override]
+        return self._full_text
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        fm = self.fontMetrics()
+        w = max(1, self.width() - 2)
+        elided = fm.elidedText(self._full_text, Qt.TextElideMode.ElideMiddle, w)
+        # Bypass our setText to avoid recursion / clearing tooltip.
+        QLabel.setText(self, elided)
+
+
 _SEQ_BROWSER_GEOMETRY_KEY = "ui/sequence_browser_geometry"
 _SEQ_BROWSER_OUTER_SPLIT_KEY = "ui/sequence_browser_outer_splitter"
 _SEQ_BROWSER_CONTENT_SPLIT_KEY = "ui/sequence_browser_content_splitter"
@@ -1635,7 +1671,7 @@ class SequenceBrowserDialog(QDialog):
 
         # Footer: status + Open/Cancel (mode is the List|Grid|Preview segment)
         bottom_row = QHBoxLayout()
-        self._status = QLabel()
+        self._status = _ElidingLabel()
         self._status.setStyleSheet(STATUS_DIM)
         bottom_row.addWidget(self._status, 1)
         buttons = QDialogButtonBox(
@@ -1645,6 +1681,8 @@ class SequenceBrowserDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Open)
         self._ok_btn.setEnabled(False)
+        # Fixed-size button row so long status cannot push buttons off-screen.
+        buttons.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         bottom_row.addWidget(buttons)
         layout.addLayout(bottom_row)
 
@@ -2597,7 +2635,7 @@ class VideoBrowserDialog(QDialog):
         right_layout.addWidget(self._content_splitter, 1)
 
         bottom_row = QHBoxLayout()
-        self._status = QLabel()
+        self._status = _ElidingLabel()
         self._status.setStyleSheet(STATUS_DIM)
         bottom_row.addWidget(self._status, 1)
         buttons = QDialogButtonBox(
@@ -2607,6 +2645,7 @@ class VideoBrowserDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Open)
         self._ok_btn.setEnabled(False)
+        buttons.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         bottom_row.addWidget(buttons)
         right_layout.addLayout(bottom_row)
 
