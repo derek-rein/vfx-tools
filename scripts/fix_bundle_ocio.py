@@ -199,7 +199,7 @@ def _linux_fix(ext: Path, src_ext: Path, src_lib: Path) -> None:
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
 
-    print(f"fix_bundle_ocio: Linux — ensured {plain}")
+    print(f"fix_bundle_ocio: Linux - ensured {plain}")
 
 
 def _windows_copy_dll(src: Path, dests: list[Path]) -> None:
@@ -211,7 +211,7 @@ def _windows_copy_dll(src: Path, dests: list[Path]) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         written.add(dest)
-        print(f"fix_bundle_ocio: Windows — copied {dest}")
+        print(f"fix_bundle_ocio: Windows - copied {dest}")
 
 
 def _windows_materialize_ocio24(work_dir: Path) -> Path:
