@@ -15,6 +15,16 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.9.1] — 2026-08-10
+
+### Fixed
+
+- **Windows R3D bridge build:** compile/link the RED bridge with `/MD` so it
+  matches `R3DSDK-*-MD.lib` (fixes LNK2038 RuntimeLibrary mismatch and unresolved
+  CRT imports on GitHub Actions Release).
+
+---
+
 ## [0.9.0] — 2026-08-10
 
 ### Added
@@ -552,7 +562,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/derek-rein/exr-converter/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/derek-rein/exr-converter/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/derek-rein/exr-converter/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/derek-rein/exr-converter/compare/v0.8.0...v0.8.1

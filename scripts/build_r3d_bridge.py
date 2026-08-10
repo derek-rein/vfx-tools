@@ -132,11 +132,16 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
 
     system = platform.system()
     if system == "Windows":
-        # Expect cl.exe on PATH (Developer Command Prompt).
+        # Expect cl.exe on PATH (Developer Command Prompt / msvc-dev-cmd).
+        # Must match the RED static lib CRT: R3DSDK-*-MD.lib → /MD (DLL runtime).
+        # Without explicit /MD, some CI images default to /MT and LNK2038.
+        # Prefer /Fo + /Fe into out_dir so intermediates stay out of the source tree.
+        obj = out_dir / "r3d_bridge.obj"
         cmd = [
             "cl.exe",
             "/nologo",
             "/O2",
+            "/MD",
             "/EHsc",
             "/std:c++17",
             f"/I{include}",
@@ -145,7 +150,8 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
             "/LD",
             str(SRC),
             str(static),
-            f"/Fe:{out_lib}",
+            f"/Fo{obj}",
+            f"/Fe{out_lib}",
         ]
     else:
         cxx = os.environ.get("CXX", "c++")
