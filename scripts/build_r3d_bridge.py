@@ -192,8 +192,9 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
         shutil.rmtree(dest_redist)
     shutil.copytree(redistrib_src, dest_redist)
 
+    # ASCII-only logs: Windows CI runners often use cp1252 and choke on arrows.
     print(f"Built {out_lib}")
-    print(f"Redistributables → {dest_redist}")
+    print(f"Redistributables -> {dest_redist}")
     print(f"SDK version root: {sdk}")
     return out_lib
 
