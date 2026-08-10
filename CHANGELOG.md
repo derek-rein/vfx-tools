@@ -15,6 +15,23 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.9.3] — 2026-08-10
+
+### Added
+
+- **Nuke-style path paste:** Pasting ``name.####.exr`` (or ``%04d``) into the
+  EXR → Video input field resolves the sequence, frame range, and source color
+  space the same way as Browse. In the sequence/video browser Folder field,
+  paste navigates to the parent folder, selects the matching item, and switches
+  to Preview so **Open** is ready.
+
+### Fixed
+
+- **R3D redistributable packaging:** skip macOS AppleDouble (``._*``) junk when
+  copying RED Redistributable libraries so Linux `strip` does not fail in CI.
+
+---
+
 ## [0.9.2] — 2026-08-10
 
 ### Fixed
@@ -571,7 +588,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/derek-rein/exr-converter/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/derek-rein/exr-converter/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/derek-rein/exr-converter/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/derek-rein/exr-converter/compare/v0.8.2...v0.9.0

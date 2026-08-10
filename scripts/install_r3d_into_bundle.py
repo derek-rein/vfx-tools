@@ -77,10 +77,18 @@ def install(target: Path, build_dir: Path = BUILD) -> Path | None:
 
     shutil.copy2(bridge, dest / bridge.name)
     for item in redist.iterdir():
+        if item.name.startswith("._") or item.name in {".DS_Store", "Thumbs.db"}:
+            continue
         if item.is_file():
             shutil.copy2(item, dest / item.name)
         elif item.is_dir():
-            shutil.copytree(item, dest / item.name)
+            shutil.copytree(
+                item,
+                dest / item.name,
+                ignore=lambda _d, names: {
+                    n for n in names if n.startswith("._") or n in {".DS_Store", "Thumbs.db"}
+                },
+            )
 
     print(f"Installed R3D runtime → {dest}")
     return dest

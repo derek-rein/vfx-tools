@@ -23,6 +23,15 @@ _DOT_FRAME_PATTERN = re.compile(
     r"^(?P<name>.+)\.(?P<frame>\d+)\.(?P<ext>[A-Za-z0-9]+)$",
     re.IGNORECASE,
 )
+# Nuke / CLI paste: ``name.####.exr``, ``name_####.exr``, ``name.%04d.exr``.
+_SEQ_HASH_PAD = re.compile(
+    r"^(?P<head>.+?)(?P<sep>[._])(?P<pad>#+)\.(?P<ext>[A-Za-z0-9]+)$",
+    re.IGNORECASE,
+)
+_SEQ_PRINTF_PAD = re.compile(
+    r"^(?P<head>.+?)(?P<sep>[._])%0?(?P<width>\d*)d\.(?P<ext>[A-Za-z0-9]+)$",
+    re.IGNORECASE,
+)
 
 
 def is_dot_frame_sequence(seq: fileseq.FileSequence) -> bool:
@@ -154,6 +163,52 @@ def _pick_default_sequence(
 
 # Back-compat alias used by older call sites / tests.
 _find_exr_seqs = _find_image_seqs
+
+
+def sequence_pattern_stem(filename: str) -> str | None:
+    """Return the sequence stem for a Nuke-style pattern filename, or ``None``.
+
+    Examples::
+
+        ``chs_010.####.exr`` → ``chs_010``
+        ``chs_010_####.exr`` → ``chs_010``
+        ``plate.%04d.exr`` → ``plate``
+        ``plate.1001.exr`` → ``plate`` (numeric frame token)
+    """
+    name = Path(filename).name
+    m = _SEQ_HASH_PAD.match(name)
+    if m:
+        return m.group("head")
+    m = _SEQ_PRINTF_PAD.match(name)
+    if m:
+        return m.group("head")
+    m = _DOT_FRAME_PATTERN.match(name)
+    if m and not Path(filename).is_file():
+        # Only treat as a pattern when the path is not a real single frame.
+        return m.group("name")
+    return None
+
+
+def looks_like_sequence_pattern(path: str) -> bool:
+    """True when *path* looks like ``name.####.ext`` (may not exist on disk)."""
+    raw = (path or "").strip()
+    if not raw:
+        return False
+    return sequence_pattern_stem(Path(raw).name) is not None
+
+
+def _match_seq_by_stem(
+    seqs: list[fileseq.FileSequence],
+    stem: str,
+) -> fileseq.FileSequence | None:
+    """Pick the sequence whose basename (sans trailing ``.``/``_``) equals *stem*."""
+    stem = (stem or "").strip()
+    if not stem:
+        return None
+    exact = [s for s in seqs if s.basename().rstrip("._") == stem]
+    if exact:
+        return exact[0]
+    return None
 
 
 def probe_pixel_colorspace(filepath: str) -> str:
@@ -337,23 +392,44 @@ def scan_exr_sequences(directory: str) -> list[dict]:
     return results
 
 
+def _scan_dir_and_pattern(
+    input_path: str,
+) -> tuple[Path, str, str | None]:
+    """Return ``(path_obj, scan_dir, pattern_stem_or_None)`` for open resolution.
+
+    Accepts real files/dirs and non-existent Nuke patterns like
+    ``/show/shot.####.exr`` (parent must exist).
+    """
+    raw = (input_path or "").strip()
+    if not raw:
+        raise RuntimeError("Empty sequence path")
+    p = Path(raw).expanduser()
+    if p.is_file() or p.is_dir():
+        scan_dir = str(p.parent) if p.is_file() else str(p)
+        return p, scan_dir, None
+    # Non-existent path: may be a #### / %04d pattern whose parent exists.
+    parent = p.parent
+    if parent.is_dir():
+        stem = sequence_pattern_stem(p.name)
+        if stem is not None:
+            return p, str(parent), stem
+        # Parent exists but name is not a pattern (typo / missing file).
+        raise RuntimeError(f"Path does not exist: {input_path}")
+    raise RuntimeError(f"Path does not exist: {input_path}")
+
+
 def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
     """Resolve *input_path* to an ordered list of image file paths + a basename.
 
     *input_path* may be:
     - a directory  → scan for supported image sequences, pick preferred (EXR first)
     - a single frame file → scan its parent dir, find the sequence it belongs to
+    - a Nuke-style pattern (``name.####.ext`` / ``name_%04d.ext``) → match by stem
 
     Supported extensions: see :data:`IMAGE_SEQUENCE_EXTS` (``.exr``, ``.dpx``,
     ``.png``, ``.jpg`` / ``.jpeg``, ``.webp``).
     """
-    p = Path(input_path)
-    if p.is_file():
-        scan_dir = str(p.parent)
-    elif p.is_dir():
-        scan_dir = str(p)
-    else:
-        raise RuntimeError(f"Path does not exist: {input_path}")
+    p, scan_dir, pattern_stem = _scan_dir_and_pattern(input_path)
 
     seqs = _find_image_seqs(scan_dir)
     if not seqs:
@@ -374,7 +450,15 @@ def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
             return [str(p)], p.stem
         raise RuntimeError(f"Not a supported image sequence frame: {p.name}")
 
-    seq = _pick_default_sequence(seqs, scan_dir)
+    if pattern_stem is not None:
+        matched = _match_seq_by_stem(seqs, pattern_stem)
+        if matched is None:
+            raise RuntimeError(
+                f"No sequence matching {p.name!r} in {scan_dir} (looked for stem {pattern_stem!r})"
+            )
+        seq = matched
+    else:
+        seq = _pick_default_sequence(seqs, scan_dir)
     fs = seq.frameSet()
     if not fs:
         raise RuntimeError(f"Image sequence has no frames in {scan_dir}")
@@ -388,14 +472,11 @@ def find_exr_sequence_info(
     """Like find_exr_sequence but also returns frame numbers, padding, and the FileSequence.
 
     Returns (paths, basename, sorted_frame_nums, pad_width, file_sequence).
+
+    Accepts directories, real frame files, and Nuke-style ``####`` / ``%04d``
+    patterns whose parent directory exists.
     """
-    p = Path(input_path)
-    if p.is_file():
-        scan_dir = str(p.parent)
-    elif p.is_dir():
-        scan_dir = str(p)
-    else:
-        raise RuntimeError(f"Path does not exist: {input_path}")
+    p, scan_dir, pattern_stem = _scan_dir_and_pattern(input_path)
 
     seqs = _find_image_seqs(scan_dir)
     if not seqs:
@@ -417,6 +498,12 @@ def find_exr_sequence_info(
         if seq is None and is_image_sequence_ext(p.suffix):
             # Build a one-frame sequence for an isolated still.
             seq = fileseq.FileSequence(str(p))
+    elif pattern_stem is not None:
+        seq = _match_seq_by_stem(seqs, pattern_stem)
+        if seq is None:
+            raise RuntimeError(
+                f"No sequence matching {p.name!r} in {scan_dir} (looked for stem {pattern_stem!r})"
+            )
     if seq is None:
         seq = _pick_default_sequence(seqs, scan_dir)
 

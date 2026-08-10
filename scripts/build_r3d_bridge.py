@@ -187,10 +187,20 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
     subprocess.check_call(cmd)
 
     # Copy only Redistributable dynamic libraries (allowed by RED license).
+    # Skip macOS AppleDouble (._*) / .DS_Store junk that can ride along in tarballs
+    # and break Linux `strip` in packaging.
     dest_redist = out_dir / "redistributable"
     if dest_redist.exists():
         shutil.rmtree(dest_redist)
-    shutil.copytree(redistrib_src, dest_redist)
+
+    def _ignore_junk(_dir: str, names: list[str]) -> set[str]:
+        return {n for n in names if n.startswith("._") or n in {".DS_Store", "Thumbs.db"}}
+
+    shutil.copytree(redistrib_src, dest_redist, ignore=_ignore_junk)
+    # Also drop any junk already nested if ignore missed something.
+    for p in dest_redist.rglob("*"):
+        if p.name.startswith("._") or p.name in {".DS_Store", "Thumbs.db"}:
+            p.unlink(missing_ok=True)
 
     # ASCII-only logs: Windows CI runners often use cp1252 and choke on arrows.
     print(f"Built {out_lib}")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -1882,6 +1883,7 @@ class SequenceBrowserDialog(QDialog):
         self._grid.itemDoubleClicked.connect(self._on_grid_double_clicked)
         self._grid.customContextMenuRequested.connect(self._on_grid_context_menu)
         self._path_edit.returnPressed.connect(self._on_path_entered)
+        self._path_edit.installEventFilter(self)
         # Space → preview (table/grid eat key presses; filter their viewports).
         self._table.installEventFilter(self)
         self._table.viewport().installEventFilter(self)
@@ -1941,11 +1943,26 @@ class SequenceBrowserDialog(QDialog):
 
         start_folder = ""
         if start_dir:
+            from ..core.sequence import looks_like_sequence_pattern, sequence_pattern_stem
+
             d = Path(start_dir)
             if d.is_file():
                 # First-frame path from convert tab — open its parent folder.
                 if not self._auto_select_name:
-                    self._auto_select_name = d.name.split(".")[0] if "." in d.name else d.stem
+                    stem = sequence_pattern_stem(d.name)
+                    if stem is None:
+                        m = re.match(
+                            r"^(?P<head>.+)\.(?P<frame>\d+)\.(?P<ext>[A-Za-z0-9]+)$",
+                            d.name,
+                            re.I,
+                        )
+                        self._auto_select_name = m.group("head") if m else d.stem
+                    else:
+                        self._auto_select_name = stem
+                d = d.parent
+            elif looks_like_sequence_pattern(start_dir):
+                if not self._auto_select_name:
+                    self._auto_select_name = sequence_pattern_stem(d.name) or ""
                 d = d.parent
             if d.is_dir():
                 start_folder = str(d)
@@ -2124,9 +2141,56 @@ class SequenceBrowserDialog(QDialog):
         self._scan_directory(path)
 
     def _on_path_entered(self) -> None:
-        path = self._path_edit.text().strip()
-        if path and Path(path).is_dir():
-            self._navigate_to(path)
+        """Navigate to a pasted/typed path (folder, frame file, or Nuke #### pattern)."""
+        raw = self._path_edit.text().strip()
+        if not raw:
+            return
+        self._navigate_to_path_string(raw)
+
+    def _navigate_to_path_string(self, raw: str, *, prefer_preview: bool = True) -> None:
+        """Resolve *raw* to a folder + optional sequence selection and open it."""
+        from ..core.sequence import looks_like_sequence_pattern, sequence_pattern_stem
+
+        p = Path(raw).expanduser()
+        directory = ""
+        select_name = ""
+        if p.is_dir():
+            directory = str(p)
+        elif p.is_file() and is_image_sequence_ext(p.suffix):
+            directory = str(p.parent)
+            # Match the sequence that owns this frame by stem (strip frame token).
+            stem = sequence_pattern_stem(p.name)
+            if stem is None:
+                # Real frame ``name.1001.exr`` → stem before last numeric token.
+                m = re.match(
+                    r"^(?P<head>.+)\.(?P<frame>\d+)\.(?P<ext>[A-Za-z0-9]+)$",
+                    p.name,
+                    re.I,
+                )
+                select_name = m.group("head") if m else p.stem
+            else:
+                select_name = stem
+        elif looks_like_sequence_pattern(raw):
+            directory = str(p.parent)
+            select_name = sequence_pattern_stem(p.name) or ""
+        else:
+            # Parent dir still useful when the leaf is mistyped.
+            if p.parent.is_dir():
+                directory = str(p.parent)
+            else:
+                return
+
+        if not directory or not Path(directory).is_dir():
+            return
+
+        self._auto_select_name = select_name
+        if prefer_preview:
+            # Paste from Nuke should land in Preview with the sequence selected.
+            self._pending_preview = True
+            self._view_seg.blockSignals(True)
+            self._view_seg.setCurrentData(_SEQ_BROWSER_VIEW_PREVIEW)
+            self._view_seg.blockSignals(False)
+        self._navigate_to(directory)
 
     def _on_view_changed(self, _index: int) -> None:
         mode = self._view_seg.currentData()
@@ -2240,6 +2304,15 @@ class SequenceBrowserDialog(QDialog):
             select_row = 0
         if select_row >= 0:
             self._apply_selection(select_row)
+            self._table.scrollToItem(
+                self._table.item(select_row, 0),
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
+            if 0 <= select_row < self._grid.count():
+                self._grid.scrollToItem(
+                    self._grid.item(select_row),
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
 
         n = len(seqs)
         if n > 1:
@@ -2383,10 +2456,20 @@ class SequenceBrowserDialog(QDialog):
         self._apply_selection(row)
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        # Paste into Folder path: navigate + select + preview after text updates.
+        if obj is self._path_edit and event.type() == QEvent.Type.KeyPress:
+            from PySide6.QtGui import QKeyEvent
+
+            if isinstance(event, QKeyEvent) and event.matches(QKeySequence.StandardKey.Paste):
+                QTimer.singleShot(0, self._on_path_entered)
+                return False  # let the paste apply, then navigate
         if event.type() == QEvent.Type.KeyPress:
             from PySide6.QtGui import QKeyEvent
 
             if isinstance(event, QKeyEvent) and not event.isAutoRepeat():
+                # Don't steal Space while typing in the path field.
+                if obj is self._path_edit:
+                    return super().eventFilter(obj, event)
                 if event.key() == Qt.Key.Key_Space:
                     # Toggle Preview segment
                     if self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW:
@@ -2935,6 +3018,7 @@ class VideoBrowserDialog(QDialog):
         self._grid.itemDoubleClicked.connect(self._on_grid_double_clicked)
         self._grid.customContextMenuRequested.connect(self._on_grid_context_menu)
         self._path_edit.returnPressed.connect(self._on_path_entered)
+        self._path_edit.installEventFilter(self)
         self._table.installEventFilter(self)
         self._table.viewport().installEventFilter(self)
         self._grid.installEventFilter(self)
@@ -3230,8 +3314,16 @@ class VideoBrowserDialog(QDialog):
         super().closeEvent(event)
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if obj is self._path_edit and event.type() == QEvent.Type.KeyPress:
+            from PySide6.QtGui import QKeyEvent
+
+            if isinstance(event, QKeyEvent) and event.matches(QKeySequence.StandardKey.Paste):
+                QTimer.singleShot(0, self._on_path_entered)
+                return False
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()  # type: ignore[attr-defined]
+            if obj is self._path_edit:
+                return super().eventFilter(obj, event)
             if key == Qt.Key.Key_Space and not event.isAutoRepeat():  # type: ignore[attr-defined]
                 if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:
                     # Let the player handle Space for play/pause when focused.
@@ -3284,9 +3376,34 @@ class VideoBrowserDialog(QDialog):
         self._scan_directory(path)
 
     def _on_path_entered(self) -> None:
-        path = self._path_edit.text().strip()
-        if path and Path(path).is_dir():
-            self._navigate_to(path)
+        """Navigate to a pasted/typed folder or video file path."""
+        raw = self._path_edit.text().strip()
+        if not raw:
+            return
+        self._navigate_to_path_string(raw)
+
+    def _navigate_to_path_string(self, raw: str, *, prefer_preview: bool = True) -> None:
+        p = Path(raw).expanduser()
+        directory = ""
+        select_path = ""
+        if p.is_dir():
+            directory = str(p)
+        elif p.is_file() and p.suffix.lower() in _VIDEO_EXTS:
+            directory = str(p.parent)
+            select_path = str(p)
+        elif p.parent.is_dir():
+            directory = str(p.parent)
+        else:
+            return
+        if not directory:
+            return
+        self._auto_select_path = select_path
+        if prefer_preview and select_path:
+            self._pending_preview = True
+            self._view_seg.blockSignals(True)
+            self._view_seg.setCurrentData(_VID_BROWSER_VIEW_PREVIEW)
+            self._view_seg.blockSignals(False)
+        self._navigate_to(directory)
 
     def _scan_directory(self, directory: str) -> None:
         was_preview = self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW
@@ -3347,17 +3464,28 @@ class VideoBrowserDialog(QDialog):
             self._grid.addItem(gitem)
 
         selected = False
+        select_row = -1
         if self._auto_select_path:
             for row in range(self._table.rowCount()):
                 item = self._table.item(row, 0)
                 if item and item.data(Qt.ItemDataRole.UserRole) == self._auto_select_path:
-                    self._table.selectRow(row)
-                    self._grid.setCurrentRow(row)
+                    select_row = row
                     selected = True
                     break
         if not selected and files:
-            self._table.selectRow(0)
-            self._grid.setCurrentRow(0)
+            select_row = 0
+        if select_row >= 0:
+            self._table.selectRow(select_row)
+            self._grid.setCurrentRow(select_row)
+            self._table.scrollToItem(
+                self._table.item(select_row, 0),
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
+            if 0 <= select_row < self._grid.count():
+                self._grid.scrollToItem(
+                    self._grid.item(select_row),
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
 
         self._status.setText(f"{len(files)} video file(s) found")
         mode = self._view_seg.currentData()
@@ -4348,7 +4476,15 @@ class ConvertTab(QWidget):
                 self.set_input(text)
                 return
         else:
-            if p.is_dir() or (p.is_file() and is_image_sequence_ext(p.suffix)):
+            from ..core.sequence import looks_like_sequence_pattern
+
+            if (
+                p.is_dir()
+                or (p.is_file() and is_image_sequence_ext(p.suffix))
+                or looks_like_sequence_pattern(text)
+            ):
+                # Nuke-style ``name.####.exr`` paste: resolve range + color space
+                # the same way as Browse / Open.
                 self.set_input(text)
                 return
 
