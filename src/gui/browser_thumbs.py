@@ -52,6 +52,28 @@ def load_video_thumbnail_rgb(
     """Return uint8 RGB thumbnail from the first video frame, or ``None``."""
     if not path or not Path(path).is_file():
         return None
+
+    # R3D / N-RAW: sixteenth-res SDK decode (fast ID thumbs; not full premium).
+    try:
+        from ..core.r3d import (
+            DECODE_THUMBNAIL,
+            R3DClip,
+            is_r3d_path,
+        )
+        from ..core.r3d import (
+            is_available as r3d_available,
+        )
+
+        if is_r3d_path(path) and r3d_available():
+            with R3DClip(path) as clip:
+                rgb = clip.decode_frame(0, mode=DECODE_THUMBNAIL)
+            # Log3G10 is not linear display; cheap OETF so thumbs aren't crushed.
+            disp = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+            disp = np.power(disp, 1.0 / 2.2)
+            return _downscale_uint8_rgb(disp, max_edge)
+    except Exception:
+        pass
+
     try:
         import av
 

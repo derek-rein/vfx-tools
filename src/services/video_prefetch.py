@@ -290,6 +290,39 @@ class _VideoDecoder:
         return None
 
 
+class _R3DDecoder:
+    """R3D / N-RAW decoder for player scrub (half-res good by default)."""
+
+    def __init__(self, path: str, *, fps: float = 0.0, mode: int | None = None) -> None:
+        from ..core.r3d import DECODE_PREVIEW, R3DClip
+
+        self.path = path
+        self._clip = R3DClip(path)
+        self.fps = float(fps) if fps and fps > 0 else float(self._clip.info.fps or 24.0)
+        self._mode = int(mode) if mode is not None else DECODE_PREVIEW
+        self._last_idx: int | None = None
+        self._last_rgb: np.ndarray | None = None
+
+    def close(self) -> None:
+        try:
+            self._clip.close()
+        except Exception:
+            pass
+
+    def get_frame(self, idx_1based: int) -> np.ndarray | None:
+        idx = max(1, int(idx_1based))
+        if self._last_idx == idx and self._last_rgb is not None:
+            return self._last_rgb
+        try:
+            rgb = self._clip.decode_frame(idx - 1, mode=self._mode)
+        except Exception:
+            log.debug("R3D get_frame failed frame=%s", idx, exc_info=True)
+            return None
+        self._last_idx = idx
+        self._last_rgb = rgb
+        return rgb
+
+
 def _decode_one(
     path: str,
     frame: int,
@@ -299,13 +332,18 @@ def _decode_one(
     fps: float = 0.0,
 ) -> np.ndarray | None:
     """Worker entry: decode one frame via a shared locked decoder."""
+    from ..core.r3d import is_r3d_path
+
     with lock:
-        dec: _VideoDecoder | None = decoder_holder.get("dec")
-        if dec is None or dec.path != path:
+        dec = decoder_holder.get("dec")
+        if dec is None or getattr(dec, "path", None) != path:
             if dec is not None:
                 dec.close()
             try:
-                dec = _VideoDecoder(path, fps=fps)
+                if is_r3d_path(path):
+                    dec = _R3DDecoder(path, fps=fps)
+                else:
+                    dec = _VideoDecoder(path, fps=fps)
             except Exception:
                 log.exception("Failed to open video for prefetch: %s", path)
                 decoder_holder["dec"] = None

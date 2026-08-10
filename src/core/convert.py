@@ -264,7 +264,40 @@ def run_video_to_exr(
     Files are always written as ``{output_name}.{frame:0N}.ext`` (dot pad only).
     *output_name* defaults to the video stem when empty. Slate / burn-in /
     watermark are **never** applied on this path.
+
+    RED R3D / Nikon N-RAW (``.r3d`` / ``.nev``) use the optional R3D SDK bridge
+    when available (see ``docs/r3d.md``); other formats use PyAV.
     """
+    from .r3d import R3DUnavailableError, is_r3d_path
+    from .r3d import is_available as r3d_available
+
+    if is_r3d_path(video_path):
+        if not r3d_available():
+            from .r3d import unavailable_reason
+
+            raise R3DUnavailableError(unavailable_reason())
+        _run_r3d_to_exr(
+            video_path,
+            output_dir,
+            ocio_cfg,
+            src_space,
+            dst_space,
+            progress=progress,
+            cancel_check=cancel_check,
+            log=log,
+            compression=compression,
+            workers=workers,
+            config_source=config_source,
+            config_path=config_path,
+            scale=scale,
+            padding=padding,
+            start_frame=start_frame,
+            frame_set=frame_set,
+            exr_opts=exr_opts,
+            output_name=output_name,
+        )
+        return
+
     ocio_cfg = _ensure_ocio(ocio_cfg, config_source, config_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -466,6 +499,217 @@ def _v2e_serial(
     if log:
         nuke_pat = "#" * padding
         log(f"Wrote {written} EXR frames \u2192 {output_dir / f'{stem}.{nuke_pat}.exr'}")
+
+
+# ---- r3d / n-raw -> exr ----------------------------------------------------
+
+
+def _run_r3d_to_exr(
+    video_path: str,
+    output_dir: Path,
+    ocio_cfg: OCIO.Config | None,
+    src_space: str,
+    dst_space: str,
+    progress: ProgressCallback | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    log: LogCallback | None = None,
+    compression: str = "dwaa",
+    workers: int = 0,
+    config_source: str = "",
+    config_path: str = "",
+    scale: float = 1.0,
+    padding: int = 4,
+    start_frame: int = 1001,
+    frame_set: set[int] | None = None,
+    exr_opts: dict[str, str] | None = None,
+    output_name: str = "",
+) -> None:
+    """Decode RED R3D / Nikon N-RAW via the R3D SDK bridge → OCIO → EXR."""
+    from .r3d import R3DClip, decode_mode_for_scale, sdk_version
+
+    ocio_cfg = _ensure_ocio(ocio_cfg, config_source, config_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = (output_name or Path(video_path).stem).strip()
+    stem = Path(stem).name
+    if not stem:
+        stem = Path(video_path).stem
+
+    mode = decode_mode_for_scale(scale)
+    # When using native half/quarter decode, skip a second software resize unless
+    # the requested scale does not match a decode ladder step exactly.
+    ladder_scale = {
+        0: 1.0,
+        1: 0.5,
+        2: 0.5,
+        3: 0.25,
+        4: 0.125,
+        5: 0.0625,
+    }.get(mode, 1.0)
+    extra_scale = scale / ladder_scale if ladder_scale > 0 else scale
+    need_extra_resize = abs(extra_scale - 1.0) > 0.02
+
+    n_workers = workers if workers > 0 else _DEFAULT_WORKERS
+    fmt = f"0{padding}d"
+
+    with R3DClip(video_path) as clip:
+        info = clip.info
+        full_w, full_h = info.width, info.height
+        total = max(1, info.frame_count)
+        ow, oh = _scaled_dims(full_w, full_h, scale)
+        render_total = len(frame_set) if frame_set else total
+
+        # Clip-level R3D metadata once; per-frame timecode added below.
+        base_attrs: dict[str, str] = {
+            f"exrconverter:r3d:{k}": v for k, v in clip.clip_metadata_dict().items() if v
+        }
+
+        if log:
+            res_info = f"{full_w}x{full_h}" if scale >= 1.0 else f"{full_w}x{full_h} → {ow}x{oh}"
+            range_info = f", range trimmed to {render_total}" if frame_set else ""
+            log(f"Input: {video_path}  ({res_info}, {total} frames{range_info})")
+            log(f"R3D SDK: {sdk_version() or info.sdk_version}")
+            log(f"R3D decode: mode={mode} pipeline=IPP2 primary Log3G10/RWG")
+            if base_attrs.get("exrconverter:r3d:camera_model"):
+                log(f"R3D camera: {base_attrs['exrconverter:r3d:camera_model']}")
+            nuke_pat = "#" * max(1, int(padding))
+            log(f"Output sequence: {output_dir / f'{stem}.{nuke_pat}.exr'}")
+
+        use_pool = n_workers > 1 and bool(config_source or config_path)
+        if log:
+            thr = f"{n_workers} workers" if use_pool else "single-threaded"
+            log(f"OCIO: {src_space} → {dst_space}  ({thr})")
+
+        max_idx = max(frame_set) if frame_set else 0
+        written = 0
+        finished = 0
+
+        def _frame_attrs(idx_0: int) -> dict[str, str]:
+            attrs = dict(base_attrs)
+            tc = clip.absolute_timecode(idx_0)
+            if tc:
+                attrs["exrconverter:r3d:absolute_timecode"] = tc
+            etc = clip.edge_timecode(idx_0)
+            if etc:
+                attrs["exrconverter:r3d:edge_timecode"] = etc
+            attrs["exrconverter:r3d:source_frame"] = str(idx_0)
+            return attrs
+
+        def _indices() -> list[int]:
+            if frame_set:
+                return sorted(i for i in frame_set if 1 <= i <= total)
+            return list(range(1, total + 1))
+
+        indices = _indices()
+        if not indices:
+            raise RuntimeError("No frames selected for R3D decode.")
+
+        if not use_pool:
+            cpu = make_cpu_processor(ocio_cfg, src_space, dst_space)
+            for idx_1based in indices:
+                if cancel_check and cancel_check():
+                    raise RuntimeError("Cancelled")
+                if frame_set and max_idx and idx_1based > max_idx:
+                    break
+                idx_0 = idx_1based - 1
+                rgb = clip.decode_frame(idx_0, mode=mode)
+                if need_extra_resize and (rgb.shape[1], rgb.shape[0]) != (ow, oh):
+                    # Simple box resize via numpy (rare path; prefer ladder modes).
+                    rgb = _resize_rgb_f32(rgb, ow, oh)
+                elif not need_extra_resize and ladder_scale < 1.0:
+                    # Ensure even dims for EXR path consistency.
+                    pass
+                h, w = rgb.shape[:2]
+                buf = np.ascontiguousarray(rgb, dtype=np.float32)
+                desc = OCIO.PackedImageDesc(buf, w, h, 3)
+                cpu.apply(desc)
+                frame_num = start_frame + idx_1based - 1
+                out_path = output_dir / f"{stem}.{frame_num:{fmt}}.exr"
+                write_exr(
+                    str(out_path),
+                    buf,
+                    compression=compression,
+                    src_space=src_space,
+                    dst_space=dst_space,
+                    exr_opts=exr_opts,
+                    extra_attrs=_frame_attrs(idx_0),
+                )
+                written += 1
+                if progress:
+                    progress(written, render_total)
+        else:
+            max_inflight = n_workers * 2
+            with _process_pool(n_workers) as pool:
+                pending: dict = {}
+                it = iter(indices)
+                all_submitted = False
+
+                def _submit_batch() -> None:
+                    nonlocal all_submitted
+                    if all_submitted:
+                        return
+                    while len(pending) < max_inflight:
+                        try:
+                            idx_1based = next(it)
+                        except StopIteration:
+                            all_submitted = True
+                            return
+                        if cancel_check and cancel_check():
+                            _cancel_pool(pool, pending)
+                            raise RuntimeError("Cancelled")
+                        idx_0 = idx_1based - 1
+                        rgb = clip.decode_frame(idx_0, mode=mode)
+                        if need_extra_resize and (rgb.shape[1], rgb.shape[0]) != (ow, oh):
+                            rgb = _resize_rgb_f32(rgb, ow, oh)
+                        frame_num = start_frame + idx_1based - 1
+                        out_path = str(output_dir / f"{stem}.{frame_num:{fmt}}.exr")
+                        fut = pool.submit(
+                            process_frame_v2e,
+                            idx_1based,
+                            rgb,
+                            out_path,
+                            compression,
+                            config_source,
+                            config_path,
+                            src_space,
+                            dst_space,
+                            exr_opts,
+                            _frame_attrs(idx_0),
+                        )
+                        pending[fut] = idx_1based
+
+                _submit_batch()
+                while pending:
+                    if cancel_check and cancel_check():
+                        _cancel_pool(pool, pending)
+                        raise RuntimeError("Cancelled")
+                    done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for done in done_set:
+                        done.result()
+                        del pending[done]
+                        finished += 1
+                        if progress:
+                            progress(finished, render_total)
+                    _submit_batch()
+            written = finished
+
+    if written == 0:
+        raise RuntimeError("No frames decoded from the R3D/N-RAW file.")
+    if log:
+        nuke_pat = "#" * padding
+        log(f"Wrote {written} EXR frames → {output_dir / f'{stem}.{nuke_pat}.exr'}")
+
+
+def _resize_rgb_f32(rgb: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    """Nearest-neighbor resize for float32 RGB (rare path when scale ≠ R3D ladder)."""
+    h, w = rgb.shape[:2]
+    if w == out_w and h == out_h:
+        return rgb
+    ys = np.linspace(0, h - 1, out_h)
+    xs = np.linspace(0, w - 1, out_w)
+    yi = np.clip(np.rint(ys).astype(np.intp), 0, h - 1)
+    xi = np.clip(np.rint(xs).astype(np.intp), 0, w - 1)
+    return np.ascontiguousarray(rgb[np.ix_(yi, xi)], dtype=np.float32)
 
 
 # ---- exr -> video ----------------------------------------------------------

@@ -80,13 +80,23 @@ def _stream_basics(stream) -> tuple[int, int, float, int, str, str]:
 
 
 def probe_video(path: str) -> tuple[int, int, float, int]:
-    """Return (width, height, fps, frame_count) using PyAV.
+    """Return (width, height, fps, frame_count) using PyAV or the R3D SDK.
 
-    Falls back through codec_context, a deep libavformat probe, and a
-    single-frame decode when the default probe doesn't surface stream
-    attributes (e.g. Sony Venice MXFs whose vendor-tagged codec parameters
-    live past the default 5 MB / 5 s probe window).
+    RED R3D / N-RAW (``.r3d`` / ``.nev``) use the optional R3D bridge when
+    available. Other formats use PyAV, falling back through codec_context, a
+    deep libavformat probe, and a single-frame decode when the default probe
+    doesn't surface stream attributes (e.g. Sony Venice MXFs).
     """
+    from .r3d import is_available as r3d_available
+    from .r3d import is_r3d_path, probe_r3d
+
+    if is_r3d_path(path):
+        if not r3d_available():
+            from .r3d import unavailable_reason
+
+            raise RuntimeError(unavailable_reason())
+        return probe_r3d(path)
+
     import av
 
     duration = time_base = None
@@ -240,6 +250,11 @@ def guess_video_colorspace_candidates(path: str) -> list[str]:
     characteristics. The caller should try each candidate through alias
     resolution until one matches the active OCIO config.
     """
+    from .r3d import is_r3d_path, r3d_src_colorspace_candidates
+
+    if is_r3d_path(path):
+        return r3d_src_colorspace_candidates(path)
+
     import av
 
     try:
@@ -354,6 +369,8 @@ _VIDEO_SUFFIXES = {
     ".webm",
     ".m4v",
     ".ts",
+    ".r3d",
+    ".nev",
 }
 
 
@@ -378,6 +395,35 @@ def scan_video_files(directory: str) -> list[dict[str, str]]:
         if entry.suffix.lower() not in _VIDEO_SUFFIXES:
             continue
         row: dict[str, str] = {"name": entry.name, "path": str(entry)}
+        # R3D / N-RAW — PyAV cannot probe these; use the optional SDK bridge.
+        from .r3d import is_available as r3d_available
+        from .r3d import is_r3d_path, probe_r3d
+
+        if is_r3d_path(entry):
+            try:
+                if r3d_available():
+                    vw, vh, fps, nframes = probe_r3d(entry)
+                    row["resolution"] = f"{vw}x{vh}" if vw and vh else ""
+                    row["codec"] = "R3D" if entry.suffix.lower() == ".r3d" else "N-RAW"
+                    row["fps"] = f"{fps:.3f}".rstrip("0").rstrip(".") if fps else ""
+                    if nframes and fps:
+                        dur = nframes / fps
+                        row["duration"] = f"{dur:.2f}s"
+                    else:
+                        row["duration"] = ""
+                else:
+                    row["resolution"] = ""
+                    row["codec"] = "R3D (SDK missing)"
+                    row["fps"] = ""
+                    row["duration"] = ""
+            except Exception:
+                row.setdefault("resolution", "")
+                row.setdefault("codec", "R3D")
+                row.setdefault("fps", "")
+                row.setdefault("duration", "")
+            results.append(row)
+            continue
+
         try:
             container = av.open(str(entry))
             vs = container.streams.video[0] if container.streams.video else None

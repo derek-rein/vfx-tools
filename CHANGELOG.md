@@ -13,8 +13,27 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] — 2026-08-10
+
 ### Added
 
+- **Optional RED R3D / N-RAW decode:** Video → EXR accepts `.r3d` and `.nev` when
+  the R3D SDK bridge is built (`make r3d-bridge` + official RED R3D SDK).
+  Decodes with IPP2 primary development (REDWideGamutRGB + Log3G10) for OCIO
+  pipelines. See [docs/r3d.md](./docs/r3d.md). The proprietary SDK is not
+  redistributed in source form.
+- **R3D CI feed:** Release builds can fetch the full SDK from a private GitHub
+  Release (`scripts/fetch_r3d_sdk.py` + secret `R3D_SDK_READ_TOKEN`), link the
+  bridge, and ship only Redistributable libs + `libr3d_bridge` under a private
+  app `r3d/` folder.
+- **R3D preview & thumbnails:** Video browser grid and sequence-player scrub use
+  low-res R3D SDK decode (not full premium). Convert remains full-quality.
+- **R3D → EXR metadata:** Camera, ISO, lens, FPS, and per-frame timecode written
+  as `exrconverter:r3d:*` attributes on output EXRs.
+- **About dialog:** RED Redistributable end-user notice (button opens full text)
+  when R3D support is present.
 - **File browser row context menu:** List/Grid right-click on sequence and video
   browsers includes **Copy File Path** and **Copy Folder Path** (same actions as
   the Input/Output path fields). Video browser also gains Preview / Open on that
@@ -533,7 +552,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/derek-rein/exr-converter/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/derek-rein/exr-converter/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/derek-rein/exr-converter/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/derek-rein/exr-converter/compare/v0.7.0...v0.8.0

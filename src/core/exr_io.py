@@ -121,6 +121,7 @@ def write_exr(
     src_space: str = "",
     dst_space: str = "",
     exr_opts: dict[str, str] | None = None,
+    extra_attrs: dict[str, str] | None = None,
 ) -> None:
     """Write a float32 (H, W, 3) array as half-float EXR.
 
@@ -131,6 +132,9 @@ def write_exr(
     to a generic ``lin_rec709`` ``oiio:ColorSpace`` tag without changing
     pixels. Trust **``exrconverter:dstColorSpace``** for the true OCIO space
     of the samples; ``oiio:ColorSpace`` is only a coarse “scene-linear” hint.
+
+    *extra_attrs* are optional string attributes (e.g. R3D camera metadata
+    under ``exrconverter:r3d:*``).
 
     Raises
     ------
@@ -154,6 +158,18 @@ def write_exr(
             spec.attribute("oiio:ColorSpace", str(dst_space))
         except Exception:
             pass
+    if extra_attrs:
+        for key, val in extra_attrs.items():
+            if key is None or val is None:
+                continue
+            k = str(key).strip()
+            v = str(val).strip()
+            if not k or not v:
+                continue
+            try:
+                spec.attribute(k, v)
+            except Exception:
+                pass
     buf = oiio.ImageBuf(spec)
     # set_pixels + write must not run OIIO colorconvert (pixels already OCIO'd).
     buf.set_pixels(
