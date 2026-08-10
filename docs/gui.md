@@ -46,6 +46,13 @@ Right-click the **Input** or **Output** path field for:
 field, **⌘-click** (macOS) or **Ctrl-click** (Windows/Linux) on **Browse…**
 reveals that path in the OS file manager instead.
 
+**Paste paths:** You can paste a Nuke-style sequence path
+(``/show/shot.####.exr`` or ``%04d``) into the convert Input field — the app
+resolves the sequence on disk, fills the frame range, and auto-detects source
+color space. Pasting a folder, frame file, video, or ``####`` pattern into a
+browser’s **Folder** field navigates there, highlights the matching item, and
+opens **Preview** so you can hit **Open** immediately.
+
 **Sequence browser** lists every supported still sequence in a folder
 (``name.####.ext`` or ``name_####.ext``). Mixed folders prefer EXR, then DPX.
 Display-encoded stills (PNG/JPEG/WebP) auto-suggest an **sRGB** source color

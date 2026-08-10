@@ -13,9 +13,11 @@ from src.core.exr_io import read_image, write_exr
 from src.core.sequence import (
     find_exr_sequence,
     find_exr_sequence_info,
+    looks_like_sequence_pattern,
     parse_dot_sequence_output,
     scan_exr_sequences,
     sequence_looks_scene_referred,
+    sequence_pattern_stem,
 )
 
 
@@ -210,3 +212,39 @@ class TestSequenceDiscovery:
         assert pad2 is None
         with pytest.raises(ValueError, match="dot-separated"):
             parse_dot_sequence_output("/tmp/out/shot_####.exr")
+
+
+class TestNukeStylePatterns:
+    def test_pattern_stem_hash_and_printf(self) -> None:
+        assert sequence_pattern_stem("chs_010_010_v0001.####.exr") == "chs_010_010_v0001"
+        assert sequence_pattern_stem("plate_####.exr") == "plate"
+        assert sequence_pattern_stem("plate.%04d.exr") == "plate"
+        assert looks_like_sequence_pattern("/show/shot/chs_010_010_v0001.####.exr")
+        assert not looks_like_sequence_pattern("/show/shot/readme.txt")
+
+    def test_resolve_hash_pattern_to_sequence(self, tmp_path: Path) -> None:
+        d = tmp_path / "footage"
+        d.mkdir()
+        for f in (1001, 1002, 1003):
+            write_exr(
+                str(d / f"chs_010_010_v0001.{f:04d}.exr"),
+                np.zeros((4, 4, 3), dtype=np.float32),
+                compression="none",
+            )
+        # Unrelated sequence in same folder
+        write_exr(
+            str(d / "other.0001.exr"),
+            np.zeros((4, 4, 3), dtype=np.float32),
+            compression="none",
+        )
+        pattern = str(d / "chs_010_010_v0001.####.exr")
+        paths, name, frames, pad, _seq = find_exr_sequence_info(pattern)
+        assert name == "chs_010_010_v0001"
+        assert frames == [1001, 1002, 1003]
+        assert pad == 4
+        assert len(paths) == 3
+        assert paths[0].endswith("chs_010_010_v0001.1001.exr")
+
+        paths2, name2 = find_exr_sequence(pattern)
+        assert name2 == "chs_010_010_v0001"
+        assert len(paths2) == 3
