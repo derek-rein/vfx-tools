@@ -13,6 +13,22 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Added
+
+- **File browser row context menu:** List/Grid right-click on sequence and video
+  browsers includes **Copy File Path** and **Copy Folder Path** (same actions as
+  the Input/Output path fields). Video browser also gains Preview / Open on that
+  menu for parity with the sequence browser.
+
+### Fixed
+
+- **File browser close while previewing:** the window close button (X) and Cancel
+  now close the sequence and video browsers immediately, even when Preview is
+  active. Escape still leaves Preview and returns to List/Grid first.
+- **Input color space highlight:** the amber auto-detect cue only appears when
+  media probe sets the source space, then clears on a timer (or immediately if
+  you pick a space manually / load a preset). It no longer stays stuck on.
+
 ---
 
 ## [0.8.2] — 2026-08-10

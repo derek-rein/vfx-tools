@@ -67,6 +67,19 @@ directory still resolves a default sequence on disk (EXR first, then DPX;
 prefers a basename matching the folder name when several sequences share the
 folder). The slate editor reuses the player with live burn-in/watermark overlays.
 
+Right-click a row in **List** or a tile in **Grid** (sequence and video
+browsers) for:
+
+| Action | Behavior |
+|--------|----------|
+| **Preview** | Switch to Preview for the selected item (**Space**) |
+| **Open** | Accept the selection (same as the Open button) |
+| **Copy File Path** | First-frame path (sequence) or video file path |
+| **Copy Folder Path** | Containing directory |
+
+(Same **Copy File Path** / **Copy Folder Path** labels as the Input/Output
+path-field menu.)
+
 **Volumes / drives:** both browsers show mounted volumes as **top-level** rows
 in the folder tree and under a **Volumes** heading in the places sidebar
 (system disk first, then other mounts by name). That covers:

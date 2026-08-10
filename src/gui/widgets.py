@@ -157,6 +157,10 @@ class ColorSpaceButton(QToolButton):
     When the active OCIO config changes, :meth:`populate` may leave the
     control in an **invalid** state if the previous space has no equivalent —
     :meth:`current_space` then returns ``""`` so Convert stays disabled.
+
+    Auto-detect (media probe) uses :meth:`try_select` with ``auto=True`` for a
+    brief amber flash; manual picks, presets, and ``populate`` never leave that
+    flash stuck on.
     """
 
     space_changed = Signal(str)
@@ -165,6 +169,13 @@ class ColorSpaceButton(QToolButton):
     _INVALID_STYLE = (
         "QToolButton { color: #e07070; border: 1px solid #a04040; background-color: #3a2020; }"
     )
+    # Brief cue when the space was chosen by media auto-detect (not sticky).
+    _AUTO_STYLE = (
+        "QToolButton { color: #e8dcc0; border: 1px solid #8a6a30; "
+        "background-color: #3a3020; border-radius: 3px; padding: 4px 8px; "
+        "text-align: left; font-size: 13px; }"
+    )
+    _AUTO_FLASH_MS = 1200
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -175,7 +186,11 @@ class ColorSpaceButton(QToolButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._current = ""
         self._valid = False
+        self._auto_flash = False
         self._menu = QMenu(self)
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._end_auto_flash)
         self._set_display("(none)")
         self._apply_valid_style()
 
@@ -190,8 +205,13 @@ class ColorSpaceButton(QToolButton):
     def is_valid(self) -> bool:
         return self._valid and bool(self._current)
 
+    def is_auto_flash(self) -> bool:
+        """True while the auto-detect highlight is showing."""
+        return self._auto_flash
+
     def set_current_space(self, name: str) -> None:
         """Set the selection; marks invalid if *name* is empty."""
+        self._stop_auto_flash()
         self._current = name or ""
         self._valid = bool(name)
         self._set_display(name or "(none)")
@@ -199,6 +219,7 @@ class ColorSpaceButton(QToolButton):
 
     def set_invalid(self, wanted: str) -> None:
         """Show *wanted* as missing from the active config (Convert disabled)."""
+        self._stop_auto_flash()
         self._current = wanted or ""
         self._valid = False
         label = wanted if wanted else "(none)"
@@ -217,6 +238,7 @@ class ColorSpaceButton(QToolButton):
         (or empty). Callers should run :func:`~src.core.ocio_utils.find_equivalent_space`
         first; use :meth:`set_invalid` when no match exists.
         """
+        self._stop_auto_flash()
         old_menu = self._menu
         self._menu = QMenu(self)
         old_menu.deleteLater()
@@ -246,14 +268,15 @@ class ColorSpaceButton(QToolButton):
             for cs_name in names:
                 all_names.add(cs_name)
                 action = target_menu.addAction(cs_name)
-                action.triggered.connect(lambda checked, n=cs_name: self._pick(n))
+                # Menu pick is always manual — clears any auto-detect flash.
+                action.triggered.connect(lambda checked, n=cs_name: self._pick(n, auto=False))
                 if cs_name == select:
                     found = True
 
         if select and found:
-            self._pick(select)
+            self._pick(select, auto=False)
         elif select and select in all_names:
-            self._pick(select)
+            self._pick(select, auto=False)
         elif select:
             # Name not in menu — invalid until the user picks.
             self.set_invalid(select)
@@ -296,29 +319,61 @@ class ColorSpaceButton(QToolButton):
         global_pos = self.mapToGlobal(QPoint(x, self.height()))
         self._menu.popup(global_pos)
 
-    def _pick(self, name: str) -> None:
+    def _pick(self, name: str, *, auto: bool = False) -> None:
         self._current = name
         self._valid = True
         self._set_display(name)
-        self._apply_valid_style()
+        if auto:
+            self._begin_auto_flash()
+        else:
+            self._stop_auto_flash()
+            self._apply_valid_style()
+            self.setToolTip(name)
         self.space_changed.emit(name)
 
-    def try_select(self, name: str) -> bool:
-        """Select *name* if it exists in the menu. Returns True on match."""
+    def try_select(self, name: str, *, auto: bool = False) -> bool:
+        """Select *name* if it exists in the menu. Returns True on match.
+
+        Pass ``auto=True`` when the value comes from media auto-detect so the
+        button briefly highlights, then returns to the normal style.
+        """
         if not name:
             return False
         if self._find_action(self._menu, name):
-            self._pick(name)
+            self._pick(name, auto=auto)
             return True
         # Case-insensitive fallback: scan all actions for a match
         found = self._find_action_ci(self._menu, name.lower())
         if found:
-            self._pick(found)
+            self._pick(found, auto=auto)
             return True
         return False
 
+    def _begin_auto_flash(self) -> None:
+        """Show the auto-detect highlight; timer clears it (never sticky)."""
+        self._auto_flash = True
+        self.setStyleSheet(self._AUTO_STYLE)
+        self.setToolTip(f"{self._current} — auto-detected from media")
+        self._auto_timer.start(self._AUTO_FLASH_MS)
+
+    def _end_auto_flash(self) -> None:
+        """Timer callback: drop auto-detect highlight, keep selection."""
+        self._auto_flash = False
+        self._apply_valid_style()
+        if self._valid and self._current:
+            self.setToolTip(self._current)
+
+    def _stop_auto_flash(self) -> None:
+        """Cancel any in-flight auto flash without waiting for the timer."""
+        if self._auto_timer.isActive():
+            self._auto_timer.stop()
+        self._auto_flash = False
+
     def _apply_valid_style(self) -> None:
-        if self._valid:
+        if self._auto_flash:
+            self.setStyleSheet(self._AUTO_STYLE)
+        elif self._valid:
+            # Empty stylesheet → inherit app QSS (normal input chrome).
             self.setStyleSheet("")
         else:
             self.setStyleSheet(self._INVALID_STYLE)
@@ -705,6 +760,51 @@ _OS_PLACES: list[tuple[str, str, QStandardPaths.StandardLocation]] = [
 def _copy_to_clipboard(text: str) -> None:
     if text:
         QGuiApplication.clipboard().setText(text)
+
+
+def _folder_path_for_copy(text: str) -> str:
+    """Directory to copy for a file, folder, or ``name.####.ext`` path string.
+
+    Shared by path-field and file-browser context menus (same semantics as the
+    Input/Output line-edit **Copy Folder Path** action).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    p = Path(raw).expanduser()
+    # Sequence pattern → containing directory
+    if "#" in p.name:
+        return str(p.parent)
+    try:
+        if p.is_dir():
+            return str(p)
+        if p.is_file():
+            return str(p.parent)
+    except OSError:
+        pass
+    # Non-existent file-like path → parent; bare path → as-is
+    if p.suffix or "." in p.name:
+        return str(p.parent) if str(p.parent) not in ("", ".") else str(p)
+    return str(p)
+
+
+def _add_copy_path_actions(menu: QMenu, *, file_path: str = "", folder_path: str = "") -> None:
+    """Append **Copy File Path** / **Copy Folder Path** (disabled when empty)."""
+    # QAction.triggered(bool) — never bind the bool as the path string.
+    file_path = (file_path or "").strip()
+    folder_path = (folder_path or "").strip()
+    if not folder_path and file_path:
+        folder_path = _folder_path_for_copy(file_path)
+
+    copy_file = QAction("Copy File Path", menu)
+    copy_file.setEnabled(bool(file_path))
+    copy_file.triggered.connect(lambda _=False, p=file_path: _copy_to_clipboard(p))
+    menu.addAction(copy_file)
+
+    copy_folder = QAction("Copy Folder Path", menu)
+    copy_folder.setEnabled(bool(folder_path))
+    copy_folder.triggered.connect(lambda _=False, p=folder_path: _copy_to_clipboard(p))
+    menu.addAction(copy_folder)
 
 
 # SizeGrip lives in :mod:`src.gui.size_grip` (imported by window / slate_widgets)
@@ -2349,6 +2449,13 @@ class SequenceBrowserDialog(QDialog):
         open_act.setEnabled(self._ok_btn.isEnabled())
         open_act.triggered.connect(self.accept)
         menu.addAction(open_act)
+        menu.addSeparator()
+        # File = first frame of the selected sequence (what Open commits).
+        _add_copy_path_actions(
+            menu,
+            file_path=self._selected_frame_path,
+            folder_path=self._selected_dir,
+        )
         menu.exec(global_pos)
 
     def _ensure_player(self):
@@ -2496,9 +2603,8 @@ class SequenceBrowserDialog(QDialog):
         super().accept()
 
     def reject(self) -> None:
-        if self._view_seg.currentData() == _SEQ_BROWSER_VIEW_PREVIEW:
-            self._view_seg.setCurrentData(self._last_browse_mode)
-            return
+        # Always close the dialog. Escape already leaves Preview via keyPressEvent /
+        # eventFilter; window chrome (X) and Cancel must not be trapped in Preview.
         self._shutdown_browser_workers()
         self._save_browser_layout()
         super().reject()
@@ -2697,6 +2803,7 @@ class VideoBrowserDialog(QDialog):
         self._table.setMinimumWidth(200)
         self._table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self._table.setWordWrap(False)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         th = self._table.horizontalHeader()
         th.setStretchLastSection(False)
         th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -2725,6 +2832,7 @@ class VideoBrowserDialog(QDialog):
         self._grid.setWordWrap(True)
         self._grid.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._grid.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._grid.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._grid.setMinimumWidth(200)
 
@@ -2821,8 +2929,10 @@ class VideoBrowserDialog(QDialog):
         self._tree.clicked.connect(self._on_tree_clicked)
         self._table.itemSelectionChanged.connect(self._on_table_selection)
         self._table.cellDoubleClicked.connect(lambda _r, _c: self.accept())
+        self._table.customContextMenuRequested.connect(self._on_table_context_menu)
         self._grid.itemSelectionChanged.connect(self._on_grid_selection)
         self._grid.itemDoubleClicked.connect(self._on_grid_double_clicked)
+        self._grid.customContextMenuRequested.connect(self._on_grid_context_menu)
         self._path_edit.returnPressed.connect(self._on_path_entered)
         self._table.installEventFilter(self)
         self._table.viewport().installEventFilter(self)
@@ -3106,9 +3216,8 @@ class VideoBrowserDialog(QDialog):
         super().accept()
 
     def reject(self) -> None:
-        if self._view_seg.currentData() == _VID_BROWSER_VIEW_PREVIEW:
-            self._view_seg.setCurrentData(self._last_browse_mode)
-            return
+        # Always close the dialog. Escape already leaves Preview via eventFilter;
+        # window chrome (X) and Cancel must not be trapped in Preview.
         self._shutdown_player()
         self._save_browser_layout()
         super().reject()
@@ -3328,6 +3437,49 @@ class VideoBrowserDialog(QDialog):
             self._selected_path = str(self._file_data[row].get("path") or "")
             if self._selected_path:
                 self.accept()
+
+    def _select_video_row(self, row: int) -> None:
+        """Commit video index *row* into selection (table + grid stay in sync)."""
+        if row < 0 or row >= len(self._file_data):
+            self._selected_path = ""
+            self._ok_btn.setEnabled(False)
+            return
+        self._selected_path = str(self._file_data[row].get("path") or "")
+        self._ok_btn.setEnabled(bool(self._selected_path))
+        self._table.selectRow(row)
+        if 0 <= row < self._grid.count():
+            self._grid.setCurrentRow(row)
+        if self._meta_panel.isVisible():
+            self._show_metadata(row)
+
+    def _on_table_context_menu(self, pos: QPoint) -> None:
+        index = self._table.indexAt(pos)
+        if index.isValid():
+            self._select_video_row(index.row())
+        self._show_video_context_menu(self._table.viewport().mapToGlobal(pos))
+
+    def _on_grid_context_menu(self, pos: QPoint) -> None:
+        item = self._grid.itemAt(pos)
+        if item is not None:
+            row = int(item.data(Qt.ItemDataRole.UserRole) or self._grid.row(item))
+            self._select_video_row(row)
+        self._show_video_context_menu(self._grid.viewport().mapToGlobal(pos))
+
+    def _show_video_context_menu(self, global_pos: QPoint) -> None:
+        menu = QMenu(self)
+        preview_act = QAction("Preview", self)
+        preview_act.setShortcut(Qt.Key.Key_Space)
+        preview_act.triggered.connect(
+            lambda: self._view_seg.setCurrentData(_VID_BROWSER_VIEW_PREVIEW)
+        )
+        menu.addAction(preview_act)
+        open_act = QAction("Open", self)
+        open_act.setEnabled(self._ok_btn.isEnabled())
+        open_act.triggered.connect(self.accept)
+        menu.addAction(open_act)
+        menu.addSeparator()
+        _add_copy_path_actions(menu, file_path=self._selected_path)
+        menu.exec(global_pos)
 
     def _on_table_selection(self) -> None:
         rows = self._table.selectionModel().selectedRows()
@@ -4569,24 +4721,7 @@ class ConvertTab(QWidget):
     @staticmethod
     def _folder_path_from_field(text: str) -> str:
         """Directory to copy/open for a path field value (file, folder, or name.####.ext)."""
-        raw = (text or "").strip()
-        if not raw:
-            return ""
-        p = Path(raw).expanduser()
-        # Sequence pattern → containing directory
-        if "#" in p.name:
-            return str(p.parent)
-        try:
-            if p.is_dir():
-                return str(p)
-            if p.is_file():
-                return str(p.parent)
-        except OSError:
-            pass
-        # Non-existent file-like path → parent; bare path → as-is
-        if p.suffix or "." in p.name:
-            return str(p.parent) if str(p.parent) not in ("", ".") else str(p)
-        return str(p)
+        return _folder_path_for_copy(text)
 
     def _show_path_context_menu(self, edit: QLineEdit, pos: QPoint) -> None:
         """Standard cut/copy/paste plus path helpers (replaces stock QLineEdit menu).
@@ -4634,20 +4769,8 @@ class ConvertTab(QWidget):
 
         menu.addSeparator()
 
-        # --- Path-specific helpers ---
-        # QAction.triggered(bool) — never bind the bool as the path string.
-        def _clip(s: str) -> None:
-            QGuiApplication.clipboard().setText(s)
-
-        copy_file = QAction("Copy File Path", menu)
-        copy_file.setEnabled(bool(text))
-        copy_file.triggered.connect(lambda _=False, t=text: _clip(t))
-        menu.addAction(copy_file)
-
-        copy_folder = QAction("Copy Folder Path", menu)
-        copy_folder.setEnabled(bool(folder))
-        copy_folder.triggered.connect(lambda _=False, f=folder: _clip(f))
-        menu.addAction(copy_folder)
+        # --- Path-specific helpers (same actions as file-browser row menus) ---
+        _add_copy_path_actions(menu, file_path=text, folder_path=folder)
 
         open_act = QAction(file_manager_label(), menu)
         open_act.setEnabled(bool(folder) and path_is_revealable(folder))
@@ -4819,10 +4942,14 @@ class ConvertTab(QWidget):
         from ..core.video import resolve_video_src_colorspace
 
         preferred = resolve_video_src_colorspace(video_path, getattr(self, "_ocio_cfg", None))
-        if preferred and self.src_btn.try_select(preferred):
+        if preferred and self.src_btn.try_select(preferred, auto=True):
             self.log_message.emit(f"Auto-detected source color space: {preferred}")
-            self.src_btn.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
+
+    def _flash_field(self, widget: QWidget) -> None:
+        """Brief amber flash on a path field / button after an auto-edit."""
+        widget.setStyleSheet("background-color: #3a3020;")
+        # Context = *widget* so the clear always runs on that object (never sticky).
+        QTimer.singleShot(500, widget, lambda w=widget: w.setStyleSheet(""))
 
     def _update_output_placeholder(self) -> None:
         """Update the output placeholder and current pattern to reflect padding."""
@@ -4837,8 +4964,7 @@ class ConvertTab(QWidget):
             updated = re.sub(r"#+\.exr$", f"{pat}.exr", current)
             if updated != current:
                 self.output_path.setText(updated)
-                self.output_path.setStyleSheet("background-color: #3a3020;")
-                QTimer.singleShot(500, self, lambda: self.output_path.setStyleSheet(""))
+                self._flash_field(self.output_path)
 
     def _update_output_ext(self) -> None:
         """Update the output path extension to match the current codec."""
@@ -4851,8 +4977,7 @@ class ConvertTab(QWidget):
         new_ext = self._codec_ext()
         if p.suffix.lower() != new_ext:
             self.output_path.setText(str(p.with_suffix(new_ext)))
-            self.output_path.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, self, lambda: self.output_path.setStyleSheet(""))
+            self._flash_field(self.output_path)
 
     def _update_dst_for_codec(self) -> None:
         """Suggest a sensible destination colorspace for the selected codec."""
@@ -4876,9 +5001,8 @@ class ConvertTab(QWidget):
                 if resolved:
                     preferred = resolved
                     break
-        if self.dst_btn.try_select(preferred):
-            self.dst_btn.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, self, lambda: self.dst_btn.setStyleSheet(""))
+        if self.dst_btn.try_select(preferred, auto=True):
+            pass  # amber flash owned by ColorSpaceButton
 
     def _auto_detect_colorspace(self, path_or_dir: str) -> None:
         """Probe or infer source colorspace for the loaded image sequence.
@@ -4925,10 +5049,8 @@ class ConvertTab(QWidget):
                     if resolved:
                         preferred = resolved
                         break
-            if self.src_btn.try_select(preferred):
+            if self.src_btn.try_select(preferred, auto=True):
                 self.log_message.emit(f"Display still sequence — source color space: {preferred}")
-                self.src_btn.setStyleSheet("background-color: #3a3020;")
-                QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
             return
 
         canonical = cs
@@ -4939,10 +5061,8 @@ class ConvertTab(QWidget):
             resolved = resolve_alias(ocio_cfg, cs)
             if resolved:
                 canonical = resolved
-        if self.src_btn.try_select(canonical):
+        if self.src_btn.try_select(canonical, auto=True):
             self.log_message.emit(f"Auto-detected source color space: {canonical}")
-            self.src_btn.setStyleSheet("background-color: #3a3020;")
-            QTimer.singleShot(500, self, lambda: self.src_btn.setStyleSheet(""))
         else:
             self.log_message.emit(f'Image color space "{cs}" not found in current OCIO config')
 
