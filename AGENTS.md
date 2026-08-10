@@ -195,19 +195,25 @@ feature commits (PR → main)
         │  1. scripts/bump_app_version.py → pyproject + APP_VERSION
         │  2. uv lock
         │  3. commit: "release: X.Y.Z"  (only version files)
-        │  4. optional local tag vX.Y.Z  (not required for publish)
+        │  4. optional local annotated tag vX.Y.Z  (not required for publish)
         ▼
- PR → main → merge
+ PR → main → merge  (CHANGELOG must already have ## [X.Y.Z] + compare link)
         │
  Auto-tag release workflow (on push to main)
-        │  if pyproject version X.Y.Z has no tag → create + push tag
-        │  if no GitHub Release for that tag yet → `gh workflow run Release --ref vX.Y.Z`
+        │  refuse if CHANGELOG lacks ## [X.Y.Z]
+        │  if pyproject version X.Y.Z has no tag → create + push annotated tag
+        │  if no GitHub Release yet and no Release run active →
+        │      `gh workflow run Release --ref main -f tag=vX.Y.Z`
         ▼
- GitHub Actions “Release” (tag push **or** workflow_dispatch on the tag)
-        │  lint → test (3 OS) → gate → Nuitka → Cosign → GitHub Release
+ GitHub Actions “Release”
+   triggers: push tags v*  (human/PAT)  OR  workflow_dispatch (auto-tag)
+   concurrency: one run per tag (cancel-in-progress: false)
+        │  validate tag↔pyproject + CHANGELOG
+        │  lint → test (3 OS) → gate → Nuitka (4 targets)
+        │  → optional SignPath (Windows) → Cosign + GH attestations → publish
         ▼
  Artifacts: Linux AppImage, macOS DMG (arm64 + x86_64), Windows installer
-            (+ .sigstore.json bundles)
+            (+ .sigstore.json bundles; GH attestations for provenance)
 ```
 
 Tags are plain semver: **`v1.2.3`**. The tag is the published app version
@@ -215,8 +221,14 @@ Tags are plain semver: **`v1.2.3`**. The tag is the published app version
 
 **Critical GitHub quirk:** a tag created with the default **`GITHUB_TOKEN` does
 not start other workflows** (recursion guard). Auto-tag therefore **dispatches**
-Release via `workflow_dispatch` after pushing the tag. Human `git push origin v*`
-with a real user/PAT still triggers Release on `push: tags` as usual.
+Release via `workflow_dispatch` after pushing the tag. The dispatch uses
+**`--ref main`** so the *workflow file* is latest; the build checks out the tag
+via `inputs.tag` (`RELEASE_REF`). Human `git push origin v*` with a real
+user/PAT still triggers Release on `push: tags`.
+
+**Do not double-fire:** after merge, prefer Auto-tag only. Do not also push the
+local `vX.Y.Z` tag unless Auto-tag failed — a human tag push *and* a late
+dispatch can race (concurrency serializes same-tag runs, but wastes minutes).
 
 ### Prerequisites
 
@@ -233,9 +245,10 @@ with a real user/PAT still triggers Release on `push: tags` as usual.
 git checkout main && git pull origin main
 git checkout -b release/X.Y.Z
 
-# Before tagging: CHANGELOG.md must have [X.Y.Z] notes (move from [Unreleased])
+# Before tagging: CHANGELOG.md must have [X.Y.Z] notes + bottom compare link
+# (Auto-tag and Release gate both refuse to ship without them.)
 make release PART=minor PUSH=0    # or patch / major
-# → commit "release: X.Y.Z" + local tag vX.Y.Z
+# → commit "release: X.Y.Z" + local annotated tag vX.Y.Z
 # Include CHANGELOG.md in the release PR if not already on main
 # (bump only commits version files — commit changelog separately on the branch)
 
@@ -245,9 +258,10 @@ gh pr checks
 gh pr merge --merge          # or --squash per preference
 
 git checkout main && git pull origin main
-# Auto-tag release workflow pushes vX.Y.Z if missing → Release workflow runs.
+# Auto-tag: creates vX.Y.Z if missing → dispatches Release (--ref main -f tag=…).
 # Manual fallback if auto-tag is disabled or failed:
-#   git tag vX.Y.Z && git push origin vX.Y.Z
+#   git tag -a vX.Y.Z -m "release: X.Y.Z" && git push origin vX.Y.Z
+#   # or: gh workflow run Release --ref main -f tag=vX.Y.Z
 
 gh run list --workflow="Auto-tag release" --limit 3
 gh run list --workflow=Release --limit 3
@@ -294,23 +308,50 @@ gh pr checks
 
 | Job | Role |
 |-----|------|
-| `lint` | Ruff check + format |
+| `lint` | Tag↔pyproject + CHANGELOG gate, then Ruff check + format |
 | `test` | Full pytest on ubuntu / macos / windows |
 | `gate` | Aborts release if lint or any OS test failed |
-| `build` | Nuitka → AppImage / DMG / Windows setup |
-| sign / publish | Cosign + GitHub Release upload |
+| `build` | Nuitka → AppImage / DMG / Windows setup (180m timeout; LTO + Qt strip aligned with `make bundle`) |
+| `sign-windows` | Optional SignPath Authenticode (skipped unless vars configured; runs **before** Cosign) |
+| `sign` | Assemble final bits → Cosign keyless + `actions/attest-build-provenance` |
+| `release` | CHANGELOG section + verify notes → single GitHub Release upload |
 
-Local package only: `make bundle` (no GitHub Release).
+Local package only: `make bundle` (no GitHub Release). Shared Nuitka strip/LTO
+flags match CI; packaging (DMG/AppImage/Inno) is CI-only.
+
+### Actions hygiene
+
+- Third-party actions are **SHA-pinned** with trailing `# vX` comments.
+- [`.github/dependabot.yml`](.github/dependabot.yml) opens weekly grouped PRs for
+  `github-actions` bumps.
+- `astral-sh/setup-uv` pins **uv 0.12.3** (not `latest`).
+- AppImage packaging pins **appimagetool 1.9.1** and verifies SHA-256.
+
+### SignPath (optional Windows Authenticode)
+
+Skipped until you set repository **variables** (and matching **secrets**):
+
+| Kind | Name |
+|------|------|
+| secret | `SIGNPATH_API_TOKEN`, `SIGNPATH_ORGANIZATION_ID` |
+| variable | `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG` |
+| variable (optional) | `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` (default `exr_converter`) |
+
+Also install the SignPath GitHub App and create a project/policy/artifact
+configuration in the SignPath dashboard. When `SIGNPATH_PROJECT_SLUG` is empty,
+`sign-windows` is skipped and the unsigned Inno setup is published (Cosign still
+applies).
 
 ### Checklist before shipping
 
 - [ ] Feature work tested (`make test` / PR CI)
-- [ ] **[CHANGELOG.md](./CHANGELOG.md)** updated: `[Unreleased]` rolled into `[X.Y.Z]`
+- [ ] **[CHANGELOG.md](./CHANGELOG.md)** updated: `[Unreleased]` rolled into `[X.Y.Z]` **and** bottom compare link `[X.Y.Z]:` updated
 - [ ] On branch `release/X.Y.Z` (not direct push to `main`)
 - [ ] Working tree free of unrelated unstaged work
 - [ ] Correct `PART`; `make release … PUSH=0` → PR → merge
-- [ ] Auto-tag (or manual `git push origin vX.Y.Z`) fires Release; `gh run watch` green
+- [ ] Auto-tag (or manual tag / `gh workflow run`) fires Release; `gh run watch` green
 - [ ] `gh release view vX.Y.Z` has artifacts + signatures
+- [ ] After merge: **do not** also push a local tag unless Auto-tag failed
 
 ### Troubleshooting
 
@@ -319,15 +360,36 @@ Local package only: `make bundle` (no GitHub Release).
 | `GH013` / must use pull request | Use `release/X.Y.Z` + PR; `PUSH=0` |
 | Required status checks on main | Ship via PR so `ci-ok` runs on the PR head |
 | `No changes to commit` from `make release` | Version already bumped; `python3 scripts/bump_app_version.py show` |
+| Auto-tag refuses: CHANGELOG missing section | Add `## [X.Y.Z]` + `[X.Y.Z]:` compare link, merge fix PR |
 | Tag exists locally not on remote | After merge, retag if needed, `git push origin vX.Y.Z`. Never force-push a published public tag lightly |
 | Gate red on Release | Fix forward with a new patch; prefer not rewriting a published tag |
 | Wrong version in GUI binary | Tag must be `vX.Y.Z`; check inject-version step and `APP_VERSION` on the tagged commit |
 | OCIO 2.4 vs 2.5 in CI/local | `scripts/ensure_ocio.py` / `make ensure-ocio` |
+| `Unable to reserve cache` (setup-uv) | Benign race if two writers share a key; CI/Release use `cache-suffix` + lint `save-cache: false` |
+| Two Release runs for one tag | Concurrency group `release-vX.Y.Z` queues; avoid double-trigger (tag push + dispatch) |
 
 ### Artifact verification (users)
 
-Cosign keyless signatures ship as `*.sigstore.json` next to each asset. See README
-/ GitHub Release body for `cosign verify-blob` commands.
+**Cosign** keyless signatures ship as `*.sigstore.json` next to each asset.
+Auto-tag dispatches Release from **main**, so the OIDC certificate identity is
+typically:
+
+`https://github.com/derek-rein/exr-converter/.github/workflows/release.yml@refs/heads/main`
+
+(A pure human `git push` of the tag uses `@refs/tags/vX.Y.Z` instead.)
+
+```bash
+cosign verify-blob <ARTIFACT_FILE> \
+  --bundle <ARTIFACT_FILE>.sigstore.json \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github.com/derek-rein/exr-converter/\.github/workflows/release\.yml@refs/(heads/main|tags/v.+)'
+```
+
+**GitHub Attestations** (SLSA-style build provenance) are also recorded:
+
+```bash
+gh attestation verify <ARTIFACT_FILE> -R derek-rein/exr-converter
+```
 
 ### macOS Gatekeeper
 
@@ -343,8 +405,8 @@ xattr -cr "/Applications/EXR Converter.app"
 |----------|---------|------|
 | [CI](.github/workflows/ci.yml) | push / PR to `main` | Ruff + full pytest on 3 OS; job **`ci-ok`** requires all green |
 | [Docs](.github/workflows/docs.yml) | push / PR paths under `docs/`, `site/` | Hugo build; deploy to Pages on `main` only |
-| [Auto-tag release](.github/workflows/auto-tag-release.yml) | push to `main` | If `pyproject` version has no `vX.Y.Z` tag → push tag |
-| [Release](.github/workflows/release.yml) | tag `v*` | Same lint + tests via **`gate`** before Nuitka / publish |
+| [Auto-tag release](.github/workflows/auto-tag-release.yml) | push to `main` | CHANGELOG gate; if no `vX.Y.Z` tag → push tag; if no GitHub Release and no active run → `workflow_dispatch` Release |
+| [Release](.github/workflows/release.yml) | tag `v*` **or** `workflow_dispatch` | Tag/CHANGELOG validate + lint + tests via **`gate`** before Nuitka / Cosign / publish |
 
 Branch protection on `main` should require `ci-ok`.
 

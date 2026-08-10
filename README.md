@@ -15,7 +15,10 @@ Targets the [VFX Reference Platform CY2026](https://vfxplatform.com/#reference-p
 | macOS Intel | [**DMG**](https://github.com/derek-rein/exr-converter/releases/latest/download/exr_converter-macos-x86_64.dmg) |
 | Linux x86_64 | [**AppImage**](https://github.com/derek-rein/exr-converter/releases/latest/download/exr_converter-linux-x86_64.AppImage) |
 
-All release artifacts are [signed with Sigstore Cosign](https://docs.sigstore.dev/) — see the [releases page](https://github.com/derek-rein/exr-converter/releases) for verification instructions.
+All release artifacts are [signed with Sigstore Cosign](https://docs.sigstore.dev/)
+and carry [GitHub build provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds)
+— see the [releases page](https://github.com/derek-rein/exr-converter/releases)
+for `cosign verify-blob` and `gh attestation verify` commands.
 
 ### Running on macOS
 

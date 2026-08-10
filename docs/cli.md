@@ -117,7 +117,7 @@ uv run python main.py exr2video -i ./plate --codec h264 --crf 18
 
 | Option | Default | Notes |
 |--------|---------|--------|
-| `-i` / `--input` | *(required)* | Sequence **directory** or any **existing frame** from the sequence (not a literal `####` path that does not exist on disk) |
+| `-i` / `--input` | *(required)* | Sequence **directory** or any **existing frame** from the sequence (``name.####.ext`` or ``name_####.ext``; not a literal `####` path that does not exist on disk) |
 | `-o` / `--output` | next to sequence | Video path; default extension follows codec family (below) |
 | `--fps` | `24` | Frame rate |
 | `--ocio` | bundled / `$OCIO` | Config file path |

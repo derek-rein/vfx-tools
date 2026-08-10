@@ -99,6 +99,8 @@ src/rc_resources.py: resources.qrc resources/icons/icon.png resources/style.qss
 
 ICON ?= resources/icons/icon.icns
 
+# Shared Nuitka strip flags must stay aligned with .github/workflows/release.yml
+# (LTO + Qt noinclude set). Local target is macOS-oriented; CI is multi-OS.
 bundle: resources
 	$(UV) sync --group bundle
 	$(PYTHON) scripts/ensure_ocio.py
@@ -169,12 +171,15 @@ release:
 	git add pyproject.toml src/core/constants.py uv.lock; \
 	if git diff --staged --quiet; then echo "No changes to commit."; exit 1; fi; \
 	git commit -m "release: $${VERSION}"; \
-	git tag "$${TAG}"; \
-	echo "Created commit + tag $${TAG}"; \
+	git tag -a "$${TAG}" -m "release: $${VERSION}"; \
+	echo "Created commit + annotated tag $${TAG}"; \
 	if [ "$(PUSH)" = "1" ]; then \
 	  git push origin HEAD; \
 	  git push origin "$${TAG}"; \
 	  echo "Pushed branch and tag $${TAG} (Release workflow runs on tag push)."; \
+	  echo "NOTE: under protected main prefer PUSH=0 + PR; Auto-tag dispatches Release after merge."; \
+	  echo "Do NOT also re-push the same tag after merge — Auto-tag handles that path."; \
 	else \
-	  echo "PUSH=0: tag is local only. To run Release workflow: git push origin HEAD && git push origin $${TAG}"; \
+	  echo "PUSH=0: tag is local only. Preferred path: push branch → PR → merge → Auto-tag dispatches Release."; \
+	  echo "Manual fallback if Auto-tag is disabled: git push origin HEAD && git push origin $${TAG}"; \
 	fi

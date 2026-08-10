@@ -1,0 +1,13 @@
+# Workflows pin actions by full SHA with trailing `# vX` comments so Dependabot
+# can bump pins.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

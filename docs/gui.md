@@ -25,7 +25,7 @@ from a Read — see [nuke.md](./nuke.md).
 | Tab | Direction | Notes |
 |-----|-----------|--------|
 | **Video → EXR** | Decode video → OCIO → EXR sequence | **Ingest only** — never slate / burn-in / watermark. Output field uses ``name.####.exr``; that basename is written (not forced to the video stem). |
-| **EXR → Video** | Image sequence → OCIO → video | OpenEXR primary; also DPX, PNG, JPEG, WebP. Slate / burn-in / watermark via that tab’s controls. Sequences must be ``name.####.ext`` (dot pad). |
+| **EXR → Video** | Image sequence → OCIO → video | OpenEXR primary; also DPX, PNG, JPEG, WebP. Slate / burn-in / watermark via that tab’s controls. Sequences may use ``name.####.ext`` or ``name_####.ext`` pads. |
 
 Mode can be forced with `--mode video2exr|exr2video`, or inferred from `--open`
 (`auto`: image-sequence paths open **EXR → Video**, common video extensions open
@@ -46,9 +46,10 @@ Right-click the **Input** or **Output** path field for:
 field, **⌘-click** (macOS) or **Ctrl-click** (Windows/Linux) on **Browse…**
 reveals that path in the OS file manager instead.
 
-**Sequence browser** lists every supported still sequence in a folder. Mixed
-folders prefer EXR, then DPX. Display-encoded stills (PNG/JPEG/WebP) auto-suggest
-an **sRGB** source color space; EXR/DPX default toward scene-linear / metadata.
+**Sequence browser** lists every supported still sequence in a folder
+(``name.####.ext`` or ``name_####.ext``). Mixed folders prefer EXR, then DPX.
+Display-encoded stills (PNG/JPEG/WebP) auto-suggest an **sRGB** source color
+space; EXR/DPX default toward scene-linear / metadata.
 
 **Views:** the top bar has **List | Grid | Preview** plus **Inspect** (always
 available). **List** is the metadata table; **Grid** shows first-frame
@@ -62,8 +63,22 @@ Preview ↔ last list/grid mode; **Esc** leaves Preview; **Left/Right** step
 frames. Double-click or **Open** commits the **selected** sequence via its
 **first-frame path** (not the folder alone), so multi-sequence directories keep
 the chosen basename through convert, restore, and slate. Typing only a
-directory still resolves to the preferred first sequence on disk (EXR, then
-DPX). The slate editor reuses the player with live burn-in/watermark overlays.
+directory still resolves a default sequence on disk (EXR first, then DPX;
+prefers a basename matching the folder name when several sequences share the
+folder). The slate editor reuses the player with live burn-in/watermark overlays.
+
+**Volumes / drives:** both browsers show mounted volumes as **top-level** rows
+in the folder tree and under a **Volumes** heading in the places sidebar
+(system disk first, then other mounts by name). That covers:
+
+| Platform | What you see |
+|----------|----------------|
+| **macOS** | Boot volume (e.g. Macintosh HD) plus each entry under `/Volumes` (USB, network, disk images). macOS hides `/Volumes` from a plain “root `/`” file model, so sticks would otherwise be invisible. |
+| **Windows** | Each drive letter (`C:\`, `D:\`, …), not only the system drive. |
+| **Linux** | `/` plus user-facing mounts (typically `/media/…`, `/mnt/…`, `/run/media/…`); pseudo filesystems (`proc`, `sysfs`, …) are omitted. |
+
+The list refreshes every few seconds while Browse is open so plug-in / eject
+updates without restarting the dialog.
 
 **Browser layout memory** (both input browsers):
 

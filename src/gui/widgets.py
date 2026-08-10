@@ -46,7 +46,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFileSystemModel,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -127,6 +126,7 @@ from .browser_state import (
     settings_bool,
     tree_vscroll_value,
 )
+from .browser_volumes import MultiRootDirModel, list_browser_volumes
 from .preferences import (
     file_manager_label,
     path_is_revealable,
@@ -748,15 +748,41 @@ class _FavoritesDropList(QListWidget):
             super().dropEvent(event)
 
 
+def _places_divider_item(list_widget: QListWidget) -> None:
+    """Insert a thin horizontal rule row into a places list."""
+    divider = QListWidgetItem()
+    divider.setFlags(Qt.ItemFlag.NoItemFlags)
+    divider.setSizeHint(divider.sizeHint().expandedTo(QWidget().sizeHint()))
+    list_widget.addItem(divider)
+
+    from .style import _PALETTE
+
+    frame = QWidget()
+    frame_layout = QVBoxLayout(frame)
+    frame_layout.setContentsMargins(4, 6, 4, 4)
+    frame_layout.setSpacing(0)
+    line = QWidget()
+    line.setFixedHeight(1)
+    line.setStyleSheet(f"background: {_PALETTE['BORDER']};")
+    frame_layout.addWidget(line)
+    list_widget.setItemWidget(divider, frame)
+
+
 class _PlacesSidebar(QWidget):
-    """Sidebar listing OS locations and user-defined favorite directories."""
+    """Sidebar listing volumes, OS locations, and user-defined favorites."""
 
     navigate_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setFixedWidth(140)
+        self.setFixedWidth(150)
         self._current_dir = ""
+        # Row ranges for rebuildable sections (volumes + static places stay fixed
+        # after first build except the volumes block which is refreshed).
+        self._vol_header_row = -1
+        self._vol_start = 0
+        self._vol_end = 0  # exclusive
+        self._fav_start = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -768,6 +794,20 @@ class _PlacesSidebar(QWidget):
         self._list.customContextMenuRequested.connect(self._ctx_menu)
         self._list.dirs_dropped.connect(self._on_dirs_dropped)
 
+        # -- Volumes (drives / external media) — rebuilt by refresh_volumes --
+        vol_header = QListWidgetItem("Volumes")
+        vol_header.setFlags(Qt.ItemFlag.NoItemFlags)
+        font = vol_header.font()
+        font.setBold(True)
+        vol_header.setFont(font)
+        self._list.addItem(vol_header)
+        self._vol_header_row = 0
+        self._vol_start = 1
+        self._vol_end = 1
+        self._rebuild_volume_items()
+
+        _places_divider_item(self._list)
+
         for icon, name, location in _OS_PLACES:
             path = QStandardPaths.writableLocation(location)
             if not path or not Path(path).is_dir():
@@ -777,22 +817,7 @@ class _PlacesSidebar(QWidget):
             item.setToolTip(path)
             self._list.addItem(item)
 
-        divider = QListWidgetItem()
-        divider.setFlags(Qt.ItemFlag.NoItemFlags)
-        divider.setSizeHint(divider.sizeHint().expandedTo(QWidget().sizeHint()))
-        self._list.addItem(divider)
-
-        from .style import _PALETTE
-
-        frame = QWidget()
-        frame_layout = QVBoxLayout(frame)
-        frame_layout.setContentsMargins(4, 6, 4, 4)
-        frame_layout.setSpacing(0)
-        line = QWidget()
-        line.setFixedHeight(1)
-        line.setStyleSheet(f"background: {_PALETTE['BORDER']};")
-        frame_layout.addWidget(line)
-        self._list.setItemWidget(divider, frame)
+        _places_divider_item(self._list)
 
         header = QListWidgetItem("\u2605  Favorites")
         header.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -827,6 +852,31 @@ class _PlacesSidebar(QWidget):
         layout.addLayout(btn_row)
 
         self._list.itemClicked.connect(self._on_clicked)
+
+    def refresh_volumes(self) -> None:
+        """Rescan mounted volumes in the places list."""
+        self._rebuild_volume_items()
+
+    def _rebuild_volume_items(self) -> None:
+        """Replace volume rows under the Volumes header without touching favorites."""
+        # Remove previous volume rows (from _vol_start to _vol_end exclusive).
+        while self._vol_end > self._vol_start:
+            self._list.takeItem(self._vol_start)
+            self._vol_end -= 1
+            self._fav_start = max(self._vol_start, self._fav_start - 1)
+
+        volumes = list_browser_volumes()
+        insert_at = self._vol_start
+        for vol in volumes:
+            # Prefer a disk glyph; system root gets a computer glyph.
+            icon = "\U0001f5a5" if vol.is_system_root else "\U0001f4be"
+            item = QListWidgetItem(f"{icon}  {vol.name}")
+            item.setData(Qt.ItemDataRole.UserRole, vol.path)
+            item.setToolTip(vol.path)
+            self._list.insertItem(insert_at, item)
+            insert_at += 1
+            self._fav_start += 1
+        self._vol_end = insert_at
 
     def set_current_dir(self, path: str) -> None:
         self._current_dir = path
@@ -895,7 +945,7 @@ class _PlacesSidebar(QWidget):
         save_favorite_paths(favs)
 
 
-def _setup_dir_tree(tree: QTreeView, fs_model: QFileSystemModel, places: _PlacesSidebar) -> None:
+def _setup_dir_tree(tree: QTreeView, fs_model: MultiRootDirModel, places: _PlacesSidebar) -> None:
     """Enable dragging folders to favorites + a right-click menu on a dir tree."""
     tree.setDragEnabled(True)
     tree.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
@@ -920,7 +970,7 @@ def _setup_dir_tree(tree: QTreeView, fs_model: QFileSystemModel, places: _Places
     tree.customContextMenuRequested.connect(_menu)
 
 
-def _tree_click_toggle_expand(tree: QTreeView, fs_model: QFileSystemModel, index) -> None:
+def _tree_click_toggle_expand(tree: QTreeView, fs_model: MultiRootDirModel, index) -> None:
     """Single-click folder: expand if collapsed, collapse if already expanded.
 
     Branch-indicator clicks are handled by QTreeView itself (and do not emit
@@ -933,6 +983,24 @@ def _tree_click_toggle_expand(tree: QTreeView, fs_model: QFileSystemModel, index
         tree.collapse(index)
     else:
         tree.expand(index)
+
+
+def _wire_volume_refresh(
+    places: _PlacesSidebar,
+    model: MultiRootDirModel,
+    parent: QObject,
+) -> QTimer:
+    """Poll mounts so USB plug-in/eject updates places + tree roots."""
+
+    def _tick() -> None:
+        places.refresh_volumes()
+        model.refresh_volumes()
+
+    timer = QTimer(parent)
+    timer.setInterval(3000)
+    timer.timeout.connect(_tick)
+    timer.start()
+    return timer
 
 
 # ---------------------------------------------------------------------------
@@ -1551,18 +1619,17 @@ class SequenceBrowserDialog(QDialog):
         self._places = _PlacesSidebar()
         self._places.navigate_requested.connect(self._navigate_to)
 
-        self._fs_model = QFileSystemModel()
-        self._fs_model.setRootPath(QDir.rootPath())
-        self._fs_model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
+        # Multi-root: each mounted volume is a top-level row (macOS /Volumes is
+        # hidden from QFileSystemModel under ``/``; Windows other drives too).
+        self._fs_model = MultiRootDirModel(self)
         self._tree = QTreeView()
         self._tree.setModel(self._fs_model)
         self._tree.setHeaderHidden(True)
-        for col in range(1, self._fs_model.columnCount()):
-            self._tree.hideColumn(col)
         self._tree.setMinimumWidth(200)
         tree_header = self._tree.header()
         tree_header.setStretchLastSection(True)
         tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._volume_timer = _wire_volume_refresh(self._places, self._fs_model, self)
 
         self._searchable_tree = _SearchableTree(self._tree, dirs_only=True)
         self._searchable_tree.result_navigated.connect(self._navigate_to)
@@ -2594,18 +2661,15 @@ class VideoBrowserDialog(QDialog):
         self._places = _PlacesSidebar()
         self._places.navigate_requested.connect(self._navigate_to)
 
-        self._fs_model = QFileSystemModel()
-        self._fs_model.setRootPath(QDir.rootPath())
-        self._fs_model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
+        self._fs_model = MultiRootDirModel(self)
         self._tree = QTreeView()
         self._tree.setModel(self._fs_model)
         self._tree.setHeaderHidden(True)
-        for col in range(1, self._fs_model.columnCount()):
-            self._tree.hideColumn(col)
         self._tree.setMinimumWidth(200)
         tree_header = self._tree.header()
         tree_header.setStretchLastSection(True)
         tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._volume_timer = _wire_volume_refresh(self._places, self._fs_model, self)
 
         self._searchable_tree = _SearchableTree(self._tree, ext_filter=_VIDEO_EXTS)
         self._searchable_tree.result_navigated.connect(self._navigate_to)
