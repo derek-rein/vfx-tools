@@ -133,6 +133,46 @@ def _bridge_names() -> tuple[str, ...]:
     return ("libr3d_bridge.so",)
 
 
+def _is_frozen_app() -> bool:
+    """True inside a Nuitka / PyInstaller-style binary (not a source checkout)."""
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        return True
+    # Nuitka marks compiled modules with ``__compiled__``.
+    return globals().get("__compiled__") is not None
+
+
+def _runtime_exe_dirs() -> list[Path]:
+    """Directories that may sit next to the real application binary.
+
+    Always consider ``sys.executable`` / ``argv[0]`` — Nuitka standalone often
+    does **not** set ``sys.frozen``, so relying only on that misses the
+    private ``r3d/`` folder we install next to the launcher.
+    """
+    dirs: list[Path] = []
+    for raw in (sys.executable, sys.argv[0] if sys.argv else ""):
+        if not raw:
+            continue
+        try:
+            p = Path(raw).resolve()
+        except OSError:
+            continue
+        if p.is_file():
+            dirs.append(p.parent)
+        elif p.is_dir():
+            dirs.append(p)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(Path(meipass))
+    # macOS .app: private redistributables live under Contents/MacOS/r3d/.
+    for d in list(dirs):
+        if d.name == "MacOS" and d.parent.name == "Contents":
+            dirs.append(d.parent / "Resources")
+        elif (d / "MacOS").is_dir():
+            dirs.append(d / "MacOS")
+            dirs.append(d / "Resources")
+    return dirs
+
+
 def _bridge_candidates() -> list[Path]:
     """Search paths for libr3d_bridge.*"""
     names = _bridge_names()
@@ -147,16 +187,16 @@ def _bridge_candidates() -> list[Path]:
         else:
             dirs.append(p)
 
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
+    # Prefer private app folder next to the binary (packaged + frozen).
+    for exe_dir in _runtime_exe_dirs():
         dirs.append(exe_dir / "r3d")
         dirs.append(exe_dir)
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            dirs.append(Path(meipass) / "r3d")
-            dirs.append(Path(meipass))
 
-    pkg_root = Path(__file__).resolve().parents[2]
+    # Dev / source checkout layouts.
+    try:
+        pkg_root = Path(__file__).resolve().parents[2]
+    except Exception:
+        pkg_root = Path.cwd()
     dirs.extend(
         [
             pkg_root / "build" / "r3d",
@@ -214,17 +254,19 @@ def _redistributable_candidates(bridge_path: Path | None) -> list[Path]:
         roots.append(bridge_path.parent)
         roots.append(bridge_path.parent / "redistributable")
 
-    pkg_root = Path(__file__).resolve().parents[2]
+    for exe_dir in _runtime_exe_dirs():
+        roots.append(exe_dir / "r3d")
+        roots.append(exe_dir)
+
+    try:
+        pkg_root = Path(__file__).resolve().parents[2]
+    except Exception:
+        pkg_root = Path.cwd()
     roots.append(pkg_root / "build" / "r3d" / "redistributable")
     roots.append(pkg_root / "resources" / "r3d")
     # Local SDK drop (developer machine only; gitignored).
     for name in ("R3DSDKv9_2_1", "R3DSDK"):
         roots.append(pkg_root / name / "Redistributable" / sub)
-
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        roots.append(exe_dir / "r3d")
-        roots.append(exe_dir)
 
     out: list[Path] = []
     seen: set[Path] = set()
@@ -356,12 +398,13 @@ def ensure_initialized() -> bool:
 
     lib = _load_library()
     if lib is None:
+        tried = ", ".join(str(p) for p in _bridge_candidates()[:12])
         _init_error = (
             "R3D bridge library not found. Build with "
             "`python3 scripts/build_r3d_bridge.py` after installing the RED R3D SDK "
-            "(see docs/r3d.md)."
+            f"(see docs/r3d.md). Tried: {tried}"
         )
-        log.debug(_init_error)
+        log.warning("%s (frozen=%s exe=%s)", _init_error, _is_frozen_app(), sys.executable)
         return False
 
     bridge_path = getattr(lib, "_bridge_path", None)
