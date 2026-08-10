@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,30 @@ def test_red_notice_is_nonempty() -> None:
 
     assert "RED" in RED_REDISTRIBUTABLE_NOTICE
     assert "reverse engineer" in RED_REDISTRIBUTABLE_NOTICE.lower()
+
+
+def test_bridge_candidates_include_exe_r3d_dir(monkeypatch, tmp_path: Path) -> None:
+    """Packaged apps place libr3d_bridge next to the binary under r3d/."""
+    from src.core import r3d as r3d_mod
+
+    fake_exe = tmp_path / "MacOS" / "exr_converter"
+    fake_exe.parent.mkdir(parents=True)
+    fake_exe.write_bytes(b"")
+    # Use the platform-native bridge filename (Linux CI looks for .so, not .dylib).
+    bridge_name = r3d_mod._bridge_names()[0]
+    bridge = tmp_path / "MacOS" / "r3d" / bridge_name
+    bridge.parent.mkdir(parents=True)
+    bridge.write_bytes(b"")
+
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    monkeypatch.setattr(sys, "argv", [str(fake_exe)])
+    # Simulate Nuitka not setting sys.frozen.
+    if hasattr(sys, "frozen"):
+        monkeypatch.delattr(sys, "frozen", raising=False)
+
+    cands = r3d_mod._bridge_candidates()
+    assert any(p.name == bridge_name and "r3d" in p.parts for p in cands)
+    assert bridge.resolve() in {p.resolve() for p in cands if p.exists()}
 
 
 def _force_r3d_unavailable() -> tuple:
