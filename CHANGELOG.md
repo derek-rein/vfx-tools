@@ -15,6 +15,17 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.8.2] — 2026-08-10
+
+### Fixed
+
+- **GitHub Release publish when SignPath is off:** optional Windows Authenticode
+  job no longer blocks the publish step (v0.8.1 built and Cosigned all platform
+  binaries but never created the GitHub Release). Re-ships the 0.8.1 product
+  fixes and release-pipeline hardening with a working publish path.
+
+---
+
 ## [0.8.1] — 2026-08-10
 
 ### Changed
@@ -506,7 +517,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/derek-rein/exr-converter/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/derek-rein/exr-converter/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/derek-rein/exr-converter/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/derek-rein/exr-converter/compare/v0.6.1...v0.7.0
