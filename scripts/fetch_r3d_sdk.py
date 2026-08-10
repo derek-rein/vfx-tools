@@ -173,9 +173,9 @@ def main() -> None:
     cache.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="r3d-sdk-") as tmp:
         tarball = Path(tmp) / args.asset
-        print(f"Downloading {args.repo}@{args.tag} / {args.asset} …", file=sys.stderr)
+        print(f"Downloading {args.repo}@{args.tag} / {args.asset} ...", file=sys.stderr)
         _api_download(args.repo, args.tag, args.asset, tarball, token)
-        print(f"Extracting → {cache}", file=sys.stderr)
+        print(f"Extracting -> {cache}", file=sys.stderr)
         # Clean previous extract of same layout.
         for child in list(cache.iterdir()) if cache.is_dir() else []:
             if child.name.startswith("R3DSDK") or child.name == "Include":

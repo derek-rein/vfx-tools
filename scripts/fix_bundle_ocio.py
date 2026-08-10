@@ -162,7 +162,7 @@ def _macos_fix(ext: Path, src_ext: Path, src_lib: Path) -> None:
             f"{ext} still has only OpenColorIO_v2_4 undefined symbols — "
             f"build-env extension was not restored correctly"
         )
-    print(f"fix_bundle_ocio: macOS — {ext.name} → @loader_path/libOpenColorIO.dylib")
+    print(f"fix_bundle_ocio: macOS - {ext.name} -> @loader_path/libOpenColorIO.dylib")
     print(f"fix_bundle_ocio: copied {dest_lib} ({dest_lib.stat().st_size} bytes)")
 
 
