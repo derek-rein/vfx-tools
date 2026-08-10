@@ -74,6 +74,7 @@ def test_bridge_candidates_include_exe_r3d_dir(monkeypatch, tmp_path: Path) -> N
     assert any(p.name == bridge_name and "r3d" in p.parts for p in cands)
     assert bridge.resolve() in {p.resolve() for p in cands if p.exists()}
 
+
 def _force_r3d_unavailable() -> tuple:
     """Return previous r3d module state after forcing unavailable."""
     from src.core import r3d as r3d_mod
