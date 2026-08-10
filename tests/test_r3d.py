@@ -58,7 +58,9 @@ def test_bridge_candidates_include_exe_r3d_dir(monkeypatch, tmp_path: Path) -> N
     fake_exe = tmp_path / "MacOS" / "exr_converter"
     fake_exe.parent.mkdir(parents=True)
     fake_exe.write_bytes(b"")
-    bridge = tmp_path / "MacOS" / "r3d" / "libr3d_bridge.dylib"
+    # Use the platform-native bridge filename (Linux CI looks for .so, not .dylib).
+    bridge_name = r3d_mod._bridge_names()[0]
+    bridge = tmp_path / "MacOS" / "r3d" / bridge_name
     bridge.parent.mkdir(parents=True)
     bridge.write_bytes(b"")
 
@@ -69,9 +71,8 @@ def test_bridge_candidates_include_exe_r3d_dir(monkeypatch, tmp_path: Path) -> N
         monkeypatch.delattr(sys, "frozen", raising=False)
 
     cands = r3d_mod._bridge_candidates()
-    assert any(p.name.startswith("libr3d_bridge") and "r3d" in p.parts for p in cands)
-    assert bridge in {p.resolve() for p in cands if p.exists()}
-
+    assert any(p.name == bridge_name and "r3d" in p.parts for p in cands)
+    assert bridge.resolve() in {p.resolve() for p in cands if p.exists()}
 
 def _force_r3d_unavailable() -> tuple:
     """Return previous r3d module state after forcing unavailable."""
