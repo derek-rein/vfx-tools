@@ -15,9 +15,21 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from PySide6.QtCore import QByteArray, QModelIndex, QSettings
-from PySide6.QtWidgets import QFileSystemModel, QTreeView
+from PySide6.QtWidgets import QTreeView
+
+
+@runtime_checkable
+class DirTreeModel(Protocol):
+    """Subset of QFileSystemModel / MultiRootDirModel used by browser helpers."""
+
+    def index(self, *args): ...  # path str or (row, col, parent)
+    def filePath(self, index: QModelIndex) -> str: ...
+    def isDir(self, index: QModelIndex) -> bool: ...
+    def rowCount(self, parent: QModelIndex = ...) -> int: ...
+
 
 # Shared by sequence + video browsers.
 BROWSER_GEOMETRY_KEY = "ui/browser_geometry"
@@ -208,7 +220,7 @@ def save_shared_geometry(geometry: QByteArray, settings: QSettings | None = None
     s.setValue(BROWSER_GEOMETRY_KEY, geometry)
 
 
-def collect_expanded_dirs(tree: QTreeView, model: QFileSystemModel) -> list[str]:
+def collect_expanded_dirs(tree: QTreeView, model: DirTreeModel) -> list[str]:
     """Return absolute paths of expanded directories currently loaded in the model."""
     out: list[str] = []
 
@@ -228,7 +240,7 @@ def collect_expanded_dirs(tree: QTreeView, model: QFileSystemModel) -> list[str]
     return out
 
 
-def expand_path_chain(tree: QTreeView, model: QFileSystemModel, path: str) -> bool:
+def expand_path_chain(tree: QTreeView, model: DirTreeModel, path: str) -> bool:
     """Expand every ancestor of *path* (and the path itself if it is a dir)."""
     if not path:
         return False
@@ -263,7 +275,7 @@ def expand_path_chain(tree: QTreeView, model: QFileSystemModel, path: str) -> bo
 
 def restore_tree_expanded(
     tree: QTreeView,
-    model: QFileSystemModel,
+    model: DirTreeModel,
     paths: list[str],
     focus_path: str = "",
 ) -> None:

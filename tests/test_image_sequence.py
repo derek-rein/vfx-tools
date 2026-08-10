@@ -149,7 +149,8 @@ class TestSequenceDiscovery:
         assert pad >= 4
         assert seq.extension().lower() == ".png"
 
-    def test_underscore_sequences_ignored(self, tmp_path: Path) -> None:
+    def test_underscore_sequences_discovered(self, tmp_path: Path) -> None:
+        """Reads accept both name.####.ext and name_####.ext pads."""
         d = tmp_path / "mix"
         d.mkdir()
         for fnum in (1, 2, 3):
@@ -159,16 +160,43 @@ class TestSequenceDiscovery:
                 compression="zip",
             )
             write_exr(
-                str(d / f"bad_{fnum:05d}.exr"),
+                str(d / f"also_{fnum:05d}.exr"),
                 np.full((4, 4, 3), 0.9, dtype=np.float32),
                 compression="zip",
             )
-        paths, basename = find_exr_sequence(str(d))
-        assert basename == "good"
-        assert all("bad_" not in p for p in paths)
         rows = scan_exr_sequences(str(d))
-        assert len(rows) == 1
-        assert rows[0]["name"] == "good"
+        names = {r["name"] for r in rows}
+        assert names == {"good", "also"}
+        # Directory default: first by basename when neither matches folder name.
+        paths, basename = find_exr_sequence(str(d))
+        assert basename in names
+        assert len(paths) == 3
+        # Selecting an underscore frame resolves that sequence fully.
+        paths_u, name_u, frames_u, _pad, _seq = find_exr_sequence_info(str(d / "also_00001.exr"))
+        assert name_u == "also"
+        assert frames_u == [1, 2, 3]
+        assert all("also_" in p for p in paths_u)
+
+    def test_folder_name_prefers_matching_sequence(self, tmp_path: Path) -> None:
+        """Folder ``shot`` prefers ``shot_####`` over ``shot-alt.####``."""
+        d = tmp_path / "shot"
+        d.mkdir()
+        for fnum in (1001, 1002):
+            write_exr(
+                str(d / f"shot-alt.{fnum:04d}.exr"),
+                np.full((4, 4, 3), 0.2, dtype=np.float32),
+                compression="zip",
+            )
+            write_exr(
+                str(d / f"shot_{fnum:05d}.exr"),
+                np.full((4, 4, 3), 0.8, dtype=np.float32),
+                compression="zip",
+            )
+        paths, name, frames, _pad, seq = find_exr_sequence_info(str(d))
+        assert name == "shot"
+        assert frames == [1001, 1002]
+        assert all(Path(p).name.startswith("shot_") for p in paths)
+        assert str(seq.basename()).endswith("_")
 
     def test_parse_dot_sequence_output(self) -> None:
         d, name, pad = parse_dot_sequence_output("/tmp/out/04_5d-2.####.exr")

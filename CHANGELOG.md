@@ -15,6 +15,34 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.8.1] — 2026-08-10
+
+### Changed
+
+- **Release pipeline hardening:** tag/CHANGELOG gates, per-tag concurrency,
+  pinned actions + uv 0.12.3, appimagetool 1.9.1 with SHA-256, Cosign identity
+  bound to `release.yml`, GitHub build provenance attestations, CHANGELOG
+  section in GitHub Release notes, optional SignPath Authenticode job (off until
+  configured). Auto-tag uses `--ref main -f tag=vX.Y.Z` and skips re-dispatch
+  while a Release run is already active.
+
+### Fixed
+
+- **Underscore EXR sequences load again:** folder browse / EXR → Video input
+  re-accepts ``name_####.ext`` pads (e.g. ``04_5d_00000.exr``) that 0.7+ had
+  ignored while standardizing **writes** on ``name.####.ext``. Frame range
+  auto-fill and the sequence browser list both sequences when a folder mixes
+  pads. Opening a folder prefers a sequence whose name matches the folder
+  name. Video → EXR output still uses dot pads only.
+- **Browser volumes / drives at top level:** the sequence and video file trees
+  no longer hide external disks. On macOS, ``QFileSystemModel`` treats
+  ``/Volumes`` as hidden under ``/``, so sticks never appeared; on Windows,
+  only the system drive was rooted. Both browsers now use a multi-root tree
+  (each mount is a top-level row) plus a **Volumes** section in the places
+  sidebar. Mounts refresh every few seconds while Browse is open.
+
+---
+
 ## [0.8.0] — 2026-08-09
 
 ### Changed
@@ -478,7 +506,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/derek-rein/exr-converter/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/derek-rein/exr-converter/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/derek-rein/exr-converter/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/derek-rein/exr-converter/compare/v0.6.0...v0.6.1

@@ -6,8 +6,12 @@
 #   (GitHub recursion guard). So auto-tag must call `gh workflow run Release`
 #   after pushing the tag. That *does* work with GITHUB_TOKEN.
 #
+# Dispatch uses --ref main so the *workflow file* is latest; the build checks
+# out the tag via inputs.tag (see RELEASE_REF in release.yml).
+#
 # Also recovers: if the tag exists but no GitHub Release was published yet,
-# re-trigger Release (e.g. after a failed publish or the 0.5.1 gap).
+# re-trigger Release (e.g. after a failed publish). Skips re-dispatch while a
+# Release run is already queued/in progress to avoid stacking full Nuitka builds.
 
 name: Auto-tag release
 
@@ -28,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -45,6 +49,18 @@ jobs:
           fi
           TAG="v${VERSION}"
           echo "version=${VERSION} tag=${TAG}"
+
+          # Refuse to mint a tag for a version with no CHANGELOG section.
+          if ! grep -qE "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md missing '## [${VERSION}]' — refusing to tag" >&2
+            echo "Roll [Unreleased] into [X.Y.Z] on the release PR before merging." >&2
+            exit 1
+          fi
+          if ! grep -qE "^\[${VERSION}\]:" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md missing compare link '[${VERSION}]:' at bottom" >&2
+            exit 1
+          fi
+          echo "OK: CHANGELOG has section and compare link for ${VERSION}"
 
           TAG_EXISTS=false
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
@@ -66,6 +82,20 @@ jobs:
           # Publish if there is no GitHub Release yet (new tag or previous miss).
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "GitHub Release ${TAG} already exists — nothing to dispatch."
+            exit 0
+          fi
+
+          # Avoid stacking full multi-OS builds when a Release is already active
+          # (e.g. every main push while a publish is mid-flight). Concurrency on
+          # Release also serializes same-tag runs; this skips the expensive queue.
+          ACTIVE=$(
+            gh run list --workflow=Release --limit 30 \
+              --json status \
+              --jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="pending" or .status=="waiting" or .status=="requested")] | length'
+          )
+          if [ "${ACTIVE:-0}" -gt 0 ]; then
+            echo "Release workflow already active (${ACTIVE} run(s)) — skip re-dispatch."
+            echo "If it fails, the next main push (or: gh workflow run Release --ref main -f tag=${TAG}) will retry."
             exit 0
           fi
 

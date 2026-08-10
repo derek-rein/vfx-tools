@@ -12,9 +12,9 @@ from .constants import (
     is_scene_referred_image_ext,
 )
 
-# Canonical sequence naming for this app: ``name.####.ext`` (dot frame pad only).
-# fileseq reports basenames as ``name.`` for that form; underscore pads (``name_``)
-# are not supported for discovery or writing.
+# **Writes** use ``name.####.ext`` (dot frame pad only). **Reads** accept both
+# common pads: ``name.####.ext`` (fileseq basename ends with ``.``) and
+# ``name_####.ext`` (basename ends with ``_``).
 _DOT_PAD_PATTERN = re.compile(
     r"^(?P<name>.+)\.(?P<pad>#+)\.(?P<ext>[A-Za-z0-9]+)$",
     re.IGNORECASE,
@@ -33,6 +33,19 @@ def is_dot_frame_sequence(seq: fileseq.FileSequence) -> bool:
         return False
 
 
+def is_underscore_frame_sequence(seq: fileseq.FileSequence) -> bool:
+    """True when *seq* uses ``name_####.ext`` (basename ends with ``_``)."""
+    try:
+        return str(seq.basename()).endswith("_")
+    except Exception:
+        return False
+
+
+def is_supported_frame_sequence(seq: fileseq.FileSequence) -> bool:
+    """True when *seq* is a readable still sequence (dot or underscore pad)."""
+    return is_dot_frame_sequence(seq) or is_underscore_frame_sequence(seq)
+
+
 def parse_dot_sequence_output(
     path: str,
 ) -> tuple[str, str | None, int | None]:
@@ -44,7 +57,8 @@ def parse_dot_sequence_output(
     - ``/out/shot.1001.exr`` → ``("/out", "shot", None)`` (pad from UI/CLI)
     - ``/out`` or ``/out/`` → ``("/out", None, None)`` (name from video stem)
 
-    Underscore pads (``shot_####.exr``) are rejected with :class:`ValueError`.
+    Underscore pads (``shot_####.exr``) are rejected for **output** paths —
+    writes always use ``name.####.ext``. Reads still accept underscore pads.
     """
     raw = (path or "").strip()
     if not raw:
@@ -95,8 +109,10 @@ def _probe_resolution(filepath: str) -> tuple[int, int]:
 def _find_image_seqs(directory: str) -> list[fileseq.FileSequence]:
     """Return image FileSequences found in *directory*, sorted by format priority then basename.
 
-    Only **dot-padded** sequences (``name.####.ext``) are returned. Underscore
-    pads (``name_####.ext``) are ignored — this app always uses name-dot-frame.
+    Accepts both common pads:
+
+    - ``name.####.ext`` (dot) — preferred for **writing**
+    - ``name_####.ext`` (underscore) — common on disk from cameras / other tools
 
     OpenEXR sequences sort first so mixed folders still pick EXR by default.
     """
@@ -104,12 +120,36 @@ def _find_image_seqs(directory: str) -> list[fileseq.FileSequence]:
     out = [
         s
         for s in seqs
-        if is_image_sequence_ext(s.extension()) and s.frameSet() and is_dot_frame_sequence(s)
+        if is_image_sequence_ext(s.extension()) and s.frameSet() and is_supported_frame_sequence(s)
     ]
     return sorted(
         out,
         key=lambda s: (image_sequence_ext_priority(s.extension()), s.basename()),
     )
+
+
+def _pick_default_sequence(
+    seqs: list[fileseq.FileSequence],
+    directory: str,
+) -> fileseq.FileSequence:
+    """Choose a default sequence when the input is a folder (not a frame file).
+
+    Prefers a sequence whose basename matches the folder name (e.g. folder
+    ``04_5d`` → ``04_5d_#####.exr`` over ``04_5d-2.####.exr``), then falls
+    back to the sorted list order (EXR first, then basename).
+    """
+    if not seqs:
+        raise RuntimeError(f"No image sequences found in {directory}")
+    if len(seqs) == 1:
+        return seqs[0]
+    folder = Path(directory).name
+    if not folder:
+        return seqs[0]
+    exact = [s for s in seqs if s.basename().rstrip("._") == folder]
+    if exact:
+        # Prefer underscore/dot variants of the folder name; keep EXR-first order.
+        return exact[0]
+    return seqs[0]
 
 
 # Back-compat alias used by older call sites / tests.
@@ -334,7 +374,7 @@ def find_exr_sequence(input_path: str) -> tuple[list[str], str]:
             return [str(p)], p.stem
         raise RuntimeError(f"Not a supported image sequence frame: {p.name}")
 
-    seq = seqs[0]
+    seq = _pick_default_sequence(seqs, scan_dir)
     fs = seq.frameSet()
     if not fs:
         raise RuntimeError(f"Image sequence has no frames in {scan_dir}")
@@ -378,7 +418,7 @@ def find_exr_sequence_info(
             # Build a one-frame sequence for an isolated still.
             seq = fileseq.FileSequence(str(p))
     if seq is None:
-        seq = seqs[0]
+        seq = _pick_default_sequence(seqs, scan_dir)
 
     fs = seq.frameSet()
     if not fs:

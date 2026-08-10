@@ -2,10 +2,14 @@
 #
 # Triggers:
 #   1. push of tag v* (human / PAT push — GITHUB_TOKEN tag pushes do NOT fire this)
-#   2. workflow_dispatch on a tag ref (used by Auto-tag release after merge to main)
+#   2. workflow_dispatch (Auto-tag after merge: --ref main -f tag=vX.Y.Z)
 #
 # Gate: lint + full pytest suite (unit + integration) must pass on all
 # platforms before any Nuitka build or GitHub Release is published.
+#
+# Cosign OIDC identity for workflow_dispatch (normal auto-tag path) is:
+#   …/release.yml@refs/heads/main
+# For a human tag-push trigger it is …@refs/tags/vX.Y.Z.
 
 name: Release
 
@@ -29,6 +33,12 @@ on:
         type: string
         default: ""
 
+# One pipeline per tag across push:tags and workflow_dispatch. Never cancel an
+# in-flight Nuitka build — queue the newer run instead.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   id-token: write
@@ -46,15 +56,55 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - uses: astral-sh/setup-uv@v7
-        with:
-          version: "latest"
+      - name: Validate tag, pyproject version, and CHANGELOG
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '' }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          VERSION="${TAG#v}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: RELEASE_TAG must be vX.Y.Z, got: ${TAG}" >&2
+            exit 1
+          fi
+          PY=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$VERSION" != "$PY" ]; then
+            # Emergency rebuild: explicit source_ref may diverge from the tag.
+            if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$SOURCE_REF" ]; then
+              echo "WARNING: emergency rebuild source_ref=${SOURCE_REF}; tag ${TAG} vs pyproject ${PY}"
+            else
+              echo "ERROR: tag ${TAG} does not match pyproject version ${PY} on ${RELEASE_REF}" >&2
+              exit 1
+            fi
+          else
+            echo "OK: tag ${TAG} matches pyproject ${PY} on ${RELEASE_REF}"
+          fi
+          if ! grep -qE "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md missing '## [${VERSION}]' section — refuse to ship" >&2
+            exit 1
+          fi
+          if ! grep -qE "^\[${VERSION}\]:" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md missing compare link '[${VERSION}]:' at bottom" >&2
+            exit 1
+          fi
+          echo "OK: CHANGELOG has section and compare link for ${VERSION}"
 
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          enable-cache: true
+          # Same key as test (ubuntu) so we can restore what test saved;
+          # do not save here or we race the concurrent test matrix cell.
+          cache-suffix: ${{ github.workflow }}
+          save-cache: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
 
@@ -75,15 +125,20 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "latest"
+          version: "0.12.3"
+          enable-cache: true
+          # Separate from CI workflow jobs so concurrent CI+Release runs
+          # don't fight over the same cache key (noisy annotations).
+          cache-suffix: ${{ github.workflow }}
+          prune-cache: true
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
 
@@ -131,6 +186,8 @@ jobs:
 
   build:
     needs: gate
+    # Nuitka + packaging can be slow; fail hung jobs instead of burning runner hours.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -151,20 +208,24 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "latest"
+          version: "0.12.3"
+          enable-cache: true
+          # Bundle group + build path; keep off the test cache key.
+          cache-suffix: ${{ github.workflow }}-build
+          prune-cache: true
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
 
       - name: Cache Nuitka and ccache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cache/Nuitka
@@ -175,6 +236,13 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --group bundle
+
+      # Linux: fix_bundle_ocio uses patchelf for RPATH / SONAME rewrites.
+      - name: Install patchelf (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends patchelf
 
       # oiio-python may rewire PyOpenColorIO.so → OCIO 2.4; reinstall 2.5 first.
       - name: Ensure OpenColorIO 2.5+ linkage
@@ -219,12 +287,14 @@ jobs:
           else
             EXTRA_FLAGS+=("--linux-icon=${{ steps.icon.outputs.path }}")
           fi
+          # Flags kept in sync with `make bundle` (shared strip set + LTO).
           uv run python -m nuitka \
             $MODE \
             --output-dir=dist \
             --output-filename=exr_converter \
             --assume-yes-for-downloads \
             --python-flag=-OO \
+            --lto=yes \
             --enable-plugin=pyside6 \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
@@ -234,6 +304,10 @@ jobs:
             --noinclude-qt-translations \
             --noinclude-qt-plugins=printsupport,mediaservice,iconengines \
             --noinclude-dlls='*Qt6WebEngine*' \
+            --noinclude-dlls='*Qt6Svg*' \
+            --noinclude-dlls='*Qt6Pdf*' \
+            --noinclude-dlls='*Qt6Positioning*' \
+            --noinclude-dlls='*Qt6PrintSupport*' \
             --include-package-data=av \
             --include-package=OpenImageIO \
             --include-package-data=OpenImageIO \
@@ -431,6 +505,7 @@ jobs:
             --icon "EXR Converter.app" 150 190 \
             --hide-extension "EXR Converter.app" \
             --app-drop-link 450 190 \
+            --overwrite \
             "${{ matrix.artifact }}.${{ matrix.ext }}" \
             "dist/EXR Converter.app"
 
@@ -454,8 +529,12 @@ jobs:
             > "${APPDIR}/AppRun"
           chmod +x "${APPDIR}/AppRun"
 
+          # Pin a release tag (not "continuous") for reproducible packaging.
+          APPIMAGETOOL_VER="1.9.1"
+          APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
           curl -fSL -o appimagetool \
-            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VER}/appimagetool-x86_64.AppImage"
+          echo "${APPIMAGETOOL_SHA256}  appimagetool" | sha256sum -c -
           chmod +x appimagetool
           ARCH=x86_64 VERSION="${VERSION}" ./appimagetool \
             --no-appstream --comp zstd \
@@ -471,115 +550,245 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ env.RELEASE_TAG }}".Replace("v","")
-          iscc "/DAppVersion=$version" installer.iss
+          # windows-* images currently ship Inno Setup 6; fail clearly if gone.
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+            )
+            foreach ($p in $candidates) {
+              if (Test-Path $p) { $iscc = @{ Source = $p }; break }
+            }
+          }
+          if (-not $iscc) {
+            throw "iscc (Inno Setup) not found on runner — install Inno Setup 6 or update this step"
+          }
+          $isccPath = if ($iscc.Source) { $iscc.Source } else { $iscc.Path }
+          & $isccPath "/DAppVersion=$version" installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.${{ matrix.ext }}
 
-  # ── Cosign (Sigstore keyless) ─────────────────────────────────────────────
-  sign:
+  # ── SignPath Foundation (Windows Authenticode) — optional ────────────────
+  # Free for qualifying open-source projects. Eliminates SmartScreen warnings.
+  #
+  # Enable by setting repository variables + secrets (see AGENTS.md):
+  #   vars:  SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG,
+  #          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG (optional, default exr_converter)
+  #   secrets: SIGNPATH_API_TOKEN, SIGNPATH_ORGANIZATION_ID
+  #   + SignPath GitHub App installed on this repo
+  #
+  # When vars.SIGNPATH_PROJECT_SLUG is empty, this job is skipped.
+  # Must run *before* Cosign so signatures cover the Authenticode binary.
+  sign-windows:
+    if: ${{ vars.SIGNPATH_PROJECT_SLUG != '' }}
     needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: exr_converter-windows-x86_64-setup
+          path: unsigned
+
+      # SignPath requires github-artifact-id from upload-artifact in *this* job.
+      - name: Re-upload Windows setup for SignPath
+        id: upload-unsigned
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: windows-setup-for-signpath
+          path: unsigned/*
+          retention-days: 1
+
+      - name: Submit Windows installer to SignPath
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG || 'exr_converter' }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Normalize signed installer name
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ensure the signed binary keeps the release asset name.
+          mkdir -p signed-out
+          found=$(find signed -type f -name '*.exe' | head -1)
+          test -n "$found"
+          cp "$found" signed-out/exr_converter-windows-x86_64-setup.exe
+          ls -la signed-out/
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: exr_converter-windows-x86_64-setup-signed
+          path: signed-out/exr_converter-windows-x86_64-setup.exe
+
+  # ── Cosign (Sigstore keyless) + GitHub build provenance ───────────────────
+  # Runs after optional SignPath so Cosign/attest cover the final Windows bits.
+  sign:
+    needs: [build, sign-windows]
+    if: ${{ always() && needs.build.result == 'success' && (needs.sign-windows.result == 'success' || needs.sign-windows.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
+      attestations: write
     steps:
-      - uses: sigstore/cosign-installer@v4.1.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          path: artifacts
-          merge-multiple: true
+          path: downloaded
+
+      - name: Assemble final binaries for signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          for name in \
+            exr_converter-linux-x86_64 \
+            exr_converter-macos-arm64 \
+            exr_converter-macos-x86_64
+          do
+            test -d "downloaded/${name}"
+            cp -a "downloaded/${name}/." artifacts/
+          done
+          WIN_SIGNED="downloaded/exr_converter-windows-x86_64-setup-signed"
+          WIN_UNSIGNED="downloaded/exr_converter-windows-x86_64-setup"
+          if [ -d "$WIN_SIGNED" ]; then
+            echo "Cosign target: SignPath-signed Windows installer"
+            cp -a "${WIN_SIGNED}/." artifacts/
+          else
+            echo "Cosign target: unsigned Windows installer (SignPath not enabled)"
+            test -d "$WIN_UNSIGNED"
+            cp -a "${WIN_UNSIGNED}/." artifacts/
+          fi
+          echo "--- artifacts to sign ---"
+          ls -la artifacts/
+          test "$(find artifacts -type f | wc -l)" -ge 4
+
+      # SLSA-style build provenance stored in GitHub Attestations.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/*.AppImage
+            artifacts/*.dmg
+            artifacts/*.exe
 
       - name: Sign all artifacts with Cosign
         shell: bash
         run: |
+          set -euo pipefail
           for f in artifacts/*; do
             [ -f "$f" ] || continue
+            case "$f" in
+              *.sigstore.json) continue ;;
+            esac
             echo "Signing $f ..."
             cosign sign-blob "$f" \
               --bundle "${f}.sigstore.json" \
               --yes
           done
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: cosign-bundles
-          path: artifacts/*.sigstore.json
-
-  # ── SignPath Foundation (Windows Authenticode) ────────────────────────────
-  # Free for qualifying open-source projects. Eliminates SmartScreen warnings.
-  #
-  # Prerequisites (one-time manual setup):
-  #   1. Apply at https://signpath.org/ (requires OSI license, MFA, active maintenance)
-  #   2. Install the SignPath GitHub App on this repo
-  #   3. Create a signing policy + artifact configuration in SignPath dashboard
-  #   4. Add secrets: SIGNPATH_API_TOKEN, SIGNPATH_ORGANIZATION_ID
-  #   5. Set variables: SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG
-  #
-  # Uncomment the job below once onboarded:
-  #
-  # sign-windows:
-  #   needs: build
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/download-artifact@v7
-  #       with:
-  #         name: exr_converter-windows-x86_64
-  #         path: unsigned
-  #
-  #     - name: Submit to SignPath
-  #       uses: signpath/github-action-submit-signing-request@v1
-  #       with:
-  #         api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-  #         organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
-  #         project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-  #         signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-  #         artifact-configuration-slug: exr_converter
-  #         github-artifact-id: ${{ needs.build.outputs.windows-artifact-id }}
-  #         wait-for-completion: true
-  #         output-artifact-directory: signed
-  #
-  #     - uses: actions/upload-artifact@v6
-  #       with:
-  #         name: exr_converter-windows-x86_64-signed
-  #         path: signed/
+          name: release-assets
+          path: artifacts/*
 
   release:
     needs: sign
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          path: artifacts
-          merge-multiple: true
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Verify release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- release-assets ---"
+          ls -la release-assets/
+          test "$(find release-assets -type f ! -name '*.sigstore.json' | wc -l)" -ge 4
+          test "$(find release-assets -type f -name '*.sigstore.json' | wc -l)" -ge 4
+
+      - name: Build release notes from CHANGELOG
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          {
+            echo "## Changelog"
+            echo
+            python3 scripts/extract_changelog_section.py "${VERSION}"
+            echo
+            echo "## Verify artifact signatures"
+            echo
+            echo "### Cosign (Sigstore keyless)"
+            echo
+            echo "All release artifacts are signed with [Sigstore Cosign](https://docs.sigstore.dev/) (keyless)."
+            echo "Each artifact has a matching \`.sigstore.json\` bundle."
+            echo
+            echo '```bash'
+            echo "# Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/"
+            echo "# Identity is release.yml on main (auto-tag dispatch) or on tags/v* (tag push)."
+            echo "cosign verify-blob <ARTIFACT_FILE> \\"
+            echo "  --bundle <ARTIFACT_FILE>.sigstore.json \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity-regexp 'https://github.com/derek-rein/exr-converter/\\.github/workflows/release\\.yml@refs/(heads/main|tags/v.+)'"
+            echo '```'
+            echo
+            echo "### GitHub build provenance"
+            echo
+            echo "Additionally, SLSA-style provenance is published to GitHub Attestations:"
+            echo
+            echo '```bash'
+            echo "gh attestation verify <ARTIFACT_FILE> -R derek-rein/exr-converter"
+            echo '```'
+            echo
+            echo "### macOS note"
+            echo
+            echo "These builds use an **ad-hoc** code signature (not Apple notarized)."
+            echo "On first launch, right-click the app and select **Open**, or run:"
+            echo
+            echo '```bash'
+            echo 'xattr -cr "/Applications/EXR Converter.app"'
+            echo '```'
+            echo
+            echo "### Windows note"
+            echo
+            echo "Unless SignPath Authenticode is enabled for this release, Windows SmartScreen"
+            echo "may warn on first run. Prefer the Cosign/\`gh attestation\` checks above."
+          } > release-notes.md
+          echo "--- release-notes.md ---"
+          head -40 release-notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2.6.1
+        # v3 targets Node 24 (v2.x still declares Node 20 → deprecation annotations)
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: "EXR Converter ${{ env.RELEASE_TAG }}"
           generate_release_notes: true
-          files: artifacts/*
-          body: |
-            ## Verify artifact signatures
-
-            All release artifacts are signed with [Sigstore Cosign](https://docs.sigstore.dev/) (keyless).
-            Each artifact has a matching `.sigstore.json` bundle that proves it was built by this repository's GitHub Actions workflow.
-
-            ```bash
-            # Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/
-            cosign verify-blob <ARTIFACT_FILE> \
-              --bundle <ARTIFACT_FILE>.sigstore.json \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              --certificate-identity-regexp "github.com/derek-rein/exr-converter"
-            ```
-
-            ### macOS note
-            These builds use an ad-hoc code signature. On first launch, right-click the app and select **Open**, or run:
-            ```bash
-            xattr -cr "/Applications/EXR Converter.app"
-            ```
+          files: release-assets/*
+          body_path: release-notes.md
