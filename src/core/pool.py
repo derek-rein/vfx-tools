@@ -55,6 +55,7 @@ def process_frame_v2e(
     src_space: str,
     dst_space: str,
     exr_opts: dict[str, str] | None = None,
+    extra_attrs: dict[str, str] | None = None,
 ) -> int:
     """OCIO transform + write one EXR frame. Returns frame index."""
     cpu = _ensure_cpu(config_source, config_path, src_space, dst_space)
@@ -69,6 +70,7 @@ def process_frame_v2e(
         src_space=src_space,
         dst_space=dst_space,
         exr_opts=exr_opts,
+        extra_attrs=extra_attrs,
     )
     return idx
 

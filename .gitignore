@@ -24,3 +24,14 @@ build/
 site/public/
 site/resources/
 site/.hugo_build.lock
+
+# RED R3D SDK (proprietary — never commit headers, static libs, docs, or samples)
+R3DSDK*/
+r3d_sdk/
+**/R3DSDKv*/
+.r3d-sdk/
+.r3d-sdk-location.example
+
+# Optional local R3D bridge build output (contains RED Redistributable copies)
+build/r3d/
+resources/r3d/

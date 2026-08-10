@@ -2,6 +2,8 @@
 
 Desktop app and CLI for converting between **video** and **OpenEXR** sequences with **OpenColorIO** color management and built-in **slate rendering**. Uses **PyAV** for decode/encode, **OpenImageIO** for EXR (and other still) I/O, and **PySide6** (QPainter) for the GUI and slate compositing. **EXR → video** also accepts **DPX** and display still sequences (**PNG**, **JPEG**, **WebP**).
 
+**Optional RED R3D / N-RAW:** when built with the official RED R3D SDK bridge, **Video → EXR** can decode `.r3d` and `.nev` (IPP2 primary → Log3G10 REDWideGamutRGB for OCIO), including browser thumbnails, sequence-player preview, and camera/timecode metadata on written EXRs. Release binaries may ship only RED’s allowed Redistributable libraries in a private app folder — see [docs/r3d.md](docs/r3d.md) and **Help → About** for the redistributable notice.
+
 Targets the [VFX Reference Platform CY2026](https://vfxplatform.com/#reference-platform): Python 3.13, Qt/PySide 6.8, OpenColorIO 2.5, OpenEXR 3.4, NumPy 2.3.
 
 ## Downloads
@@ -37,7 +39,7 @@ Then open it normally (double-click, or right-click → **Open**). If macOS stil
 | **Language & tooling** | Python 3.13, [uv](https://docs.astral.sh/uv/) for deps and runs, [Ruff](https://docs.astral.sh/ruff/) in CI, [Nuitka](https://nuitka.net/) for standalone bundles |
 | **UI** | [PySide6](https://doc.qt.io/qtforpython/) (Qt 6.8), Nuke-inspired dark theme |
 | **Imaging & color** | [OpenImageIO](https://openimageio.org/) (`oiio-python`), [OpenColorIO 2.5](https://opencolorio.org/) display/render transforms with a wide-gamut scene-linear **compositing space** for all overlay (slate / burn-in / watermark) compositing — prefers **ACES2065-1 (AP0)** via the `aces_interchange` role so sRGB-authored overlays are linearised and alpha-over'd without ever clipping or shifting the user's footage; falls back to the `scene_linear` role (e.g. ACEScg) on non-ACES configs.<br>Bundles the official **ACES Studio Config v4** (from [ASWF OpenColorIO-Config-ACES](https://github.com/AcademySoftwareFoundation/OpenColorIO-Config-ACES), BSD-3-Clause) which includes dozens of camera IDTs including **Apple Log** (iPhone 15/16 Pro cinematic / ProRes Log), ARRI LogC3/4, RED Log3G10, Sony S-Log/Venice, Canon, DJI, and many more. |
-| **Video & sequences** | [PyAV](https://github.com/PyAV-Org/PyAV) (FFmpeg bindings) for video I/O, [fileseq](https://github.com/justinfx/fileseq) for frame sequences & ranges |
+| **Video & sequences** | [PyAV](https://github.com/PyAV-Org/PyAV) (FFmpeg bindings) for video I/O, [fileseq](https://github.com/justinfx/fileseq) for frame sequences & ranges; optional **RED R3D SDK** bridge for `.r3d` / `.nev` |
 | **Slate / burn-in / watermark** | Native **QPainter** preview and offscreen capture (no embedded browser); burn-in and watermark are linearised into the working space and alpha-composited per-frame, then OCIO-transformed to display before encode |
 
 CI runs on **GitHub Actions**; releases publish binaries for Linux, macOS (Apple Silicon + Intel), and Windows.
@@ -69,6 +71,7 @@ built with Hugo from [`site/`](site/) and published to GitHub Pages:
 |-------|--|
 | [CLI](docs/cli.md) | `video2exr` / `exr2video` / GUI launch flags |
 | [GUI](docs/gui.md) | Tabs, overlays, preferences, post-convert |
+| [R3D / N-RAW](docs/r3d.md) | Optional RED SDK (license, build, CI, preview) |
 | [Nuke](docs/nuke.md) | Menu: open selected Read + session OCIO |
 
 ```bash

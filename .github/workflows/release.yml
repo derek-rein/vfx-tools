@@ -248,6 +248,45 @@ jobs:
       - name: Ensure OpenColorIO 2.5+ linkage
         run: uv run python scripts/ensure_ocio.py
 
+      # Optional RED R3D SDK (private feed). Builds libr3d_bridge for packaging.
+      # Secret R3D_SDK_READ_TOKEN must read derek-rein/r3d-sdk-private releases.
+      # Without the secret, Release still ships; R3D convert reports SDK missing.
+      - name: Fetch private R3D SDK
+        id: r3d_sdk
+        shell: bash
+        env:
+          R3D_SDK_READ_TOKEN: ${{ secrets.R3D_SDK_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${R3D_SDK_READ_TOKEN:-}" ]; then
+            echo "R3D_SDK_READ_TOKEN not set — skipping R3D bridge"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SDK_ROOT="$(uv run python scripts/fetch_r3d_sdk.py --out "${RUNNER_TEMP}/r3d-sdk")"
+          echo "R3D_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "Fetched R3D SDK → ${SDK_ROOT}"
+
+      - name: R3D bridge build deps (Linux)
+        if: runner.os == 'Linux' && steps.r3d_sdk.outputs.enabled == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ uuid-dev
+
+      # Puts cl.exe / link.exe on PATH for the R3D static lib link step.
+      - name: Enable MSVC environment (Windows)
+        if: runner.os == 'Windows' && steps.r3d_sdk.outputs.enabled == 'true'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Build R3D bridge
+        if: steps.r3d_sdk.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/build_r3d_bridge.py -v
+          ls -la build/r3d/
+
       - name: Inject version from tag
         shell: bash
         run: |
@@ -344,6 +383,33 @@ jobs:
               || find dist/main.dist -name 'OpenColorIO_2_4.dll' | grep -q . \
               || { echo "ERROR: OpenColorIO_2_4.dll missing from Windows bundle" >&2; exit 1; }
           fi
+
+      # Ship only Redistributable dylibs/so/dll + our bridge (private app dir).
+      # Never package SDK headers or static libs into the user-facing artifact.
+      - name: Install R3D runtime into bundle
+        if: steps.r3d_sdk.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            uv run python scripts/install_r3d_into_bundle.py "dist/EXR Converter.app"
+          else
+            uv run python scripts/install_r3d_into_bundle.py dist/main.dist
+          fi
+          # Sanity: no headers/static libs leaked into the private r3d dir.
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            R3D_DIR="dist/EXR Converter.app/Contents/MacOS/r3d"
+          else
+            R3D_DIR="dist/main.dist/r3d"
+          fi
+          test -d "$R3D_DIR"
+          if find "$R3D_DIR" \( -iname '*.a' -o -iname '*.lib' -o -iname 'R3DSDK.h' \) | grep -q .; then
+            echo "ERROR: forbidden SDK artifacts under $R3D_DIR" >&2
+            find "$R3D_DIR" | head -50
+            exit 1
+          fi
+          echo "OK: R3D redistributables in $R3D_DIR"
+          ls -la "$R3D_DIR" | head -20
 
       - name: Slim macOS bundle
         if: runner.os == 'macOS'

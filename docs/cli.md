@@ -77,14 +77,17 @@ For a one-click Nuke menu that fills these in from a **Read** node, see
 uv run python main.py video2exr -i plate.mov
 uv run python main.py video2exr -i plate.mov -o /tmp/exr_out --exr-compression zip
 uv run python main.py video2exr -i plate.mov --frame-range 1-100 --workers 4
+# Optional RED R3D / N-RAW (requires local R3D SDK bridge — docs/r3d.md):
+uv run python main.py video2exr -i clip.R3D -o /tmp/exr_out \
+  --src "Log3G10 REDWideGamutRGB" --dst ACEScg
 ```
 
 | Option | Default | Notes |
 |--------|---------|--------|
-| `-i` / `--input` | *(required)* | Input video file |
+| `-i` / `--input` | *(required)* | Input video file (also `.r3d` / `.nev` when R3D support is built) |
 | `-o` / `--output-dir` | `<input_dir>/<stem>/` | Directory for EXR frames |
 | `--ocio` | bundled / `$OCIO` | Config file path |
-| `--src` | auto | Stream color tags / codec ranking → **`Output - Rec.709`** (alias-resolved). Not an OIIO still probe. |
+| `--src` | auto | Stream color tags / codec ranking → **`Output - Rec.709`** (alias-resolved). R3D/N-RAW defaults toward **Log3G10 REDWideGamutRGB**. Not an OIIO still probe. |
 | `--dst` | `ACEScg` / scene_linear | Destination scene space (role fallbacks; not media probing) |
 | `--exr-compression` | `dwaa` | `none`, `rle`, `zip`, `zips`, `piz`, `pxr24`, `b44`, `b44a`, `dwaa`, `dwab` |
 | `--dwa-level` | library | DWA level for `dwaa`/`dwab` (`0` = lossless) |
@@ -98,6 +101,10 @@ uv run python main.py video2exr -i plate.mov --frame-range 1-100 --workers 4
 
 **Output naming:** `stem.####.exr` inside the output directory (pad width from
 `--padding`). Default directory is `<input_parent>/<stem>/` (same idea as the GUI).
+
+**RED R3D / N-RAW:** optional. Requires building the R3D bridge against the
+official proprietary SDK — see [r3d.md](./r3d.md). Without it, `.r3d` / `.nev`
+inputs error with a clear missing-SDK message.
 
 ---
 

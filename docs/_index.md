@@ -12,3 +12,12 @@ as the code (and [CHANGELOG.md](../CHANGELOG.md)). See
 [AGENTS.md — Documentation](../AGENTS.md#documentation-required).
 
 ## Guides
+
+| Guide | Topics |
+|-------|--------|
+| [CLI](./cli.md) | `video2exr`, `exr2video`, GUI launch flags |
+| [GUI](./gui.md) | Tabs, browsers, overlays, preferences, post-convert |
+| [Nuke](./nuke.md) | Nuke menu integration |
+| [R3D / N-RAW](./r3d.md) | Optional RED R3D SDK (proprietary; build + license) |
+| [Releasing](./releasing.md) | Pointer to maintainer release process |
+| [12-bit ProRes plan](./plan-12bit-prores-oxideav.md) | Future work (not implemented) |

@@ -8,7 +8,7 @@
 #   make release PUSH=0                   # … local only; push branch + tag yourself to trigger CI
 
 .PHONY: help run lint typecheck fmt test test-unit resources bundle clean bump release \
-	sync ensure-ocio docs-serve docs-build
+	sync ensure-ocio docs-serve docs-build r3d-bridge r3d-sdk-fetch
 
 APP_NAME := exr_converter
 MACOS_BUNDLE_NAME := EXR Converter
@@ -41,6 +41,8 @@ help:
 	@echo "  make bundle                            # Nuitka standalone build"
 	@echo "  make clean                             # remove build artifacts"
 	@echo "  make docs-serve / docs-build           # Hugo site from docs/ (local / CI)"
+	@echo "  make r3d-sdk-fetch                     # download private R3D SDK (CI feed / gh auth)"
+	@echo "  make r3d-bridge                        # build optional RED R3D bridge (needs SDK)"
 	@echo ""
 	@echo "  make bump PART=patch|minor|major       # bump version (no git)"
 	@echo "  make release PART=… PUSH=0             # preferred: bump+commit+tag on release/* branch"
@@ -61,6 +63,15 @@ sync:
 
 ensure-ocio:
 	$(PYTHON) scripts/ensure_ocio.py
+
+# Optional RED R3D SDK bridge (proprietary SDK; not required for normal builds).
+# Discovers ~/code/r3d-sdk-private/R3DSDKv9_2_1 or R3D_SDK_ROOT.
+# CI: make r3d-sdk-fetch then r3d-bridge (needs R3D_SDK_READ_TOKEN / gh auth).
+r3d-sdk-fetch:
+	$(PYTHON) scripts/fetch_r3d_sdk.py
+
+r3d-bridge:
+	$(PYTHON) scripts/build_r3d_bridge.py
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 
@@ -104,6 +115,8 @@ ICON ?= resources/icons/icon.icns
 bundle: resources
 	$(UV) sync --group bundle
 	$(PYTHON) scripts/ensure_ocio.py
+	# Optional R3D: build bridge when SDK is present (local stash or prior fetch).
+	-@$(PYTHON) scripts/build_r3d_bridge.py
 	$(PYTHON) -m nuitka \
 		--standalone \
 		--output-dir=dist \
@@ -140,6 +153,8 @@ bundle: resources
 	mv dist/main.app "dist/$(MACOS_BUNDLE_NAME).app"
 	# Nuitka rewires PyOpenColorIO → OIIO’s OCIO 2.4; put 2.5 back.
 	$(PYTHON) scripts/fix_bundle_ocio.py "dist/$(MACOS_BUNDLE_NAME).app"
+	# Optional R3D runtime (bridge + RED Redistributable only) into private app dir.
+	-$(PYTHON) scripts/install_r3d_into_bundle.py "dist/$(MACOS_BUNDLE_NAME).app"
 
 # ── Docs site (Hugo → GitHub Pages) ──────────────────────────────────────────
 # Source of truth: docs/*.md  ·  site config/theme: site/  ·  preview: http://127.0.0.1:1313/

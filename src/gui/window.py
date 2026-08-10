@@ -60,7 +60,8 @@ class AboutDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("About EXR Converter")
-        self.setFixedSize(480, 440)
+        self.setMinimumSize(480, 480)
+        self.resize(520, 560)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -77,11 +78,25 @@ class AboutDialog(QDialog):
         except Exception:
             oiio_ver = "?"
 
+        r3d_line = ""
+        try:
+            from ..core.r3d import is_available as r3d_available
+            from ..core.r3d import sdk_version
+
+            if r3d_available():
+                ver = sdk_version() or "loaded"
+                r3d_line = f"<br>RED R3D SDK: {ver}"
+            else:
+                r3d_line = "<br>RED R3D: not available (optional)"
+        except Exception:
+            r3d_line = ""
+
         deps = (
             f"Python {sys.version.split()[0]} · "
             f"PySide6 {__import__('PySide6').__version__}<br>"
             f"OpenColorIO {OCIO_mod.GetVersion()} · "
             f"OpenImageIO {oiio_ver}"
+            f"{r3d_line}"
         )
 
         body = QTextBrowser()
@@ -106,13 +121,37 @@ class AboutDialog(QDialog):
             "rights to use, copy, modify, merge, publish, distribute, sublicense, "
             "and/or sell copies of the Software, subject to the above copyright "
             "notice and this permission notice being included in all copies.</p>"
+            "<p style='font-size:10px;'>Application source is MIT-licensed. "
+            "Optional RED Redistributable libraries (when present) remain under "
+            "the proprietary R3D SDK License Agreement — use the button below.</p>"
         )
         body.setReadOnly(True)
         layout.addWidget(body, 1)
 
+        red_btn = QPushButton("RED redistributable notice…")
+        red_btn.setToolTip("End-user terms for optional RED R3D / N-RAW libraries")
+        red_btn.clicked.connect(self._show_red_notice)
+        layout.addWidget(red_btn)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
+
+    def _show_red_notice(self) -> None:
+        from ..core.r3d import RED_REDISTRIBUTABLE_NOTICE
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("RED R3D redistributable notice")
+        dlg.setMinimumSize(480, 360)
+        lay = QVBoxLayout(dlg)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(RED_REDISTRIBUTABLE_NOTICE.strip())
+        lay.addWidget(text, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        bb.accepted.connect(dlg.accept)
+        lay.addWidget(bb)
+        dlg.exec()
 
 
 class MainWindow(QMainWindow):
@@ -1215,6 +1254,8 @@ class MainWindow(QMainWindow):
         ".webm",
         ".m4v",
         ".ts",
+        ".r3d",
+        ".nev",
     }
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:

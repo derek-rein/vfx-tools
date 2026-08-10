@@ -81,6 +81,8 @@ site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
 | Area | Start here |
 |------|------------|
 | Convert pipeline | `src/core/convert.py`, `src/core/video.py`, `src/core/exr_io.py` |
+| Optional R3D / N-RAW | `src/core/r3d.py`, `native/r3d/`, `scripts/build_r3d_bridge.py`, `scripts/fetch_r3d_sdk.py`, `scripts/install_r3d_into_bundle.py`, [docs/r3d.md](./docs/r3d.md) |
+| Private full SDK (local) | `~/code/r3d-sdk-private/R3DSDKv9_2_1` — never commit; CI feed = private repo `derek-rein/r3d-sdk-private` release `sdk-9.2.1` |
 | Codec ladder / bit depth labels | `src/core/constants.py` |
 | CLI | `src/cli.py` |
 | Main window / post-convert actions | `src/gui/window.py` |
@@ -423,6 +425,7 @@ Branch protection on `main` should require `ci-ok`.
 | [docs/gui.md](./docs/gui.md) | GUI tabs, overlays, preferences, post-convert |
 | [docs/nuke.md](./docs/nuke.md) | Nuke menu integration |
 | [docs/plan-12bit-prores-oxideav.md](./docs/plan-12bit-prores-oxideav.md) | Future 12-bit ProRes plan (not implemented) |
+| [docs/r3d.md](./docs/r3d.md) | Optional RED R3D / N-RAW (proprietary SDK; license + build) |
 | [docs/releasing.md](./docs/releasing.md) | Short pointer here + docs-site note |
 | [integrations/nuke/](./integrations/nuke/) | Nuke `menu.py` + helpers |
 
@@ -433,6 +436,9 @@ Public site: `make docs-serve` / `make docs-build`; workflow **Docs** deploys to
 
 - Do not assume system `ffmpeg` / `ffplay` / `mpv` are installed for core features.
 - Do not claim software ProRes is 12-bit.
+- Do not commit the proprietary RED R3D SDK (headers, static libs, docs, samples)
+  or claim the SDK is open-source; only Redistributable dylibs/so/dll may ship,
+  in a private app directory, with required EULA terms — see [docs/r3d.md](./docs/r3d.md).
 - Do not reintroduce Qt WebEngine for slate.
 - Do not push version tags without a changelog section and green Release gate intent.
 - Do not hand-edit `src/rc_resources.py` or force-push published release tags without a deliberate recovery process.
