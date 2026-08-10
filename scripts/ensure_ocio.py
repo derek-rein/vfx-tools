@@ -113,14 +113,14 @@ def _reinstall() -> int:
 def main() -> int:
     broken, ver = _is_broken()
     if not broken:
-        print(f"ensure_ocio: OK — OpenColorIO {ver}")
+        print(f"ensure_ocio: OK - OpenColorIO {ver}")
         _preserve_oiio_ocio24_dll()
         return 0
 
     print(
         f"ensure_ocio: OpenColorIO runtime is {ver!r}, need >= {'.'.join(map(str, REQUIRED))}.\n"
         "  (oiio-python often rewires PyOpenColorIO to its vendored 2.4 library.)\n"
-        f"  Reinstalling {PACKAGE} …",
+        f"  Reinstalling {PACKAGE} ...",
         file=sys.stderr,
     )
     rc = _reinstall()
@@ -132,7 +132,7 @@ def main() -> int:
         print(f"ensure_ocio: still broken after reinstall ({ver})", file=sys.stderr)
         return 2
 
-    print(f"ensure_ocio: repaired — OpenColorIO {ver}")
+    print(f"ensure_ocio: repaired - OpenColorIO {ver}")
     _preserve_oiio_ocio24_dll()
 
     try:
@@ -143,7 +143,7 @@ def main() -> int:
             out = subprocess.check_output(["otool", "-L", str(so)], text=True)
             first = next((ln.strip() for ln in out.splitlines()[1:] if ln.strip()), "")
             if first:
-                print(f"ensure_ocio: link → {first.split()[0]}")
+                print(f"ensure_ocio: link -> {first.split()[0]}")
     except Exception:
         pass
     return 0

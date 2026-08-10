@@ -90,7 +90,8 @@ def install(target: Path, build_dir: Path = BUILD) -> Path | None:
                 },
             )
 
-    print(f"Installed R3D runtime → {dest}")
+    # ASCII-only: Windows CI consoles are often cp1252.
+    print(f"Installed R3D runtime -> {dest}")
     return dest
 
 
