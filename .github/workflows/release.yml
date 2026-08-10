@@ -710,6 +710,10 @@ jobs:
 
   release:
     needs: sign
+    # sign may depend on a *skipped* optional sign-windows job. GitHub treats a
+    # skipped job in the needs chain as non-success for the default success()
+    # gate, so we must re-check needs.sign.result explicitly or publish never runs.
+    if: ${{ always() && needs.sign.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
