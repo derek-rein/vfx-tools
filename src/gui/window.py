@@ -353,9 +353,7 @@ class MainWindow(QMainWindow):
         if open_path:
             open_name = Path(open_path.split()[0]).name
             if is_ignored_media_filename(open_name):
-                self._append_log(
-                    f"Ignored OS metadata path on launch (not media): {open_name}"
-                )
+                self._append_log(f"Ignored OS metadata path on launch (not media): {open_name}")
             else:
                 # Prevent deferred QSettings restore from overwriting --open / Nuke.
                 self._v2e_tab.suppress_saved_input_restore()
