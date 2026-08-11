@@ -156,6 +156,8 @@ Windows:<dist>/r3d/
 | CI skips R3D | Secret `R3D_SDK_READ_TOKEN` not set or cannot read private release |
 | Wrong colors | Use Log3G10 / RWG source (auto-detect) — primary pipeline is not display Rec.709 |
 | Multi-part classic R3D | Point at any part (e.g. `…_001.R3D`); the SDK loads siblings |
+| `._….R3D` in browser | macOS AppleDouble metadata next to the real clip — hidden from the video browser (not media) |
+| `.RMD` next to clip | RED metadata recipe sidecar — not listed as video (open the `.R3D`) |
 
 Sample clips (from RED / Nikon, not this repo):
 

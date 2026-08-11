@@ -104,8 +104,13 @@ def open_ingest_source(
 ) -> IngestSource:
     """Factory for video→EXR decode (R3D SDK or PyAV)."""
     from .r3d import R3DUnavailableError, is_available, is_r3d_path, unavailable_reason
+    from .video import is_ignored_media_filename
 
     path_s = str(path)
+    if is_ignored_media_filename(path_s):
+        raise RuntimeError(
+            f"Not a media file (OS metadata sidecar): {Path(path_s).name}"
+        )
     if is_r3d_path(path_s):
         if not is_available():
             raise R3DUnavailableError(unavailable_reason())

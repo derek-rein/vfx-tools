@@ -15,6 +15,17 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.9.7] — 2026-08-11
+
+### Fixed
+
+- **Video browser:** hide macOS AppleDouble metadata sidecars (``._clip.R3D``
+  and similar) that share a media extension but are not real clips. The same
+  filter applies to drag/drop, paste, R3D path detection, CLI probe, and
+  convert ingest; forced sidecar paths fail with a clear error.
+
+---
+
 ## [0.9.6] — 2026-08-11
 
 ### Changed
@@ -626,7 +637,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/derek-rein/exr-converter/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/derek-rein/exr-converter/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/derek-rein/exr-converter/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/derek-rein/exr-converter/compare/v0.9.3...v0.9.4

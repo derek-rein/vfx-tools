@@ -43,8 +43,15 @@ _bridge_names = bridge_names
 
 
 def is_r3d_path(path: str | Path) -> bool:
-    """True if *path* looks like an R3D / N-RAW file by extension."""
-    return Path(path).suffix.lower() in R3D_SUFFIXES
+    """True if *path* looks like an R3D / N-RAW file by extension.
+
+    Rejects macOS AppleDouble sidecars (``._clip.R3D``) that share the media
+    extension but are Finder/resource-fork metadata, not decodable clips.
+    """
+    p = Path(path)
+    if p.name.startswith("._"):
+        return False
+    return p.suffix.lower() in R3D_SUFFIXES
 
 
 def r3d_src_colorspace_candidates(path: str | Path = "") -> list[str]:

@@ -46,3 +46,14 @@ def test_resolve_video_browser_path_file(tmp_path: Path) -> None:
     directory, select_path = got
     assert Path(directory) == tmp_path
     assert Path(select_path) == clip
+
+
+def test_resolve_video_browser_path_skips_appledouble(tmp_path: Path) -> None:
+    """macOS ``._*.R3D`` sidecars must not auto-select as video."""
+    junk = tmp_path / "._cam.R3D"
+    junk.write_bytes(b"x")
+    got = resolve_video_browser_path(str(junk), _VIDEO)
+    assert got is not None
+    directory, select_path = got
+    assert Path(directory) == tmp_path
+    assert select_path == ""
