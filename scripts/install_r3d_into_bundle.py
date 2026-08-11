@@ -26,6 +26,10 @@ import shutil
 import sys
 from pathlib import Path
 
+# Allow `python scripts/install_r3d_into_bundle.py` without installing the package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from packaging_util import ignore_macos_junk, is_macos_junk_name, safe_print  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build" / "r3d"
 
@@ -61,12 +65,12 @@ def install(target: Path, build_dir: Path = BUILD) -> Path | None:
         if alt.is_file():
             bridge = alt
     if not bridge.is_file():
-        print(f"skip: no bridge at {bridge} (R3D optional)", file=sys.stderr)
+        safe_print(f"skip: no bridge at {bridge} (R3D optional)", file=sys.stderr)
         return None
 
     redist = build_dir / "redistributable"
     if not redist.is_dir():
-        print(f"ERROR: missing redistributable dir {redist}", file=sys.stderr)
+        safe_print(f"ERROR: missing redistributable dir {redist}", file=sys.stderr)
         raise SystemExit(2)
 
     root = resolve_install_root(target)
@@ -77,21 +81,15 @@ def install(target: Path, build_dir: Path = BUILD) -> Path | None:
 
     shutil.copy2(bridge, dest / bridge.name)
     for item in redist.iterdir():
-        if item.name.startswith("._") or item.name in {".DS_Store", "Thumbs.db"}:
+        if is_macos_junk_name(item.name):
             continue
         if item.is_file():
             shutil.copy2(item, dest / item.name)
         elif item.is_dir():
-            shutil.copytree(
-                item,
-                dest / item.name,
-                ignore=lambda _d, names: {
-                    n for n in names if n.startswith("._") or n in {".DS_Store", "Thumbs.db"}
-                },
-            )
+            shutil.copytree(item, dest / item.name, ignore=ignore_macos_junk)
 
     # ASCII-only: Windows CI consoles are often cp1252.
-    print(f"Installed R3D runtime -> {dest}")
+    safe_print(f"Installed R3D runtime -> {dest}")
     return dest
 
 

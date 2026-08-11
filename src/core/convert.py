@@ -22,7 +22,6 @@ from .ocio_utils import (
 )
 from .pool import _alpha_over_rgb, process_frame_e2v, process_frame_v2e
 from .sequence import find_exr_sequence
-from .video import decode_video_frames, probe_video
 
 ProgressCallback = Callable[[int, int], None]
 LogCallback = Callable[[str], None]
@@ -259,175 +258,97 @@ def run_video_to_exr(
     deinterlace: str = "auto",
     output_name: str = "",
 ) -> None:
-    """Decode video → OCIO → EXR sequence (ingest).
+    """Decode video / R3D → OCIO → EXR sequence (ingest).
 
     Files are always written as ``{output_name}.{frame:0N}.ext`` (dot pad only).
     *output_name* defaults to the video stem when empty. Slate / burn-in /
     watermark are **never** applied on this path.
 
     RED R3D / Nikon N-RAW (``.r3d`` / ``.nev``) use the optional R3D SDK bridge
-    when available (see ``docs/r3d.md``); other formats use PyAV.
+    when available (see ``docs/r3d.md``); other formats use PyAV. Both share the
+    same OCIO + EXR write loop via :func:`open_ingest_source`.
     """
-    from .r3d import R3DUnavailableError, is_r3d_path
-    from .r3d import is_available as r3d_available
-
-    if is_r3d_path(video_path):
-        if not r3d_available():
-            from .r3d import unavailable_reason
-
-            raise R3DUnavailableError(unavailable_reason())
-        _run_r3d_to_exr(
-            video_path,
-            output_dir,
-            ocio_cfg,
-            src_space,
-            dst_space,
-            progress=progress,
-            cancel_check=cancel_check,
-            log=log,
-            compression=compression,
-            workers=workers,
-            config_source=config_source,
-            config_path=config_path,
-            scale=scale,
-            padding=padding,
-            start_frame=start_frame,
-            frame_set=frame_set,
-            exr_opts=exr_opts,
-            output_name=output_name,
-        )
-        return
+    from .frame_source import open_ingest_source
 
     ocio_cfg = _ensure_ocio(ocio_cfg, config_source, config_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = (output_name or Path(video_path).stem).strip()
-    # Never allow path separators in the sequence name.
     stem = Path(stem).name
     if not stem:
         stem = Path(video_path).stem
-    w, h, _fps, total = probe_video(video_path)
-    ow, oh = _scaled_dims(w, h, scale)
-    render_total = len(frame_set) if frame_set else total
-    if log:
-        res_info = f"{w}x{h}" if scale >= 1.0 else f"{w}x{h} \u2192 {ow}x{oh}"
-        range_info = f", range trimmed to {render_total}" if frame_set else ""
-        log(f"Input: {video_path}  ({res_info}, ~{total} frames{range_info})")
-        nuke_pat = "#" * max(1, int(padding))
-        log(f"Output sequence: {output_dir / f'{stem}.{nuke_pat}.exr'}")
 
-    n_workers = workers if workers > 0 else _DEFAULT_WORKERS
+    with open_ingest_source(
+        video_path,
+        scale=scale,
+        deinterlace=deinterlace,
+        log_fn=log,
+    ) as src:
+        info = src.info
+        ow, oh = src.output_size
+        total = info.frame_count
+        render_total = len(frame_set) if frame_set else total
+        if log:
+            res_info = (
+                f"{info.width}x{info.height}"
+                if scale >= 1.0
+                else (f"{info.width}x{info.height} \u2192 {ow}x{oh}")
+            )
+            range_info = f", range trimmed to {render_total}" if frame_set else ""
+            log(f"Input: {video_path}  ({res_info}, ~{total} frames{range_info})")
+            src.log_header(log)
+            nuke_pat = "#" * max(1, int(padding))
+            log(f"Output sequence: {output_dir / f'{stem}.{nuke_pat}.exr'}")
 
-    if n_workers <= 1 or (not config_source and not config_path):
-        _v2e_serial(
-            video_path,
+        n_workers = workers if workers > 0 else _DEFAULT_WORKERS
+        use_pool = n_workers > 1 and bool(config_source or config_path)
+
+        if not use_pool:
+            _v2e_serial_from_source(
+                src,
+                output_dir,
+                ocio_cfg,
+                src_space,
+                dst_space,
+                progress,
+                cancel_check,
+                log,
+                compression,
+                padding,
+                start_frame,
+                frame_set,
+                exr_opts=exr_opts,
+                output_name=stem,
+                render_total=render_total,
+            )
+            return
+
+        if log:
+            log(f"OCIO: {src_space} \u2192 {dst_space}  ({n_workers} workers)")
+
+        _v2e_parallel_from_source(
+            src,
             output_dir,
-            ocio_cfg,
             src_space,
             dst_space,
             progress,
             cancel_check,
             log,
             compression,
-            ow,
-            oh,
-            total,
-            scale,
+            n_workers,
+            config_source,
+            config_path,
             padding,
             start_frame,
             frame_set,
             exr_opts=exr_opts,
-            deinterlace=deinterlace,
             output_name=stem,
+            render_total=render_total,
         )
-        return
-
-    if log:
-        log(f"OCIO: {src_space} \u2192 {dst_space}  ({n_workers} workers)")
-
-    container = av.open(video_path)
-    stream = container.streams.video[0]
-    max_inflight = n_workers * 2
-    do_resize = scale < 1.0
-    fmt = f"0{padding}d"
-
-    idx = 0
-    submitted = 0
-    finished = 0
-    try:
-        with _process_pool(n_workers) as pool:
-            pending: dict = {}
-            frame_iter = decode_video_frames(container, stream, deinterlace=deinterlace, log=log)
-            all_submitted = False
-
-            def _submit_batch() -> None:
-                nonlocal idx, submitted, all_submitted
-                if all_submitted:
-                    return
-                while len(pending) < max_inflight:
-                    try:
-                        frame = next(frame_iter)
-                    except StopIteration:
-                        all_submitted = True
-                        return
-                    if cancel_check and cancel_check():
-                        _cancel_pool(pool, pending)
-                        raise RuntimeError("Cancelled")
-                    idx += 1
-                    if frame_set and idx not in frame_set:
-                        if frame_set and idx > max(frame_set):
-                            all_submitted = True
-                            return
-                        continue
-                    if do_resize:
-                        frame = frame.reformat(width=ow, height=oh)
-                    rgb_u16 = frame.to_ndarray(format="rgb48le")
-                    rgb_f32 = rgb_u16.astype(np.float32) * (1.0 / 65535.0)
-                    frame_num = start_frame + idx - 1
-                    out_path = str(output_dir / f"{stem}.{frame_num:{fmt}}.exr")
-                    fut = pool.submit(
-                        process_frame_v2e,
-                        idx,
-                        rgb_f32,
-                        out_path,
-                        compression,
-                        config_source,
-                        config_path,
-                        src_space,
-                        dst_space,
-                        exr_opts,
-                    )
-                    pending[fut] = idx
-                    submitted += 1
-                    if frame_set and submitted >= len(frame_set):
-                        all_submitted = True
-                        return
-
-            _submit_batch()
-            while pending:
-                if cancel_check and cancel_check():
-                    _cancel_pool(pool, pending)
-                    raise RuntimeError("Cancelled")
-                done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for done in done_set:
-                    done.result()
-                    del pending[done]
-                    finished += 1
-                    if progress:
-                        progress(finished, render_total)
-                _submit_batch()
-    finally:
-        container.close()
-
-    if finished == 0:
-        raise RuntimeError("No frames decoded from the video file.")
-    if log:
-        nuke_pat = "#" * padding
-        log(f"Wrote {finished} EXR frames \u2192 {output_dir / f'{stem}.{nuke_pat}.exr'}")
 
 
-def _v2e_serial(
-    video_path: str,
+def _v2e_serial_from_source(
+    src,
     output_dir: Path,
     ocio_cfg: OCIO.Config,
     src_space: str,
@@ -436,280 +357,127 @@ def _v2e_serial(
     cancel_check: Callable[[], bool] | None,
     log: LogCallback | None,
     compression: str,
-    w: int,
-    h: int,
-    total: int,
-    scale: float = 1.0,
-    padding: int = 4,
-    start_frame: int = 1001,
-    frame_set: set[int] | None = None,
+    padding: int,
+    start_frame: int,
+    frame_set: set[int] | None,
+    *,
     exr_opts: dict[str, str] | None = None,
-    deinterlace: str = "auto",
     output_name: str = "",
+    render_total: int = 0,
 ) -> None:
     cpu = make_cpu_processor(ocio_cfg, src_space, dst_space)
-    render_total = len(frame_set) if frame_set else total
     if log:
         log(f"OCIO: {src_space} \u2192 {dst_space}  (single-threaded)")
 
-    stem = (output_name or Path(video_path).stem).strip()
-    stem = Path(stem).name or Path(video_path).stem
-    container = av.open(video_path)
-    stream = container.streams.video[0]
-    frame_buf = np.empty((h, w, 3), dtype=np.float32)
-    do_resize = scale < 1.0
+    stem = output_name
     fmt = f"0{padding}d"
-
-    max_idx = max(frame_set) if frame_set else 0
-    idx = 0
     written = 0
-    try:
-        for frame in decode_video_frames(container, stream, deinterlace=deinterlace, log=log):
-            if cancel_check and cancel_check():
-                raise RuntimeError("Cancelled")
-            idx += 1
-            if frame_set and idx not in frame_set:
-                if idx > max_idx:
-                    break
-                continue
-            if do_resize:
-                frame = frame.reformat(width=w, height=h)
-            rgb_u16 = frame.to_ndarray(format="rgb48le")
-            np.multiply(rgb_u16, 1.0 / 65535.0, out=frame_buf, casting="unsafe")
-            desc = OCIO.PackedImageDesc(frame_buf, w, h, 3)
-            cpu.apply(desc)
-            frame_num = start_frame + idx - 1
-            out_path = output_dir / f"{stem}.{frame_num:{fmt}}.exr"
-            write_exr(
-                str(out_path),
-                frame_buf,
-                compression=compression,
-                src_space=src_space,
-                dst_space=dst_space,
-                exr_opts=exr_opts,
-            )
-            written += 1
-            if progress:
-                progress(written, render_total)
-    finally:
-        container.close()
+    for idx_1based, rgb, extra_attrs in src.iter_frames(frame_set, cancel_check=cancel_check):
+        h, w = rgb.shape[:2]
+        buf = np.ascontiguousarray(rgb, dtype=np.float32)
+        desc = OCIO.PackedImageDesc(buf, w, h, 3)
+        cpu.apply(desc)
+        frame_num = start_frame + idx_1based - 1
+        out_path = output_dir / f"{stem}.{frame_num:{fmt}}.exr"
+        write_exr(
+            str(out_path),
+            buf,
+            compression=compression,
+            src_space=src_space,
+            dst_space=dst_space,
+            exr_opts=exr_opts,
+            extra_attrs=extra_attrs or None,
+        )
+        written += 1
+        if progress:
+            progress(written, render_total or written)
 
     if written == 0:
-        raise RuntimeError("No frames decoded from the video file.")
+        raise RuntimeError("No frames decoded from the input file.")
     if log:
         nuke_pat = "#" * padding
         log(f"Wrote {written} EXR frames \u2192 {output_dir / f'{stem}.{nuke_pat}.exr'}")
 
 
-# ---- r3d / n-raw -> exr ----------------------------------------------------
-
-
-def _run_r3d_to_exr(
-    video_path: str,
+def _v2e_parallel_from_source(
+    src,
     output_dir: Path,
-    ocio_cfg: OCIO.Config | None,
     src_space: str,
     dst_space: str,
-    progress: ProgressCallback | None = None,
-    cancel_check: Callable[[], bool] | None = None,
-    log: LogCallback | None = None,
-    compression: str = "dwaa",
-    workers: int = 0,
-    config_source: str = "",
-    config_path: str = "",
-    scale: float = 1.0,
-    padding: int = 4,
-    start_frame: int = 1001,
-    frame_set: set[int] | None = None,
+    progress: ProgressCallback | None,
+    cancel_check: Callable[[], bool] | None,
+    log: LogCallback | None,
+    compression: str,
+    n_workers: int,
+    config_source: str,
+    config_path: str,
+    padding: int,
+    start_frame: int,
+    frame_set: set[int] | None,
+    *,
     exr_opts: dict[str, str] | None = None,
     output_name: str = "",
+    render_total: int = 0,
 ) -> None:
-    """Decode RED R3D / Nikon N-RAW via the R3D SDK bridge → OCIO → EXR."""
-    from .r3d import R3DClip, decode_mode_for_scale, sdk_version
-
-    ocio_cfg = _ensure_ocio(ocio_cfg, config_source, config_path)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = (output_name or Path(video_path).stem).strip()
-    stem = Path(stem).name
-    if not stem:
-        stem = Path(video_path).stem
-
-    mode = decode_mode_for_scale(scale)
-    # When using native half/quarter decode, skip a second software resize unless
-    # the requested scale does not match a decode ladder step exactly.
-    ladder_scale = {
-        0: 1.0,
-        1: 0.5,
-        2: 0.5,
-        3: 0.25,
-        4: 0.125,
-        5: 0.0625,
-    }.get(mode, 1.0)
-    extra_scale = scale / ladder_scale if ladder_scale > 0 else scale
-    need_extra_resize = abs(extra_scale - 1.0) > 0.02
-
-    n_workers = workers if workers > 0 else _DEFAULT_WORKERS
+    stem = output_name
     fmt = f"0{padding}d"
+    max_inflight = n_workers * 2
+    finished = 0
 
-    with R3DClip(video_path) as clip:
-        info = clip.info
-        full_w, full_h = info.width, info.height
-        total = max(1, info.frame_count)
-        ow, oh = _scaled_dims(full_w, full_h, scale)
-        render_total = len(frame_set) if frame_set else total
+    with _process_pool(n_workers) as pool:
+        pending: dict = {}
+        frame_iter = src.iter_frames(frame_set, cancel_check=cancel_check)
+        all_submitted = False
 
-        # Clip-level R3D metadata once; per-frame timecode added below.
-        base_attrs: dict[str, str] = {
-            f"exrconverter:r3d:{k}": v for k, v in clip.clip_metadata_dict().items() if v
-        }
-
-        if log:
-            res_info = f"{full_w}x{full_h}" if scale >= 1.0 else f"{full_w}x{full_h} → {ow}x{oh}"
-            range_info = f", range trimmed to {render_total}" if frame_set else ""
-            log(f"Input: {video_path}  ({res_info}, {total} frames{range_info})")
-            log(f"R3D SDK: {sdk_version() or info.sdk_version}")
-            log(f"R3D decode: mode={mode} pipeline=IPP2 primary Log3G10/RWG")
-            if base_attrs.get("exrconverter:r3d:camera_model"):
-                log(f"R3D camera: {base_attrs['exrconverter:r3d:camera_model']}")
-            nuke_pat = "#" * max(1, int(padding))
-            log(f"Output sequence: {output_dir / f'{stem}.{nuke_pat}.exr'}")
-
-        use_pool = n_workers > 1 and bool(config_source or config_path)
-        if log:
-            thr = f"{n_workers} workers" if use_pool else "single-threaded"
-            log(f"OCIO: {src_space} → {dst_space}  ({thr})")
-
-        max_idx = max(frame_set) if frame_set else 0
-        written = 0
-        finished = 0
-
-        def _frame_attrs(idx_0: int) -> dict[str, str]:
-            attrs = dict(base_attrs)
-            tc = clip.absolute_timecode(idx_0)
-            if tc:
-                attrs["exrconverter:r3d:absolute_timecode"] = tc
-            etc = clip.edge_timecode(idx_0)
-            if etc:
-                attrs["exrconverter:r3d:edge_timecode"] = etc
-            attrs["exrconverter:r3d:source_frame"] = str(idx_0)
-            return attrs
-
-        def _indices() -> list[int]:
-            if frame_set:
-                return sorted(i for i in frame_set if 1 <= i <= total)
-            return list(range(1, total + 1))
-
-        indices = _indices()
-        if not indices:
-            raise RuntimeError("No frames selected for R3D decode.")
-
-        if not use_pool:
-            cpu = make_cpu_processor(ocio_cfg, src_space, dst_space)
-            for idx_1based in indices:
+        def _submit_batch() -> None:
+            nonlocal all_submitted
+            if all_submitted:
+                return
+            while len(pending) < max_inflight:
+                try:
+                    idx_1based, rgb, extra_attrs = next(frame_iter)
+                except StopIteration:
+                    all_submitted = True
+                    return
                 if cancel_check and cancel_check():
+                    _cancel_pool(pool, pending)
                     raise RuntimeError("Cancelled")
-                if frame_set and max_idx and idx_1based > max_idx:
-                    break
-                idx_0 = idx_1based - 1
-                rgb = clip.decode_frame(idx_0, mode=mode)
-                if need_extra_resize and (rgb.shape[1], rgb.shape[0]) != (ow, oh):
-                    # Simple box resize via numpy (rare path; prefer ladder modes).
-                    rgb = _resize_rgb_f32(rgb, ow, oh)
-                elif not need_extra_resize and ladder_scale < 1.0:
-                    # Ensure even dims for EXR path consistency.
-                    pass
-                h, w = rgb.shape[:2]
-                buf = np.ascontiguousarray(rgb, dtype=np.float32)
-                desc = OCIO.PackedImageDesc(buf, w, h, 3)
-                cpu.apply(desc)
                 frame_num = start_frame + idx_1based - 1
-                out_path = output_dir / f"{stem}.{frame_num:{fmt}}.exr"
-                write_exr(
-                    str(out_path),
-                    buf,
-                    compression=compression,
-                    src_space=src_space,
-                    dst_space=dst_space,
-                    exr_opts=exr_opts,
-                    extra_attrs=_frame_attrs(idx_0),
+                out_path = str(output_dir / f"{stem}.{frame_num:{fmt}}.exr")
+                fut = pool.submit(
+                    process_frame_v2e,
+                    idx_1based,
+                    rgb,
+                    out_path,
+                    compression,
+                    config_source,
+                    config_path,
+                    src_space,
+                    dst_space,
+                    exr_opts,
+                    extra_attrs or None,
                 )
-                written += 1
+                pending[fut] = idx_1based
+
+        _submit_batch()
+        while pending:
+            if cancel_check and cancel_check():
+                _cancel_pool(pool, pending)
+                raise RuntimeError("Cancelled")
+            done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for done in done_set:
+                done.result()
+                del pending[done]
+                finished += 1
                 if progress:
-                    progress(written, render_total)
-        else:
-            max_inflight = n_workers * 2
-            with _process_pool(n_workers) as pool:
-                pending: dict = {}
-                it = iter(indices)
-                all_submitted = False
+                    progress(finished, render_total or finished)
+            _submit_batch()
 
-                def _submit_batch() -> None:
-                    nonlocal all_submitted
-                    if all_submitted:
-                        return
-                    while len(pending) < max_inflight:
-                        try:
-                            idx_1based = next(it)
-                        except StopIteration:
-                            all_submitted = True
-                            return
-                        if cancel_check and cancel_check():
-                            _cancel_pool(pool, pending)
-                            raise RuntimeError("Cancelled")
-                        idx_0 = idx_1based - 1
-                        rgb = clip.decode_frame(idx_0, mode=mode)
-                        if need_extra_resize and (rgb.shape[1], rgb.shape[0]) != (ow, oh):
-                            rgb = _resize_rgb_f32(rgb, ow, oh)
-                        frame_num = start_frame + idx_1based - 1
-                        out_path = str(output_dir / f"{stem}.{frame_num:{fmt}}.exr")
-                        fut = pool.submit(
-                            process_frame_v2e,
-                            idx_1based,
-                            rgb,
-                            out_path,
-                            compression,
-                            config_source,
-                            config_path,
-                            src_space,
-                            dst_space,
-                            exr_opts,
-                            _frame_attrs(idx_0),
-                        )
-                        pending[fut] = idx_1based
-
-                _submit_batch()
-                while pending:
-                    if cancel_check and cancel_check():
-                        _cancel_pool(pool, pending)
-                        raise RuntimeError("Cancelled")
-                    done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
-                    for done in done_set:
-                        done.result()
-                        del pending[done]
-                        finished += 1
-                        if progress:
-                            progress(finished, render_total)
-                    _submit_batch()
-            written = finished
-
-    if written == 0:
-        raise RuntimeError("No frames decoded from the R3D/N-RAW file.")
+    if finished == 0:
+        raise RuntimeError("No frames decoded from the input file.")
     if log:
         nuke_pat = "#" * padding
-        log(f"Wrote {written} EXR frames → {output_dir / f'{stem}.{nuke_pat}.exr'}")
-
-
-def _resize_rgb_f32(rgb: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
-    """Nearest-neighbor resize for float32 RGB (rare path when scale ≠ R3D ladder)."""
-    h, w = rgb.shape[:2]
-    if w == out_w and h == out_h:
-        return rgb
-    ys = np.linspace(0, h - 1, out_h)
-    xs = np.linspace(0, w - 1, out_w)
-    yi = np.clip(np.rint(ys).astype(np.intp), 0, h - 1)
-    xi = np.clip(np.rint(xs).astype(np.intp), 0, w - 1)
-    return np.ascontiguousarray(rgb[np.ix_(yi, xi)], dtype=np.float32)
+        log(f"Wrote {finished} EXR frames \u2192 {output_dir / f'{stem}.{nuke_pat}.exr'}")
 
 
 # ---- exr -> video ----------------------------------------------------------

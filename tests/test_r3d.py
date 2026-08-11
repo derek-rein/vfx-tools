@@ -76,30 +76,30 @@ def test_bridge_candidates_include_exe_r3d_dir(monkeypatch, tmp_path: Path) -> N
 
 
 def _force_r3d_unavailable() -> tuple:
-    """Return previous r3d module state after forcing unavailable."""
-    from src.core import r3d as r3d_mod
+    """Return previous r3d native state after forcing unavailable."""
+    from src.core.r3d import native as native_mod
 
     prev = (
-        r3d_mod._init_attempted,
-        r3d_mod._init_ok,
-        r3d_mod._init_error,
-        r3d_mod._lib,
+        native_mod._init_attempted,
+        native_mod._init_ok,
+        native_mod._init_error,
+        native_mod._lib,
     )
-    r3d_mod._init_attempted = True
-    r3d_mod._init_ok = False
-    r3d_mod._init_error = "test: bridge missing"
-    r3d_mod._lib = None
+    native_mod._init_attempted = True
+    native_mod._init_ok = False
+    native_mod._init_error = "test: bridge missing"
+    native_mod._lib = None
     return prev
 
 
 def _restore_r3d_state(prev: tuple) -> None:
-    from src.core import r3d as r3d_mod
+    from src.core.r3d import native as native_mod
 
     (
-        r3d_mod._init_attempted,
-        r3d_mod._init_ok,
-        r3d_mod._init_error,
-        r3d_mod._lib,
+        native_mod._init_attempted,
+        native_mod._init_ok,
+        native_mod._init_error,
+        native_mod._lib,
     ) = prev
 
 

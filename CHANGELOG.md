@@ -15,6 +15,24 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.9.6] — 2026-08-11
+
+### Changed
+
+- **Internal media pipeline:** video and R3D decode share a common frame-source
+  layer for convert and player prefetch (same OCIO/EXR write path; R3D scrub
+  resolution follows the preview decode ladder).
+- **Browser path paste:** shared helpers for ``file://``, quoted paths, and
+  Nuke-style sequence navigation (sequence + video browsers, convert input).
+
+### Fixed
+
+- **Packaging:** never strip RED redistributables under ``r3d/`` on macOS/Linux
+  release slim steps; R3D build/install scripts use shared ASCII-safe logging
+  and macOS junk filters.
+
+---
+
 ## [0.9.5] — 2026-08-11
 
 ### Fixed
@@ -608,7 +626,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/derek-rein/exr-converter/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/derek-rein/exr-converter/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/derek-rein/exr-converter/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/derek-rein/exr-converter/compare/v0.9.2...v0.9.3
