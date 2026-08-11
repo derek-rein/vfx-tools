@@ -25,6 +25,9 @@ def test_is_r3d_path_extensions() -> None:
     assert is_r3d_path("shot.nev")
     assert not is_r3d_path("plate.mov")
     assert not is_r3d_path("seq.####.exr")
+    # macOS AppleDouble resource-fork sidecars share the .R3D extension.
+    assert not is_r3d_path("._clip.R3D")
+    assert not is_r3d_path(Path("/tmp/._A004_C010_0920DA_001.R3D"))
 
 
 def test_r3d_suffixes_set() -> None:
@@ -120,6 +123,39 @@ def test_video_suffixes_include_r3d() -> None:
 
     assert ".r3d" in _VIDEO_SUFFIXES
     assert ".nev" in _VIDEO_SUFFIXES
+
+
+def test_is_ignored_media_filename_appledouble() -> None:
+    from src.core.video import is_ignored_media_filename
+
+    assert is_ignored_media_filename("._A004_C010_0920DA_001.R3D")
+    assert is_ignored_media_filename("._clip.mov")
+    assert is_ignored_media_filename(".DS_Store")
+    assert is_ignored_media_filename("Thumbs.db")
+    assert not is_ignored_media_filename("A004_C010_0920DA_001.R3D")
+    assert not is_ignored_media_filename("clip.mov")
+
+
+def test_scan_video_files_skips_appledouble(tmp_path: Path) -> None:
+    """Browser listing must hide macOS AppleDouble ``._*.R3D`` sidecars."""
+    from src.core.video import scan_video_files
+
+    real = tmp_path / "A004_C010_0920DA_001.R3D"
+    junk = tmp_path / "._A004_C010_0920DA_001.R3D"
+    # Fake bytes are fine: scan is extension-based; SDK probe may fail gracefully.
+    real.write_bytes(b"not-real-r3d")
+    junk.write_bytes(b"appledouble")
+    rows = scan_video_files(str(tmp_path))
+    names = [r["name"] for r in rows]
+    assert "A004_C010_0920DA_001.R3D" in names
+    assert "._A004_C010_0920DA_001.R3D" not in names
+
+
+def test_probe_video_rejects_appledouble() -> None:
+    from src.core.video import probe_video
+
+    with pytest.raises(RuntimeError, match="OS metadata sidecar"):
+        probe_video("/tmp/._clip.R3D")
 
 
 def test_run_video_to_exr_r3d_missing_sdk(tmp_path: Path) -> None:

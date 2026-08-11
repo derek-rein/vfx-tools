@@ -74,6 +74,13 @@ directory still resolves a default sequence on disk (EXR first, then DPX;
 prefers a basename matching the folder name when several sequences share the
 folder). The slate editor reuses the player with live burn-in/watermark overlays.
 
+**Video browser filters:** only real media extensions are listed (``.r3d``,
+``.nev``, ``.mov``, ``.mp4``, …). macOS **AppleDouble** Finder sidecars
+(``._clip.R3D``) that appear next to clips on network shares or non-HFS
+volumes are hidden — they share the media extension but are resource-fork
+metadata, not video. RED **`.RMD`** metadata files are never listed (not a
+video extension).
+
 Right-click a row in **List** or a tile in **Grid** (sequence and video
 browsers) for:
 

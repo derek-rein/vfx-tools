@@ -87,8 +87,14 @@ def probe_video(path: str) -> tuple[int, int, float, int]:
     deep libavformat probe, and a single-frame decode when the default probe
     doesn't surface stream attributes (e.g. Sony Venice MXFs).
     """
+    from pathlib import Path
+
     from .r3d import is_available as r3d_available
     from .r3d import is_r3d_path, probe_r3d
+
+    # Reject OS metadata sidecars early (CLI / forced paths), not only in the browser.
+    if is_ignored_media_filename(path):
+        raise RuntimeError(f"Not a media file (OS metadata sidecar): {Path(path).name}")
 
     if is_r3d_path(path):
         if not r3d_available():
@@ -373,11 +379,35 @@ _VIDEO_SUFFIXES = {
     ".nev",
 }
 
+# OS / desktop metadata that often sits next to media and can share an extension
+# (notably macOS AppleDouble ``._clip.R3D`` on non-HFS volumes and network shares).
+_IGNORED_MEDIA_BASENAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
+
+
+def is_ignored_media_filename(name: str) -> bool:
+    """True for OS metadata sidecars that must not be treated as video media.
+
+    macOS AppleDouble resource-fork files (``._clip.R3D``) store Finder metadata
+    next to the real clip. They end with the same extension as the media and
+    would otherwise appear in the video browser as empty R3D/MOV rows.
+
+    *name* may be a basename or a full path; only the final path component is
+    inspected.
+    """
+    from pathlib import Path
+
+    base = Path(name).name
+    if base.startswith("._"):
+        return True
+    return base in _IGNORED_MEDIA_BASENAMES
+
 
 def scan_video_files(directory: str) -> list[dict[str, str]]:
     """Return summary dicts for every video file in *directory*.
 
     Each dict: name, resolution, codec, fps, duration, path (full).
+
+    Skips OS metadata sidecars (macOS AppleDouble ``._*``, ``.DS_Store``, etc.).
     """
     from pathlib import Path
 
@@ -391,6 +421,8 @@ def scan_video_files(directory: str) -> list[dict[str, str]]:
 
     for entry in entries:
         if not entry.is_file():
+            continue
+        if is_ignored_media_filename(entry.name):
             continue
         if entry.suffix.lower() not in _VIDEO_SUFFIXES:
             continue

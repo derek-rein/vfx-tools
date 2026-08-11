@@ -127,6 +127,8 @@ def resolve_video_browser_path(
     Returns ``(directory, select_path)`` or ``None``. *select_path* is the full
     path of a video file to select (empty when navigating a folder only).
     """
+    from ..core.video import is_ignored_media_filename
+
     text = clean_path_string(raw)
     if not text:
         return None
@@ -135,7 +137,7 @@ def resolve_video_browser_path(
     select_path = ""
     if p.is_dir():
         directory = str(p)
-    elif p.is_file() and p.suffix.lower() in video_exts:
+    elif p.is_file() and p.suffix.lower() in video_exts and not is_ignored_media_filename(p.name):
         directory = str(p.parent)
         select_path = str(p)
     elif p.parent.is_dir():

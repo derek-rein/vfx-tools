@@ -43,6 +43,7 @@ from ..core.constants import (
     is_image_sequence_ext,
 )
 from ..core.ocio_utils import color_space_families, config_source_info
+from ..core.video import is_ignored_media_filename
 from ..services.presets import delete_preset, list_presets, load_preset, save_preset
 from ..services.worker import ConvertWorker
 from .preferences import (
@@ -340,8 +341,9 @@ class MainWindow(QMainWindow):
             # that are not yet fully visible, or sequence tokens).
             p = Path(open_path.split()[0] if open_path else "")
             name = p.name.lower()
-            if p.suffix.lower() in self._VIDEO_EXTS or any(
-                name.endswith(ext) for ext in self._VIDEO_EXTS
+            if not is_ignored_media_filename(p.name) and (
+                p.suffix.lower() in self._VIDEO_EXTS
+                or any(name.endswith(ext) for ext in self._VIDEO_EXTS)
             ):
                 self._tabs.setCurrentIndex(0)
             else:
@@ -349,13 +351,17 @@ class MainWindow(QMainWindow):
                 self._tabs.setCurrentIndex(1)
 
         if open_path:
-            # Prevent deferred QSettings restore from overwriting --open / Nuke.
-            self._v2e_tab.suppress_saved_input_restore()
-            self._e2v_tab.suppress_saved_input_restore()
-            tab = self._active_tab()
-            # Async probe so large MXFs / sequences don't freeze launch.
-            tab.set_input_async(open_path)
-            self._append_log(f"Opened (launch): {open_path}")
+            open_name = Path(open_path.split()[0]).name
+            if is_ignored_media_filename(open_name):
+                self._append_log(f"Ignored OS metadata path on launch (not media): {open_name}")
+            else:
+                # Prevent deferred QSettings restore from overwriting --open / Nuke.
+                self._v2e_tab.suppress_saved_input_restore()
+                self._e2v_tab.suppress_saved_input_restore()
+                tab = self._active_tab()
+                # Async probe so large MXFs / sequences don't freeze launch.
+                tab.set_input_async(open_path)
+                self._append_log(f"Opened (launch): {open_path}")
 
     # -- Menu bar --
 
@@ -1264,7 +1270,12 @@ class MainWindow(QMainWindow):
             for url in mime.urls():
                 if url.isLocalFile():
                     p = Path(url.toLocalFile())
-                    if p.is_dir() or p.suffix.lower() in (self._VIDEO_EXTS | IMAGE_SEQUENCE_EXTS):
+                    if p.is_dir():
+                        event.acceptProposedAction()
+                        return
+                    if is_ignored_media_filename(p.name):
+                        continue
+                    if p.suffix.lower() in (self._VIDEO_EXTS | IMAGE_SEQUENCE_EXTS):
                         event.acceptProposedAction()
                         return
         event.ignore()
@@ -1277,13 +1288,21 @@ class MainWindow(QMainWindow):
             if not url.isLocalFile():
                 continue
             p = Path(url.toLocalFile())
-            if p.is_file() and p.suffix.lower() in self._VIDEO_EXTS:
+            if (
+                p.is_file()
+                and p.suffix.lower() in self._VIDEO_EXTS
+                and not is_ignored_media_filename(p.name)
+            ):
                 self._tabs.setCurrentIndex(0)
                 self._v2e_tab.handle_dropped_path(str(p))
                 self._append_log(f"Dropped video: {p.name}")
                 event.acceptProposedAction()
                 return
-            if p.is_dir() or (p.is_file() and is_image_sequence_ext(p.suffix)):
+            if p.is_dir() or (
+                p.is_file()
+                and is_image_sequence_ext(p.suffix)
+                and not is_ignored_media_filename(p.name)
+            ):
                 self._tabs.setCurrentIndex(1)
                 self._e2v_tab.handle_dropped_path(str(p))
                 self._append_log(f"Dropped: {p.name}")

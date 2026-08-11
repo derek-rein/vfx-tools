@@ -102,7 +102,7 @@ from ..core.ocio_utils import (
     resolve_ocio_config,
 )
 from ..core.sequence import probe_exr_colorspace, probe_exr_metadata, scan_exr_sequences
-from ..core.video import probe_video_metadata, scan_video_files
+from ..core.video import is_ignored_media_filename, probe_video_metadata, scan_video_files
 from .browser_state import (
     SEQ_BROWSER_KEYS,
     VID_BROWSER_KEYS,
@@ -1326,6 +1326,7 @@ class _DirSearchWorker(QObject):
                     if not is_dir and (
                         self._dirs_only
                         or name in _SEARCH_SKIP_FILES
+                        or name.startswith("._")
                         or ext_lower in _SEARCH_SKIP_SUFFIXES
                         or (self._ext_filter is not None and ext_lower not in self._ext_filter)
                     ):
@@ -4428,7 +4429,11 @@ class ConvertTab(QWidget):
 
         p = Path(text).expanduser()
         if self._mode == "video2exr":
-            if p.is_file() and p.suffix.lower() in _VIDEO_EXTS:
+            if (
+                p.is_file()
+                and p.suffix.lower() in _VIDEO_EXTS
+                and not is_ignored_media_filename(p.name)
+            ):
                 self.set_input(str(p))
                 return
         else:
@@ -4436,7 +4441,11 @@ class ConvertTab(QWidget):
 
             if (
                 p.is_dir()
-                or (p.is_file() and is_image_sequence_ext(p.suffix))
+                or (
+                    p.is_file()
+                    and is_image_sequence_ext(p.suffix)
+                    and not is_ignored_media_filename(p.name)
+                )
                 or looks_like_sequence_pattern(text)
             ):
                 # Nuke-style ``name.####.exr`` paste: resolve range + color space
@@ -4986,10 +4995,18 @@ class ConvertTab(QWidget):
         """Accept a dropped path if valid for this tab's mode. Returns True if accepted."""
         p = Path(path)
         if self._mode == "video2exr":
-            if p.is_file() and p.suffix.lower() in _VIDEO_EXTS:
+            if (
+                p.is_file()
+                and p.suffix.lower() in _VIDEO_EXTS
+                and not is_ignored_media_filename(p.name)
+            ):
                 return self.set_input(str(p))
         else:
-            if p.is_dir() or (p.is_file() and is_image_sequence_ext(p.suffix)):
+            if p.is_dir() or (
+                p.is_file()
+                and is_image_sequence_ext(p.suffix)
+                and not is_ignored_media_filename(p.name)
+            ):
                 return self.set_input(str(p))
         return False
 
