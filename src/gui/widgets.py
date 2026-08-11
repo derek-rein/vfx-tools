@@ -764,29 +764,10 @@ def _copy_to_clipboard(text: str) -> None:
 
 
 def _folder_path_for_copy(text: str) -> str:
-    """Directory to copy for a file, folder, or ``name.####.ext`` path string.
+    """Directory to copy for a file, folder, or ``name.####.ext`` path string."""
+    from .browser_path import folder_path_for_copy
 
-    Shared by path-field and file-browser context menus (same semantics as the
-    Input/Output line-edit **Copy Folder Path** action).
-    """
-    raw = (text or "").strip()
-    if not raw:
-        return ""
-    p = Path(raw).expanduser()
-    # Sequence pattern → containing directory
-    if "#" in p.name:
-        return str(p.parent)
-    try:
-        if p.is_dir():
-            return str(p)
-        if p.is_file():
-            return str(p.parent)
-    except OSError:
-        pass
-    # Non-existent file-like path → parent; bare path → as-is
-    if p.suffix or "." in p.name:
-        return str(p.parent) if str(p.parent) not in ("", ".") else str(p)
-    return str(p)
+    return folder_path_for_copy(text)
 
 
 def _add_copy_path_actions(menu: QMenu, *, file_path: str = "", folder_path: str = "") -> None:
@@ -2142,47 +2123,24 @@ class SequenceBrowserDialog(QDialog):
 
     def _on_path_entered(self) -> None:
         """Navigate to a pasted/typed path (folder, frame file, or Nuke #### pattern)."""
-        raw = self._path_edit.text().strip()
+        from .browser_path import clean_path_string
+
+        raw = clean_path_string(self._path_edit.text())
         if not raw:
             return
+        # Reflect cleaned paste (file:// / quotes) back into the field.
+        if raw != self._path_edit.text().strip():
+            self._path_edit.setText(raw)
         self._navigate_to_path_string(raw)
 
     def _navigate_to_path_string(self, raw: str, *, prefer_preview: bool = True) -> None:
         """Resolve *raw* to a folder + optional sequence selection and open it."""
-        from ..core.sequence import looks_like_sequence_pattern, sequence_pattern_stem
+        from .browser_path import resolve_sequence_browser_path
 
-        p = Path(raw).expanduser()
-        directory = ""
-        select_name = ""
-        if p.is_dir():
-            directory = str(p)
-        elif p.is_file() and is_image_sequence_ext(p.suffix):
-            directory = str(p.parent)
-            # Match the sequence that owns this frame by stem (strip frame token).
-            stem = sequence_pattern_stem(p.name)
-            if stem is None:
-                # Real frame ``name.1001.exr`` → stem before last numeric token.
-                m = re.match(
-                    r"^(?P<head>.+)\.(?P<frame>\d+)\.(?P<ext>[A-Za-z0-9]+)$",
-                    p.name,
-                    re.I,
-                )
-                select_name = m.group("head") if m else p.stem
-            else:
-                select_name = stem
-        elif looks_like_sequence_pattern(raw):
-            directory = str(p.parent)
-            select_name = sequence_pattern_stem(p.name) or ""
-        else:
-            # Parent dir still useful when the leaf is mistyped.
-            if p.parent.is_dir():
-                directory = str(p.parent)
-            else:
-                return
-
-        if not directory or not Path(directory).is_dir():
+        resolved = resolve_sequence_browser_path(raw)
+        if resolved is None:
             return
-
+        directory, select_name = resolved
         self._auto_select_name = select_name
         if prefer_preview:
             # Paste from Nuke should land in Preview with the sequence selected.
@@ -3377,26 +3335,22 @@ class VideoBrowserDialog(QDialog):
 
     def _on_path_entered(self) -> None:
         """Navigate to a pasted/typed folder or video file path."""
-        raw = self._path_edit.text().strip()
+        from .browser_path import clean_path_string
+
+        raw = clean_path_string(self._path_edit.text())
         if not raw:
             return
+        if raw != self._path_edit.text().strip():
+            self._path_edit.setText(raw)
         self._navigate_to_path_string(raw)
 
     def _navigate_to_path_string(self, raw: str, *, prefer_preview: bool = True) -> None:
-        p = Path(raw).expanduser()
-        directory = ""
-        select_path = ""
-        if p.is_dir():
-            directory = str(p)
-        elif p.is_file() and p.suffix.lower() in _VIDEO_EXTS:
-            directory = str(p.parent)
-            select_path = str(p)
-        elif p.parent.is_dir():
-            directory = str(p.parent)
-        else:
+        from .browser_path import resolve_video_browser_path
+
+        resolved = resolve_video_browser_path(raw, _VIDEO_EXTS)
+        if resolved is None:
             return
-        if not directory:
-            return
+        directory, select_path = resolved
         self._auto_select_path = select_path
         if prefer_preview and select_path:
             self._pending_preview = True
@@ -4451,7 +4405,9 @@ class ConvertTab(QWidget):
         sequence the moment anything re-emitted ``textChanged`` with the
         display pattern, which is not a filesystem path.
         """
-        text = text.strip()
+        from .browser_path import clean_path_string
+
+        text = clean_path_string(text)
         if not text:
             self._video_info = None
             self._input_seq = None
@@ -4470,10 +4426,10 @@ class ConvertTab(QWidget):
         self._video_info = None
         self._input_seq = None
 
-        p = Path(text)
+        p = Path(text).expanduser()
         if self._mode == "video2exr":
             if p.is_file() and p.suffix.lower() in _VIDEO_EXTS:
-                self.set_input(text)
+                self.set_input(str(p))
                 return
         else:
             from ..core.sequence import looks_like_sequence_pattern

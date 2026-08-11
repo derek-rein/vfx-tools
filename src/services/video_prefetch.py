@@ -18,10 +18,9 @@ Playback / scrub strategy (FFmpeg / PyAV best practice)
 from __future__ import annotations
 
 import logging
-import math
 import threading
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
@@ -36,291 +35,10 @@ FrameTransform = Callable[[np.ndarray], "np.ndarray | None"]
 
 _HARD_LOOKAHEAD_FRAMES = 120
 _MIN_LOOKAHEAD_FRAMES = 8
-# Decode this many frames forward instead of seeking (cheap sequential path).
+# Drop stale scrub work when the playhead moved far from a queued frame.
 _FORWARD_DECODE_LIMIT = 48
 # Scrubbing: avoid reverse seeks that thrash the GOP decoder.
 _SCRUB_LOOKBACK_FRAMES = 2
-# Safety cap when walking from a keyframe toward a target (long GOPs).
-_MAX_DECODE_STEPS = 600
-
-
-class _VideoDecoder:
-    """Stateful sequential PyAV decoder with keyframe-seek + decode-forward."""
-
-    def __init__(self, path: str, *, fps: float = 0.0) -> None:
-        import av
-
-        from ..core.video import stream_fps
-
-        self.path = path
-        self._av = av
-        self.container = av.open(path)
-        if not self.container.streams.video:
-            self.container.close()
-            raise RuntimeError(f"No video stream in {path}")
-        self.stream = self.container.streams.video[0]
-        # Slice / frame threading helps H.264/HEVC scrub latency.
-        try:
-            self.stream.thread_type = "AUTO"
-        except Exception:
-            pass
-
-        # Prefer the same rate the player used for the 1…N timeline (probe).
-        probed = float(fps) if fps and fps > 0 else 0.0
-        self.fps = probed if probed > 0 else (stream_fps(self.stream) or 24.0)
-        self._time_base = self.stream.time_base
-        self._start_pts = int(self.stream.start_time or 0)
-
-        # Persistent decoder iterator (invalidated on seek / reopen).
-        self._frame_iter: Iterator | None = None
-        # Next 1-based index that sequential ``_next_decoded`` will assign when
-        # counting (set after first post-seek frame via PTS).
-        self._next_idx: int | None = None
-        self._last_rgb: np.ndarray | None = None
-        self._last_idx: int | None = None
-        self._eof = False
-
-    def close(self) -> None:
-        self._frame_iter = None
-        try:
-            self.container.close()
-        except Exception:
-            pass
-
-    def _frame_to_rgb_f32(self, frame) -> np.ndarray:
-        # 16-bit RGB keeps headroom for OCIO; match convert path.
-        try:
-            arr = frame.to_ndarray(format="rgb48le")
-            return np.ascontiguousarray(arr.astype(np.float32) * (1.0 / 65535.0))
-        except Exception:
-            arr = frame.to_ndarray(format="rgb24")
-            return np.ascontiguousarray(arr.astype(np.float32) * (1.0 / 255.0))
-
-    def _pts_to_index(self, pts: int | None) -> int:
-        """Map a presentation timestamp to a 1-based timeline index."""
-        if pts is None or self._time_base is None:
-            return 1
-        try:
-            rel = float((int(pts) - self._start_pts) * self._time_base)
-        except Exception:
-            return 1
-        if rel < 0:
-            rel = 0.0
-        # floor(t * fps + ε) + 1 — stable at frame boundaries.
-        return max(1, int(math.floor(rel * self.fps + 1e-6)) + 1)
-
-    def _index_to_pts(self, idx_1based: int) -> int:
-        """Stream PTS for the start of *idx_1based* (1-based)."""
-        idx = max(1, int(idx_1based))
-        if self._time_base is None:
-            # AV_TIME_BASE units when no stream time_base (rare).
-            import av
-
-            return int((idx - 1) / self.fps * av.time_base)
-        sec = (idx - 1) / self.fps
-        return self._start_pts + int(round(sec / float(self._time_base)))
-
-    def _frame_index(self, frame) -> int:
-        pts = getattr(frame, "pts", None)
-        if pts is not None:
-            return self._pts_to_index(int(pts))
-        # Some decoders only expose ``time`` (seconds).
-        t = getattr(frame, "time", None)
-        if t is not None:
-            try:
-                rel = float(t)
-                if self._time_base is not None and self._start_pts:
-                    rel = max(0.0, rel - float(self._start_pts * self._time_base))
-                return max(1, int(math.floor(rel * self.fps + 1e-6)) + 1)
-            except Exception:
-                pass
-        return self._next_idx or 1
-
-    def _reopen(self) -> None:
-        try:
-            self.container.close()
-        except Exception:
-            pass
-        self.container = self._av.open(self.path)
-        self.stream = self.container.streams.video[0]
-        try:
-            self.stream.thread_type = "AUTO"
-        except Exception:
-            pass
-        self._time_base = self.stream.time_base
-        self._start_pts = int(self.stream.start_time or 0)
-        # Keep the timeline clock from construction (probe); only re-read if
-        # we never had a rate.
-        if self.fps <= 0:
-            from ..core.video import stream_fps
-
-            self.fps = stream_fps(self.stream) or 24.0
-        self._frame_iter = None
-        self._next_idx = None
-        self._last_rgb = None
-        self._last_idx = None
-        self._eof = False
-
-    def _seek_to_index(self, idx_1based: int) -> None:
-        """Keyframe-seek just before *idx_1based*; next decode establishes index."""
-        target = max(1, int(idx_1based))
-        try:
-            if target <= 1:
-                # Start of stream — prefer stream timeline origin.
-                if self._time_base is not None:
-                    self.container.seek(
-                        self._start_pts,
-                        stream=self.stream,
-                        any_frame=False,
-                        backward=True,
-                    )
-                else:
-                    self.container.seek(0, any_frame=False, backward=True)
-            else:
-                pts = self._index_to_pts(target)
-                self.container.seek(
-                    pts,
-                    stream=self.stream,
-                    any_frame=False,
-                    backward=True,
-                )
-        except Exception:
-            log.debug("Video seek failed for frame %s; reopening", target, exc_info=True)
-            self._reopen()
-            try:
-                if target > 1 and self._time_base is not None:
-                    self.container.seek(
-                        self._index_to_pts(target),
-                        stream=self.stream,
-                        any_frame=False,
-                        backward=True,
-                    )
-            except Exception:
-                log.debug("Retry seek failed for frame %s", target, exc_info=True)
-
-        try:
-            flush = getattr(self.stream.codec_context, "flush_buffers", None)
-            if callable(flush):
-                flush()
-        except Exception:
-            pass
-
-        # Invalidate iterator so the next demux starts at the new position.
-        self._frame_iter = None
-        self._next_idx = None
-        self._last_rgb = None
-        self._last_idx = None
-        self._eof = False
-
-    def _ensure_iter(self) -> Iterator:
-        if self._frame_iter is None:
-            self._frame_iter = self.container.decode(self.stream)
-        return self._frame_iter
-
-    def _next_decoded(self) -> tuple[int, np.ndarray] | None:
-        """Pull one frame; return ``(1-based index, rgb float32)`` or None at EOF."""
-        if self._eof:
-            return None
-        it = self._ensure_iter()
-        try:
-            frame = next(it)
-        except StopIteration:
-            self._eof = True
-            self._frame_iter = None
-            return None
-        except Exception:
-            log.debug("Video decode error", exc_info=True)
-            self._eof = True
-            self._frame_iter = None
-            return None
-
-        if self._next_idx is None:
-            cur = self._frame_index(frame)
-            self._next_idx = cur + 1
-        else:
-            cur = self._next_idx
-            self._next_idx = cur + 1
-
-        rgb = self._frame_to_rgb_f32(frame)
-        self._last_idx = cur
-        self._last_rgb = rgb
-        return cur, rgb
-
-    def get_frame(self, idx_1based: int) -> np.ndarray | None:
-        """Return float32 RGB for 1-based frame index, or None on failure."""
-        idx = max(1, int(idx_1based))
-        if self._last_idx == idx and self._last_rgb is not None:
-            return self._last_rgb
-
-        need_seek = False
-        if self._eof:
-            need_seek = True
-        elif self._last_idx is None:
-            # Cold start: sequential from 1 is cheaper than seek for early frames.
-            need_seek = idx > 1
-        elif idx < self._last_idx:
-            need_seek = True
-        elif idx > self._last_idx + _FORWARD_DECODE_LIMIT:
-            need_seek = True
-
-        if need_seek:
-            self._seek_to_index(idx)
-        elif idx == self._last_idx and self._last_rgb is not None:
-            return self._last_rgb
-
-        # After keyframe seek, walk forward until we hit (or pass) the target.
-        # Never label the first post-seek keyframe as *idx* unless PTS agrees.
-        steps = 0
-        while steps < _MAX_DECODE_STEPS:
-            steps += 1
-            got = self._next_decoded()
-            if got is None:
-                break
-            cur, rgb = got
-            if cur == idx:
-                return rgb
-            if cur > idx:
-                # Overshot (coarse PTS mapping / VFR). Return nearest decoded.
-                return rgb
-            # cur < idx: keep decoding toward target
-            continue
-
-        if self._last_idx == idx:
-            return self._last_rgb
-        return None
-
-
-class _R3DDecoder:
-    """R3D / N-RAW decoder for player scrub (half-res good by default)."""
-
-    def __init__(self, path: str, *, fps: float = 0.0, mode: int | None = None) -> None:
-        from ..core.r3d import DECODE_PREVIEW, R3DClip
-
-        self.path = path
-        self._clip = R3DClip(path)
-        self.fps = float(fps) if fps and fps > 0 else float(self._clip.info.fps or 24.0)
-        self._mode = int(mode) if mode is not None else DECODE_PREVIEW
-        self._last_idx: int | None = None
-        self._last_rgb: np.ndarray | None = None
-
-    def close(self) -> None:
-        try:
-            self._clip.close()
-        except Exception:
-            pass
-
-    def get_frame(self, idx_1based: int) -> np.ndarray | None:
-        idx = max(1, int(idx_1based))
-        if self._last_idx == idx and self._last_rgb is not None:
-            return self._last_rgb
-        try:
-            rgb = self._clip.decode_frame(idx - 1, mode=self._mode)
-        except Exception:
-            log.debug("R3D get_frame failed frame=%s", idx, exc_info=True)
-            return None
-        self._last_idx = idx
-        self._last_rgb = rgb
-        return rgb
 
 
 def _decode_one(
@@ -332,7 +50,7 @@ def _decode_one(
     fps: float = 0.0,
 ) -> np.ndarray | None:
     """Worker entry: decode one frame via a shared locked decoder."""
-    from ..core.r3d import is_r3d_path
+    from ..core.frame_source import open_preview_decoder
 
     with lock:
         dec = decoder_holder.get("dec")
@@ -340,10 +58,7 @@ def _decode_one(
             if dec is not None:
                 dec.close()
             try:
-                if is_r3d_path(path):
-                    dec = _R3DDecoder(path, fps=fps)
-                else:
-                    dec = _VideoDecoder(path, fps=fps)
+                dec = open_preview_decoder(path, fps=fps)
             except Exception:
                 log.exception("Failed to open video for prefetch: %s", path)
                 decoder_holder["dec"] = None

@@ -26,6 +26,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from packaging_util import ignore_macos_junk, is_macos_junk_name, safe_print  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "native" / "r3d" / "r3d_bridge.cpp"
 HDR_DIR = ROOT / "native" / "r3d"
@@ -193,19 +196,16 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
     if dest_redist.exists():
         shutil.rmtree(dest_redist)
 
-    def _ignore_junk(_dir: str, names: list[str]) -> set[str]:
-        return {n for n in names if n.startswith("._") or n in {".DS_Store", "Thumbs.db"}}
-
-    shutil.copytree(redistrib_src, dest_redist, ignore=_ignore_junk)
+    shutil.copytree(redistrib_src, dest_redist, ignore=ignore_macos_junk)
     # Also drop any junk already nested if ignore missed something.
     for p in dest_redist.rglob("*"):
-        if p.name.startswith("._") or p.name in {".DS_Store", "Thumbs.db"}:
+        if p.is_file() and is_macos_junk_name(p.name):
             p.unlink(missing_ok=True)
 
     # ASCII-only logs: Windows CI runners often use cp1252 and choke on arrows.
-    print(f"Built {out_lib}")
-    print(f"Redistributables -> {dest_redist}")
-    print(f"SDK version root: {sdk}")
+    safe_print(f"Built {out_lib}")
+    safe_print(f"Redistributables -> {dest_redist}")
+    safe_print(f"SDK version root: {sdk}")
     return out_lib
 
 

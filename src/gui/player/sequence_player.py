@@ -385,7 +385,7 @@ class SequencePlayer(QWidget):
             return False
 
         try:
-            from ...core.r3d import is_r3d_path
+            from ...core.r3d import DECODE_PREVIEW, is_r3d_path, scale_for_decode_mode
             from ...core.video import probe_video, resolve_video_src_colorspace
 
             w, h, probed_fps, n_frames = probe_video(path)
@@ -401,10 +401,15 @@ class SequencePlayer(QWidget):
             use_fps = 24.0
         self.set_fps(use_fps)
         # Probe size when caller did not pass a positive resolution.
-        # R3D player path uses half-res decode (DECODE_PREVIEW) for scrub speed.
+        # R3D player path uses DECODE_PREVIEW (half) — set resolution from the
+        # decode ladder so the viewer matches actual prefetch buffers.
         if w > 0 and h > 0 and (resolution is None or resolution[0] <= 0 or resolution[1] <= 0):
             if is_r3d_path(path):
-                self.set_resolution(max(1, int(w) // 2), max(1, int(h) // 2))
+                ladder = scale_for_decode_mode(DECODE_PREVIEW)
+                self.set_resolution(
+                    max(1, int(round(w * ladder))),
+                    max(1, int(round(h * ladder))),
+                )
             else:
                 self.set_resolution(int(w), int(h))
 

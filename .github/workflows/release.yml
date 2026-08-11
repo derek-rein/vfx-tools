@@ -430,8 +430,8 @@ jobs:
               sh -c 'lipo -info "$1" 2>/dev/null | grep -q "universal\|two arch" && lipo -thin '"$ARCH"' "$1" -output "$1.thin" && mv "$1.thin" "$1" || true' _ {} \;
           fi
 
-          # Strip debug symbols
-          find "$APP" -type f \( -name '*.dylib' -o -name '*.so' \) -exec strip -x {} +
+          # Strip debug symbols (never strip private RED redistributables under r3d/).
+          find "$APP" -type f \( -name '*.dylib' -o -name '*.so' \) ! -path '*/r3d/*' -exec strip -x {} +
 
           echo "Bundle size after slimming:"
           du -sh "$APP"
@@ -464,7 +464,9 @@ jobs:
         shell: bash
         run: |
           DIST="dist/main.dist"
-          find "$DIST" -type f \( -name '*.so' -o -name '*.so.*' -o -name 'exr_converter' \) -exec strip --strip-unneeded {} +
+          # Never strip private RED redistributables under r3d/ (license + ABI safety).
+          find "$DIST" -type f \( -name '*.so' -o -name '*.so.*' -o -name 'exr_converter' \) \
+            ! -path '*/r3d/*' -exec strip --strip-unneeded {} +
           echo "Bundle size after slimming:"
           du -sh "$DIST"
 

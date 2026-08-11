@@ -8,8 +8,9 @@ import numpy as np
 import pytest
 from PySide6.QtCore import QCoreApplication
 
+from src.core.frame_source import VideoPreviewDecoder
 from src.services.frame_cache import FrameCache
-from src.services.video_prefetch import VideoPrefetchService, _VideoDecoder
+from src.services.video_prefetch import VideoPrefetchService
 
 
 def _write_tiny_video(
@@ -67,7 +68,7 @@ class TestVideoDecoder:
     def test_sequential_frames(self, tmp_path: Path) -> None:
         vid = tmp_path / "t.mp4"
         _write_tiny_video(vid, n_frames=6)
-        dec = _VideoDecoder(str(vid))
+        dec = VideoPreviewDecoder(str(vid))
         try:
             f1 = dec.get_frame(1)
             f2 = dec.get_frame(2)
@@ -83,7 +84,7 @@ class TestVideoDecoder:
     def test_seek_backward(self, tmp_path: Path) -> None:
         vid = tmp_path / "t.mp4"
         _write_tiny_video(vid, n_frames=10)
-        dec = _VideoDecoder(str(vid))
+        dec = VideoPreviewDecoder(str(vid))
         try:
             late = dec.get_frame(8)
             early = dec.get_frame(2)
@@ -103,7 +104,7 @@ class TestVideoDecoder:
         _write_tiny_video(vid, n_frames=n, gop=12)
 
         sequential: dict[int, float] = {}
-        dec_seq = _VideoDecoder(str(vid))
+        dec_seq = VideoPreviewDecoder(str(vid))
         try:
             for i in range(1, n + 1):
                 rgb = dec_seq.get_frame(i)
@@ -115,7 +116,7 @@ class TestVideoDecoder:
         # Monotonic red ramp (within encode quantisation).
         assert sequential[1] < sequential[n // 2] < sequential[n]
 
-        dec = _VideoDecoder(str(vid))
+        dec = VideoPreviewDecoder(str(vid))
         try:
             # Mid-GOP target after a cold seek (not sequential from 1).
             for target in (15, 23, 7, 28, 3, 18):
@@ -133,7 +134,7 @@ class TestVideoDecoder:
         """Playing 1→N should keep increasing content (no keyframe snap-back)."""
         vid = tmp_path / "play.mp4"
         _write_tiny_video(vid, n_frames=16, gop=8)
-        dec = _VideoDecoder(str(vid))
+        dec = VideoPreviewDecoder(str(vid))
         try:
             prev = -1.0
             for i in range(1, 17):
@@ -208,7 +209,7 @@ class TestFrameTransformContract:
                     break
                 time.sleep(0.01)
             assert cache.contains(1)
-            raw = _VideoDecoder(str(vid)).get_frame(1)
+            raw = VideoPreviewDecoder(str(vid)).get_frame(1)
             assert raw is not None
             got = cache.get(1)
             assert got is not None
