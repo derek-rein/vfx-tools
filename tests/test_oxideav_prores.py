@@ -182,9 +182,7 @@ class TestOxideavBitDepth:
 
     def test_yuv_midbin_kept_4444(self, tmp_path: Path):
         out = tmp_path / "midbin_4444.mov"
-        with exr_prores.ProResMovWriter(
-            str(out), self.W, self.H, 24, 1, profile="4444"
-        ) as writer:
+        with exr_prores.ProResMovWriter(str(out), self.W, self.H, 24, 1, profile="4444") as writer:
             for yv in (self.BASE, self.BASE + self.MID):
                 y = np.full((self.H, self.W), yv, dtype=np.uint16)
                 c = np.full((self.H, self.W), 2048, dtype=np.uint16)
