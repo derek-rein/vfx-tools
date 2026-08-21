@@ -20,4 +20,4 @@ as the code (and [CHANGELOG.md](../CHANGELOG.md)). See
 | [Nuke](./nuke.md) | Nuke menu integration |
 | [R3D / N-RAW](./r3d.md) | Optional RED R3D SDK (proprietary; build + license) |
 | [Releasing](./releasing.md) | Pointer to maintainer release process |
-| [12-bit ProRes plan](./plan-12bit-prores-oxideav.md) | Future work (not implemented) |
+| [12-bit ProRes (oxideav)](./plan-12bit-prores-oxideav.md) | Experimental RDD-36 12-bit ProRes via PyO3 |

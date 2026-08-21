@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "exr-prores"
+version = "0.1.0"
+description = "oxideav-prores PyO3 bindings for EXR Converter (12-bit RDD-36 ProRes-compatible MOV)"
+requires-python = ">=3.13"
+
+[tool.maturin]
+module-name = "exr_prores"
+features = ["pyo3/extension-module"]

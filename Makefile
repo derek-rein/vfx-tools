@@ -8,7 +8,7 @@
 #   make release PUSH=0                   # … local only; push branch + tag yourself to trigger CI
 
 .PHONY: help run lint typecheck fmt test test-unit resources bundle clean bump release \
-	sync ensure-ocio docs-serve docs-build r3d-bridge r3d-sdk-fetch
+	sync ensure-ocio docs-serve docs-build r3d-bridge r3d-sdk-fetch oxideav-prores
 
 APP_NAME := exr_converter
 MACOS_BUNDLE_NAME := EXR Converter
@@ -43,6 +43,7 @@ help:
 	@echo "  make docs-serve / docs-build           # Hugo site from docs/ (local / CI)"
 	@echo "  make r3d-sdk-fetch                     # download private R3D SDK (CI feed / gh auth)"
 	@echo "  make r3d-bridge                        # build optional RED R3D bridge (needs SDK)"
+	@echo "  make oxideav-prores                    # build PyO3 oxideav 12-bit ProRes extension"
 	@echo ""
 	@echo "  make bump PART=patch|minor|major       # bump version (no git)"
 	@echo "  make release PART=… PUSH=0             # preferred: bump+commit+tag on release/* branch"
@@ -72,6 +73,10 @@ r3d-sdk-fetch:
 
 r3d-bridge:
 	$(PYTHON) scripts/build_r3d_bridge.py
+
+# Optional true 12-bit ProRes (oxideav-prores via PyO3). Needs Rust + maturin.
+oxideav-prores:
+	$(PYTHON) scripts/build_oxideav_prores.py
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 
@@ -117,6 +122,8 @@ bundle: resources
 	$(PYTHON) scripts/ensure_ocio.py
 	# Optional R3D: build bridge when SDK is present (local stash or prior fetch).
 	-@$(PYTHON) scripts/build_r3d_bridge.py
+	# Optional oxideav 12-bit ProRes PyO3 extension (skip quietly if no Rust).
+	-@$(PYTHON) scripts/build_oxideav_prores.py
 	$(PYTHON) -m nuitka \
 		--standalone \
 		--output-dir=dist \
@@ -149,6 +156,7 @@ bundle: resources
 		--include-package=OpenGL \
 		--include-data-dir=resources/ocio=resources/ocio \
 		--include-module=ssl \
+		--include-module=exr_prores \
 		$(ENTRY)
 	mv dist/main.app "dist/$(MACOS_BUNDLE_NAME).app"
 	# Nuitka rewires PyOpenColorIO → OIIO’s OCIO 2.4; put 2.5 back.
