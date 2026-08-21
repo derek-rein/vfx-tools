@@ -104,10 +104,9 @@ impl ProResMovWriter {
             return Ok(());
         }
         if self.sample_sizes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no frames written",
-            ));
+            // Allow close after a failed/cancelled job with zero frames.
+            self.closed = true;
+            return Ok(());
         }
 
         let mdat_end = self.file.stream_position()?;
