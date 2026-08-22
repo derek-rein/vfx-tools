@@ -13,6 +13,14 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Added
+
+- **Experimental true 12-bit ProRes** (`prores_ox_4444` / `prores_ox_xq`):
+  cross-platform RDD-36 ProRes-compatible encode via in-process
+  **oxideav-prores** PyO3 bindings (``exr_prores``), packaged with Nuitka.
+  Not Apple-certified; hidden when the extension is not built
+  (`make oxideav-prores`). Software FFmpeg ProRes remains honest 10-bit.
+
 ---
 
 ## [0.9.7] — 2026-08-11

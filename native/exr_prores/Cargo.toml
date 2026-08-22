@@ -1,0 +1,21 @@
+[package]
+name = "exr_prores"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 bindings: oxideav-prores 12-bit encode + minimal MOV mux for EXR Converter"
+license = "MIT"
+publish = false
+
+[lib]
+name = "exr_prores"
+crate-type = ["cdylib"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-prores = "0.1"
+numpy = "0.25"
+pyo3 = { version = "0.25", features = ["extension-module"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

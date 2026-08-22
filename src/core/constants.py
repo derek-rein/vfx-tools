@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from typing import NamedTuple
 
+from .oxideav_prores import is_available as oxideav_prores_available
+
 APP_ORG = "VFXTools"
 APP_NAME = "EXRConverter"
 APP_VERSION = "0.9.7"
@@ -223,6 +225,25 @@ VIDEO_CODECS: list[VideoCodecSpec] = [
     # VT 4444/XQ: ayuv64le intermediate; HW keeps ~12-bit mid-bin (unlike prores_ks).
     _prores_vt("prores_vt_4444", "Apple ProRes 4444", "ayuv64le", 12, "4:4:4:4"),
     _prores_vt("prores_vt_xq", "Apple ProRes 4444 XQ", "ayuv64le", 12, "4:4:4:4"),
+    # ── ProRes oxideav (experimental, cross-platform true 12-bit) ────────
+    # Pure-Rust RDD-36 encode via PyO3 ``exr_prores`` (not FFmpeg). Hidden
+    # when the extension is not built — see available_video_codecs().
+    VideoCodecSpec(
+        "prores_ox_4444",
+        "ProRes 4444 · 12-bit 4:4:4 · oxideav (experimental, RDD-36)",
+        "oxideav_prores",
+        "yuv444p12le",
+        12,
+        "4:4:4",
+    ),
+    VideoCodecSpec(
+        "prores_ox_xq",
+        "ProRes 4444 XQ · 12-bit 4:4:4 · oxideav (experimental, RDD-36)",
+        "oxideav_prores",
+        "yuv444p12le",
+        12,
+        "4:4:4",
+    ),
     # ── CineForm ──────────────────────────────────────────────────────────
     VideoCodecSpec(
         "cineform",
@@ -301,6 +322,8 @@ VIDEO_CODECS: list[VideoCodecSpec] = [
 HEVC_CODEC_KEYS: frozenset[str] = frozenset({"hevc", "hevc_8", "hevc_12"})
 FFV1_CODEC_KEYS: frozenset[str] = frozenset({"ffv1", "ffv1_12"})
 X26X_CODEC_KEYS: frozenset[str] = frozenset({"h264"}) | HEVC_CODEC_KEYS
+# Experimental true 12-bit RDD-36 via PyO3 ``exr_prores`` (not FFmpeg).
+OXIDEAV_PRORES_KEYS: frozenset[str] = frozenset({"prores_ox_4444", "prores_ox_xq"})
 DEFAULT_VIDEO_CODEC = "prores"
 
 # prores_ks / prores_videotoolbox profile values keyed by our preset *key*.
@@ -355,8 +378,15 @@ X26X_PRESETS = [
 
 
 def available_video_codecs() -> list[VideoCodecSpec]:
-    """Codecs usable on this OS (filters out VideoToolbox on non-macOS)."""
-    return [c for c in VIDEO_CODECS if c.is_available()]
+    """Codecs usable on this OS (filters VT on non-macOS; oxideav if built)."""
+    out: list[VideoCodecSpec] = []
+    for c in VIDEO_CODECS:
+        if not c.is_available():
+            continue
+        if c.key in OXIDEAV_PRORES_KEYS and not oxideav_prores_available():
+            continue
+        out.append(c)
+    return out
 
 
 def video_codec_by_key(key: str) -> VideoCodecSpec | None:

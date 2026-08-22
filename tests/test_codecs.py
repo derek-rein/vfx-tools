@@ -20,6 +20,7 @@ from src.core.constants import (
     DNXHR_PROFILE,
     FFV1_CODEC_KEYS,
     HEVC_CODEC_KEYS,
+    OXIDEAV_PRORES_KEYS,
     PRORES_KS_PROFILE,
     PRORES_VT_PROFILE,
     VIDEO_CODECS,
@@ -28,6 +29,7 @@ from src.core.constants import (
     video_codec_by_key,
 )
 from src.core.convert import _default_codec_opts
+from src.core.oxideav_prores import is_available as oxideav_prores_available
 
 
 class TestVideoCodecSpecs:
@@ -102,6 +104,22 @@ class TestVideoCodecSpecs:
         else:
             assert not any(s.is_available() for s in vt)
             assert not any(s.key.startswith("prores_vt_") for s in available_video_codecs())
+
+    def test_oxideav_prores_twelve_bit_gated(self):
+        """oxideav presets claim true 12-bit and hide when extension missing."""
+        assert OXIDEAV_PRORES_KEYS == frozenset({"prores_ox_4444", "prores_ox_xq"})
+        for key in OXIDEAV_PRORES_KEYS:
+            s = video_codec_by_key(key)
+            assert s is not None
+            assert s.libav_codec == "oxideav_prores"
+            assert s.bit_depth == 12
+            assert s.pix_fmt == "yuv444p12le"
+            assert s.chroma == "4:4:4"
+        avail_keys = {c.key for c in available_video_codecs()}
+        if oxideav_prores_available():
+            assert OXIDEAV_PRORES_KEYS <= avail_keys
+        else:
+            assert not (OXIDEAV_PRORES_KEYS & avail_keys)
 
     def test_dnxhr_full_ladder(self):
         for k, bit, chroma in (

@@ -32,6 +32,4 @@ r3d_sdk/
 .r3d-sdk/
 .r3d-sdk-location.example
 
-# Optional local R3D bridge build output (contains RED Redistributable copies)
-build/r3d/
-resources/r3d/
+native/exr_prores/target/

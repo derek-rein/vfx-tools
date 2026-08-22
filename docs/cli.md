@@ -163,6 +163,7 @@ variants are **macOS only**.
 | `prores_xq` | 10-bit 4:4:4:4 | Software; not true 12-bit |
 | `prores_vt_proxy` … `prores_vt_hq` | 10-bit 4:2:2 | VideoToolbox (macOS) |
 | `prores_vt_4444`, `prores_vt_xq` | ~12-bit 4:4:4:4 | VideoToolbox (macOS) |
+| `prores_ox_4444`, `prores_ox_xq` | **12-bit** 4:4:4 | Experimental RDD-36 via oxideav (PyO3); requires `make oxideav-prores` |
 | `cineform` | 10-bit 4:2:2 | GoPro CineForm |
 | `cineform_rgb` | 12-bit RGB | CineForm RGB |
 | `dnxhr_lb` / `sq` / `hq` | 8-bit 4:2:2 | DNxHR |
@@ -181,8 +182,11 @@ List keys on your build (filters macOS-only codecs on other OSes):
 uv run python main.py exr2video --help
 ```
 
-Research notes for true cross-platform 12-bit ProRes (not shipped):
-[plan-12bit-prores-oxideav.md](./plan-12bit-prores-oxideav.md).
+Research notes and implementation status for cross-platform 12-bit ProRes:
+[plan-12bit-prores-oxideav.md](./plan-12bit-prores-oxideav.md). Experimental
+presets `prores_ox_4444` / `prores_ox_xq` use in-process oxideav PyO3 bindings
+when `exr_prores` is built (`make oxideav-prores`); they are omitted from
+`--codec` choices otherwise.
 
 ---
 

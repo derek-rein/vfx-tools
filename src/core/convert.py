@@ -11,6 +11,7 @@ import av
 import numpy as np
 import PyOpenColorIO as OCIO
 
+from .constants import OXIDEAV_PRORES_KEYS
 from .exr_io import read_image, write_exr
 from .ocio_utils import (
     get_compositing_space,
@@ -20,6 +21,8 @@ from .ocio_utils import (
     load_config_from_source_info,
     make_cpu_processor,
 )
+from .oxideav_prores import is_available as oxideav_prores_available
+from .oxideav_prores import open_writer, unavailable_reason, write_rgb48_frame
 from .pool import _alpha_over_rgb, process_frame_e2v, process_frame_v2e
 from .sequence import find_exr_sequence
 
@@ -232,6 +235,193 @@ def _encode_slate_video_frame(
         vf = vf.reformat(width=ow, height=oh)
     for packet in stream.encode(vf):
         container.mux(packet)
+
+
+def _rgb_u16_display(
+    slate_rgb_display: np.ndarray,
+    ow: int,
+    oh: int,
+    do_resize: bool,
+) -> np.ndarray:
+    """Quantise display-space float RGB to contiguous HxWx3 uint16 (optionally scaled)."""
+    rgb_u16 = np.clip(slate_rgb_display * 65535.0, 0.0, 65535.0).astype(np.uint16)
+    if not do_resize:
+        return np.ascontiguousarray(rgb_u16)
+    vf = av.VideoFrame.from_ndarray(rgb_u16, format="rgb48le")
+    vf = vf.reformat(width=ow, height=oh)
+    return np.ascontiguousarray(vf.to_ndarray(format="rgb48le"))
+
+
+def _fps_num_den(fps: float) -> tuple[int, int]:
+    rate = _fps_to_rate(fps)
+    if isinstance(rate, Fraction):
+        return int(rate.numerator), int(rate.denominator)
+    return int(rate), 1
+
+
+def _e2v_oxideav(
+    paths: list[str],
+    output_video: Path,
+    ocio_cfg: OCIO.Config,
+    src_space: str,
+    working_space: str,
+    dst_space: str,
+    fps: float,
+    progress: ProgressCallback | None,
+    cancel_check: Callable[[], bool] | None,
+    log: LogCallback | None,
+    ow: int,
+    oh: int,
+    total: int,
+    scale: float,
+    codec_key: str,
+    slate_frame: np.ndarray | None,
+    slate_overlay_working: np.ndarray | None,
+    burnin_working: np.ndarray | None,
+    overlay_auth_space: str,
+    overlay_provider: Callable[[int | None], np.ndarray | None] | None,
+    config_source: str,
+    config_path: str,
+    workers: int,
+) -> None:
+    """EXR→video via in-process oxideav-prores PyO3 bindings (true 12-bit RDD-36)."""
+    if not oxideav_prores_available():
+        raise RuntimeError(unavailable_reason())
+
+    fps_num, fps_den = _fps_num_den(fps)
+    do_resize = scale < 1.0
+    output_video = Path(output_video)
+    if output_video.suffix.lower() != ".mov":
+        output_video = output_video.with_suffix(".mov")
+    output_video.parent.mkdir(parents=True, exist_ok=True)
+
+    if log:
+        log(
+            f"OCIO: {src_space} → {working_space} → {dst_space}  "
+            f"(oxideav-prores {codec_key}, in-process)"
+        )
+
+    writer = open_writer(output_video, ow, oh, fps_num, fps_den, codec_key)
+    finished = 0
+    try:
+        if slate_frame is not None:
+            slate_display = _bake_slate_to_display(
+                slate_frame,
+                ocio_cfg,
+                overlay_auth_space,
+                working_space,
+                dst_space,
+                slate_overlay_working,
+            )
+            write_rgb48_frame(writer, _rgb_u16_display(slate_display, ow, oh, do_resize))
+            if log:
+                log("Slate frame encoded as first video frame (oxideav)")
+
+        # Prefer the process pool for OCIO when possible; encode stays ordered.
+        n_workers = workers if workers > 0 else _DEFAULT_WORKERS
+        use_pool = overlay_provider is None and n_workers > 1 and bool(config_source or config_path)
+
+        if use_pool:
+            max_inflight = n_workers * 2
+            with _process_pool(n_workers) as pool:
+                pending: dict = {}
+                ready: dict[int, np.ndarray] = {}
+                next_encode = 1
+                submit_idx = 0
+
+                def _submit_batch() -> None:
+                    nonlocal submit_idx
+                    while len(pending) < max_inflight and submit_idx < total:
+                        if cancel_check and cancel_check():
+                            _cancel_pool(pool, pending)
+                            raise RuntimeError("Cancelled")
+                        path = paths[submit_idx]
+                        frame_idx = submit_idx + 1
+                        submit_idx += 1
+                        fut = pool.submit(
+                            process_frame_e2v,
+                            frame_idx,
+                            path,
+                            config_source,
+                            config_path,
+                            src_space,
+                            working_space,
+                            dst_space,
+                            burnin_working,
+                        )
+                        pending[fut] = frame_idx
+
+                def _drain_ready() -> None:
+                    nonlocal next_encode, finished
+                    while next_encode in ready:
+                        rgb_u16 = ready.pop(next_encode)
+                        if do_resize:
+                            vf = av.VideoFrame.from_ndarray(rgb_u16, format="rgb48le")
+                            vf = vf.reformat(width=ow, height=oh)
+                            rgb_u16 = vf.to_ndarray(format="rgb48le")
+                        write_rgb48_frame(writer, rgb_u16)
+                        finished += 1
+                        if progress:
+                            progress(finished, total)
+                        next_encode += 1
+
+                _submit_batch()
+                while pending:
+                    if cancel_check and cancel_check():
+                        _cancel_pool(pool, pending)
+                        raise RuntimeError("Cancelled")
+                    done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for done in done_set:
+                        pending.pop(done)
+                        fidx, rgb_u16 = done.result()
+                        ready[fidx] = rgb_u16
+                    _drain_ready()
+                    _submit_batch()
+                _drain_ready()
+        else:
+            cpu_to_working = make_cpu_processor(ocio_cfg, src_space, working_space)
+            cpu_to_display = make_cpu_processor(ocio_cfg, working_space, dst_space)
+            auth_space = overlay_auth_space or get_internal_overlay_authoring_space()
+            for _idx, path in enumerate(paths, 1):
+                if cancel_check and cancel_check():
+                    raise RuntimeError("Cancelled")
+                rgb = read_image(path)
+                frame_buf = np.ascontiguousarray(rgb[:, :, :3], dtype=np.float32)
+                fh, fw = frame_buf.shape[:2]
+                cpu_to_working.apply(OCIO.PackedImageDesc(frame_buf, fw, fh, 3))
+
+                overlay = burnin_working
+                if overlay_provider is not None:
+                    overlay_u8 = overlay_provider(_frame_num_from_path(path))
+                    overlay = (
+                        linearize_overlay(
+                            ocio_cfg,
+                            overlay_u8,
+                            src_space=auth_space,
+                            working_space=working_space,
+                        )
+                        if overlay_u8 is not None
+                        else None
+                    )
+                if overlay is not None and overlay.shape[:2] == (fh, fw):
+                    frame_buf = _alpha_over_rgb(frame_buf, overlay)
+                    frame_buf = np.ascontiguousarray(frame_buf, dtype=np.float32)
+
+                cpu_to_display.apply(OCIO.PackedImageDesc(frame_buf, fw, fh, 3))
+                rgb_u16 = np.clip(frame_buf * 65535.0, 0.0, 65535.0).astype(np.uint16)
+                if do_resize or (fw, fh) != (ow, oh):
+                    vf = av.VideoFrame.from_ndarray(rgb_u16, format="rgb48le")
+                    vf = vf.reformat(width=ow, height=oh)
+                    rgb_u16 = vf.to_ndarray(format="rgb48le")
+                write_rgb48_frame(writer, rgb_u16)
+                finished += 1
+                if progress:
+                    progress(finished, total)
+    finally:
+        writer.close()
+
+    if log:
+        log(f"Wrote {output_video} ({finished} frames, {fps} fps, oxideav)")
 
 
 # ---- video -> exr ----------------------------------------------------------
@@ -582,7 +772,35 @@ def run_exr_to_video(
             ocio_cfg, slate_overlay, working_space=working_space
         )
 
+    # Experimental true 12-bit RDD-36 ProRes via in-process oxideav bindings.
     n_workers = workers if workers > 0 else _DEFAULT_WORKERS
+    if codec_key in OXIDEAV_PRORES_KEYS:
+        _e2v_oxideav(
+            paths,
+            output_video,
+            ocio_cfg,
+            src_space,
+            working_space,
+            dst_space,
+            fps,
+            progress,
+            cancel_check,
+            log,
+            ow,
+            oh,
+            total,
+            scale,
+            codec_key,
+            slate_frame=slate_frame,
+            slate_overlay_working=slate_overlay_working,
+            burnin_working=burnin_working,
+            overlay_auth_space=overlay_auth,
+            overlay_provider=overlay_provider,
+            config_source=config_source,
+            config_path=config_path,
+            workers=n_workers,
+        )
+        return
 
     # A per-frame overlay provider re-renders the overlay each frame, so the
     # worker pool can't share one pre-baked buffer — run single-threaded.

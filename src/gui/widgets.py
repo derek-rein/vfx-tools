@@ -3781,6 +3781,15 @@ _CODEC_HELP: dict[str, str] = {
         "Hardware ProRes 4444 XQ via VideoToolbox (macOS only). ~12-bit class "
         "precision; preferred over software XQ when bit depth matters."
     ),
+    "prores_ox_4444": (
+        "Experimental cross-platform true 12-bit ProRes 4444-compatible encode "
+        "(SMPTE RDD 36 via oxideav-prores PyO3 bindings). Not Apple-certified. "
+        "Requires the built-in exr_prores extension (make oxideav-prores)."
+    ),
+    "prores_ox_xq": (
+        "Experimental cross-platform true 12-bit ProRes 4444 XQ-compatible encode "
+        "(SMPTE RDD 36 via oxideav-prores). Not Apple-certified. Requires exr_prores."
+    ),
     "cineform": (
         "GoPro CineForm (cfhd) — 10-bit 4:2:2 wavelet intermediate. "
         "Quality ladder film3+…low in settings."

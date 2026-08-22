@@ -184,7 +184,10 @@ sequence. Extraction uses the known EXR frame list (not a video seek).
 
 Same honest bit-depth ladder as the CLI. Default is software **ProRes 422 HQ**
 (`prores`, **10-bit**). macOS-only VideoToolbox ProRes keys appear only on
-Darwin. Full key list and bit depths: [CLI codecs](./cli.md#codecs-honest-bit-depths).
+Darwin. Experimental **oxideav** 12-bit ProRes keys (`prores_ox_4444` /
+`prores_ox_xq`) appear when the `exr_prores` extension is built
+(`make oxideav-prores`). Full key list and bit depths:
+[CLI codecs](./cli.md#codecs-honest-bit-depths).
 
 ---
 

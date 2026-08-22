@@ -68,8 +68,11 @@ src/
   render/               # slate, burn-in, watermark, tokens (QPainter)
   services/             # worker thread, presets, cache, slate model, prefetch
   rc_resources.py       # generated from resources.qrc — do not hand-edit
+native/
+  r3d/                  # optional RED R3D C ABI bridge
+  exr_prores/           # optional oxideav-prores PyO3 extension (12-bit ProRes)
 resources/              # icons, style.qss, OCIO config, screenshots
-scripts/                # bump_app_version.py, ensure_ocio.py
+scripts/                # bump_app_version.py, ensure_ocio.py, build_oxideav_prores.py
 tests/                  # pytest; integration + fixtures under tests/fixtures/
 docs/                   # user-facing Markdown (Hugo content source of truth)
 site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
@@ -82,6 +85,7 @@ site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
 |------|------------|
 | Convert pipeline | `src/core/convert.py`, `src/core/video.py`, `src/core/exr_io.py` |
 | Optional R3D / N-RAW | `src/core/r3d.py`, `native/r3d/`, `scripts/build_r3d_bridge.py`, `scripts/fetch_r3d_sdk.py`, `scripts/install_r3d_into_bundle.py`, [docs/r3d.md](./docs/r3d.md) |
+| Optional 12-bit ProRes (oxideav) | `native/exr_prores/` (PyO3), `src/core/oxideav_prores.py`, `make oxideav-prores`, [docs/plan-12bit-prores-oxideav.md](./docs/plan-12bit-prores-oxideav.md) |
 | Private full SDK (local) | `~/code/r3d-sdk-private/R3DSDKv9_2_1` — never commit; CI feed = private repo `derek-rein/r3d-sdk-private` release `sdk-9.2.1` |
 | Codec ladder / bit depth labels | `src/core/constants.py` |
 | CLI | `src/cli.py` |
@@ -103,6 +107,7 @@ make typecheck     # basedpyright
 make test          # full pytest (needs QT_QPA_PLATFORM=offscreen — Makefile sets it)
 make test-unit     # skip @pytest.mark.integration
 make resources     # regenerate src/rc_resources.py after resources.qrc / icons change
+make oxideav-prores # build optional PyO3 12-bit ProRes extension (needs Rust)
 make docs-serve    # Hugo local preview of docs/ (http://127.0.0.1:1313/)
 make docs-build    # Hugo static build → site/public/
 make bundle        # local Nuitka standalone (does not publish a GitHub Release)
@@ -137,10 +142,10 @@ config version 2.5 cannot load on library 2.4. Fix: `make ensure-ocio` or
    exists on user machines. Playback after convert uses the user’s preferred
    player from Preferences (system default or custom path).
 3. **Software ProRes is 10-bit** in FFmpeg/`prores_ks`. True cross-platform
-   12-bit ProRes is *not* available via current FFmpeg path; see
-   `docs/plan-12bit-prores-oxideav.md` for the experimental oxideav plan.
-   VideoToolbox ProRes (`prores_vt_*`) is **macOS-only**; UI must keep honest
-   bit-depth labels.
+   12-bit ProRes-compatible output is experimental via oxideav PyO3
+   (`prores_ox_*`, `make oxideav-prores`); see
+   `docs/plan-12bit-prores-oxideav.md`. VideoToolbox ProRes (`prores_vt_*`) is
+   **macOS-only**; UI must keep honest bit-depth labels.
 4. **Slate is QPainter** — no Qt WebEngine. Do not reintroduce browser-based slate.
    **Preview display** prefers **GPU OCIO** (`src/gui/ocio_gpu_plane.py`,
    `QOpenGLWidget` + PyOpenGL + OCIO `getDefaultGPUProcessor`). Do not put
