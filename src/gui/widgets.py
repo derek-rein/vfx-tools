@@ -90,6 +90,7 @@ from ..core.constants import (
     OCIO_SOURCE_FILE,
     SCALE_OPTIONS,
     available_video_codecs,
+    available_video_codecs_grouped,
     is_image_sequence_ext,
     video_codec_by_key,
 )
@@ -4023,6 +4024,56 @@ class _InputProbeWorker(QObject):
             self.failed.emit(str(e))
 
 
+def _set_codec_combo_header_row(combo: QComboBox, index: int) -> None:
+    """Non-selectable bold group label row in the codec picker."""
+    from PySide6.QtGui import QStandardItemModel
+
+    model = combo.model()
+    if not isinstance(model, QStandardItemModel):
+        return
+    item = model.item(index)
+    if item is None:
+        return
+    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+    font = item.font()
+    font.setBold(True)
+    item.setFont(font)
+
+
+def _populate_video_codec_combo(combo: QComboBox) -> None:
+    """Fill *combo* with OS-filtered codecs grouped by family."""
+    combo.clear()
+    first_group = True
+    for group_label, specs in available_video_codecs_grouped():
+        if not first_group:
+            combo.insertSeparator(combo.count())
+        first_group = False
+
+        combo.addItem(group_label, None)
+        _set_codec_combo_header_row(combo, combo.count() - 1)
+
+        for spec in specs:
+            tip = spec.format_label
+            if spec.platforms:
+                tip += f" · {', '.join(spec.platforms)} only"
+            combo.addItem(spec.display_name, spec.key)
+            idx = combo.count() - 1
+            combo.setItemData(idx, tip, Qt.ItemDataRole.ToolTipRole)
+
+
+def _select_video_codec_combo_key(
+    combo: QComboBox,
+    key: str,
+    *,
+    fallback: str = DEFAULT_VIDEO_CODEC,
+) -> None:
+    for codec_key in (key, fallback):
+        for i in range(combo.count()):
+            if combo.itemData(i) == codec_key:
+                combo.setCurrentIndex(i)
+                return
+
+
 class ConvertTab(QWidget):
     log_message = Signal(str)
     readiness_changed = Signal(bool)
@@ -4253,18 +4304,9 @@ class ConvertTab(QWidget):
             opts_layout.addRow("Frame rate", self.fps_widget)
 
             self.codec_combo = QComboBox()
-            for spec in available_video_codecs():
-                tip = spec.format_label
-                if spec.platforms:
-                    tip += f" · {', '.join(spec.platforms)} only"
-                self.codec_combo.addItem(spec.display_name, spec.key)
-                idx = self.codec_combo.count() - 1
-                self.codec_combo.setItemData(idx, tip, Qt.ItemDataRole.ToolTipRole)
+            _populate_video_codec_combo(self.codec_combo)
             saved_codec = settings.value(f"{mode}/video_codec", DEFAULT_VIDEO_CODEC)
-            for i in range(self.codec_combo.count()):
-                if self.codec_combo.itemData(i) == saved_codec:
-                    self.codec_combo.setCurrentIndex(i)
-                    break
+            _select_video_codec_combo_key(self.codec_combo, str(saved_codec))
             self.codec_combo.currentIndexChanged.connect(
                 lambda _: self._settings.setValue(
                     f"{self._mode}/video_codec",

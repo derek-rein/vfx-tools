@@ -13,6 +13,11 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Changed
+
+- **EXR → Video codec picker:** codecs are grouped in the dropdown (ProRes
+  software / VideoToolbox / oxideav, CineForm, DNxHR, H.264/HEVC, FFV1).
+
 ### Added
 
 - **Experimental true 12-bit ProRes** (`prores_ox_4444` / `prores_ox_xq`):

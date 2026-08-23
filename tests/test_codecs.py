@@ -26,6 +26,7 @@ from src.core.constants import (
     VIDEO_CODECS,
     VideoCodecSpec,
     available_video_codecs,
+    available_video_codecs_grouped,
     video_codec_by_key,
 )
 from src.core.convert import _default_codec_opts
@@ -120,6 +121,22 @@ class TestVideoCodecSpecs:
             assert OXIDEAV_PRORES_KEYS <= avail_keys
         else:
             assert not (OXIDEAV_PRORES_KEYS & avail_keys)
+
+    def test_available_video_codecs_grouped_covers_all(self):
+        flat = {c.key for c in available_video_codecs()}
+        grouped: set[str] = set()
+        labels: list[str] = []
+        for label, specs in available_video_codecs_grouped():
+            labels.append(label)
+            for spec in specs:
+                assert spec.key not in grouped
+                grouped.add(spec.key)
+        assert grouped == flat
+        assert labels == sorted(labels, key=labels.index)  # stable order
+        if sys.platform == "darwin":
+            assert any(label.startswith("ProRes (VideoToolbox") for label in labels)
+        else:
+            assert not any(label.startswith("ProRes (VideoToolbox") for label in labels)
 
     def test_dnxhr_full_ladder(self):
         for k, bit, chroma in (
