@@ -13,6 +13,11 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Security
+
+- **oxideav PyO3 extension:** bump ``pyo3`` 0.25 → 0.29 (fixes
+  GHSA-36hh-v3qg-5jq4 iterator OOB read) and matching ``numpy`` crate.
+
 ### Changed
 
 - **README:** clearer upfront bullets for dailies (slate / burn-in / watermark),
