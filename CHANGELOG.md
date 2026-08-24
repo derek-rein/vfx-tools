@@ -13,6 +13,10 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+---
+
+## [0.9.8] — 2026-08-24
+
 ### Added
 
 - **Experimental true 12-bit ProRes** (`prores_ox_4444` / `prores_ox_xq`):
@@ -20,6 +24,11 @@ rolling the `[Unreleased]` section into a versioned heading.
   **oxideav-prores** PyO3 bindings (``exr_prores``), packaged with Nuitka.
   Not Apple-certified; hidden when the extension is not built
   (`make oxideav-prores`). Software FFmpeg ProRes remains honest 10-bit.
+
+### Changed
+
+- **EXR → Video codec picker:** codecs are grouped in the dropdown (ProRes
+  software / VideoToolbox / oxideav, CineForm, DNxHR, H.264/HEVC, FFV1).
 
 ---
 
@@ -645,7 +654,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/derek-rein/exr-converter/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/derek-rein/exr-converter/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/derek-rein/exr-converter/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/derek-rein/exr-converter/compare/v0.9.4...v0.9.5

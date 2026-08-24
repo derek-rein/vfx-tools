@@ -39,7 +39,7 @@ Then open it normally (double-click, or right-click → **Open**). If macOS stil
 | **Language & tooling** | Python 3.13, [uv](https://docs.astral.sh/uv/) for deps and runs, [Ruff](https://docs.astral.sh/ruff/) in CI, [Nuitka](https://nuitka.net/) for standalone bundles |
 | **UI** | [PySide6](https://doc.qt.io/qtforpython/) (Qt 6.8), Nuke-inspired dark theme |
 | **Imaging & color** | [OpenImageIO](https://openimageio.org/) (`oiio-python`), [OpenColorIO 2.5](https://opencolorio.org/) display/render transforms with a wide-gamut scene-linear **compositing space** for all overlay (slate / burn-in / watermark) compositing — prefers **ACES2065-1 (AP0)** via the `aces_interchange` role so sRGB-authored overlays are linearised and alpha-over'd without ever clipping or shifting the user's footage; falls back to the `scene_linear` role (e.g. ACEScg) on non-ACES configs.<br>Bundles the official **ACES Studio Config v4** (from [ASWF OpenColorIO-Config-ACES](https://github.com/AcademySoftwareFoundation/OpenColorIO-Config-ACES), BSD-3-Clause) which includes dozens of camera IDTs including **Apple Log** (iPhone 15/16 Pro cinematic / ProRes Log), ARRI LogC3/4, RED Log3G10, Sony S-Log/Venice, Canon, DJI, and many more. |
-| **Video & sequences** | [PyAV](https://github.com/PyAV-Org/PyAV) (FFmpeg bindings) for video I/O, [fileseq](https://github.com/justinfx/fileseq) for frame sequences & ranges; optional **RED R3D SDK** bridge for `.r3d` / `.nev` |
+| **Video & sequences** | [PyAV](https://github.com/PyAV-Org/PyAV) (FFmpeg bindings) for video I/O, [fileseq](https://github.com/justinfx/fileseq) for frame sequences & ranges; optional **RED R3D SDK** bridge for `.r3d` / `.nev`; optional **oxideav-prores** PyO3 extension (`exr_prores`) for experimental cross-platform **12-bit** ProRes-compatible encode in release builds |
 | **Slate / burn-in / watermark** | Native **QPainter** preview and offscreen capture (no embedded browser); burn-in and watermark are linearised into the working space and alpha-composited per-frame, then OCIO-transformed to display before encode |
 
 CI runs on **GitHub Actions**; releases publish binaries for Linux, macOS (Apple Silicon + Intel), and Windows.
@@ -70,8 +70,9 @@ built with Hugo from [`site/`](site/) and published to GitHub Pages:
 | Guide | |
 |-------|--|
 | [CLI](docs/cli.md) | `video2exr` / `exr2video` / GUI launch flags |
-| [GUI](docs/gui.md) | Tabs, overlays, preferences, post-convert |
+| [GUI](docs/gui.md) | Tabs, overlays, preferences, post-convert, codec picker |
 | [R3D / N-RAW](docs/r3d.md) | Optional RED SDK (license, build, CI, preview) |
+| [12-bit ProRes (oxideav)](docs/plan-12bit-prores-oxideav.md) | Experimental RDD-36 12-bit ProRes via PyO3 |
 | [Nuke](docs/nuke.md) | Menu: open selected Read + session OCIO |
 
 ```bash
@@ -118,7 +119,19 @@ Common convert options:
 | `--workers N` | both | `0` = auto, `1` = single-threaded |
 | `--scale FACTOR` | both | e.g. `0.5` for half resolution |
 | `--exr-compression NAME` | `video2exr` | e.g. `dwaa`, `zip`, `none` (see `--help`) |
-| `--codec KEY` | `exr2video` | ProRes / DNxHR / CineForm / HEVC / H.264 / FFV1 — see [docs/cli.md](docs/cli.md) for bit-depth notes |
+| `--codec KEY` | `exr2video` | ProRes / DNxHR / CineForm / HEVC / H.264 / FFV1 — see [docs/cli.md](docs/cli.md) for bit-depth notes and codec keys |
+
+### EXR → video codecs (summary)
+
+Default **`prores`** is software **ProRes 422 HQ** (FFmpeg `prores_ks`, **10-bit** encode). The GUI codec menu groups presets by family (ProRes software, VideoToolbox on macOS, experimental oxideav, CineForm, DNxHR, H.264/HEVC, FFV1).
+
+| Path | When to use |
+|------|-------------|
+| **`prores_*` (software)** | Cross-platform ProRes; all profiles encode at **10-bit** |
+| **`prores_vt_*` (macOS)** | Apple **VideoToolbox** — faster, official HW encoder; 4444/XQ ~12-bit class |
+| **`prores_ox_*` (oxideav)** | Experimental **true 12-bit** RDD-36 ProRes-compatible MOV in **release builds**; not Apple-certified. Dev from source: `make oxideav-prores` |
+
+Software ProRes 4444/XQ must not be treated as true 12-bit. On macOS, prefer VideoToolbox for speed and Apple’s encoder. Full ladder: [docs/cli.md](docs/cli.md#codecs-honest-bit-depths).
 
 ```bash
 uv run python main.py --help
@@ -171,6 +184,7 @@ Nuitka will auto-download `ccache` on first run. See the `Makefile` for the full
 | `make test-unit` | Unit tests only (skip integration) |
 | `make resources` | Regenerate `src/rc_resources.py` from `resources.qrc` (needed after icon changes) |
 | `make bundle` | Nuitka standalone bundle under `dist/` |
+| `make oxideav-prores` | Build optional PyO3 12-bit ProRes extension (needs Rust + maturin) |
 | `make clean` | Remove all build artifacts |
 
 All static assets live under `resources/`: icons in `resources/icons/` (`icon.icns` / `icon.ico` / `icon.png`), UI images in `resources/images/`, the Qt stylesheet at `resources/style.qss`, the bundled OCIO config in `resources/ocio/`, and docs imagery in `resources/screenshots/`.

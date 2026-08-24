@@ -7,7 +7,7 @@ from .oxideav_prores import is_available as oxideav_prores_available
 
 APP_ORG = "VFXTools"
 APP_NAME = "EXRConverter"
-APP_VERSION = "0.9.7"
+APP_VERSION = "0.9.8"
 
 GITHUB_REPO = "derek-rein/exr-converter"
 
@@ -387,6 +387,56 @@ def available_video_codecs() -> list[VideoCodecSpec]:
             continue
         out.append(c)
     return out
+
+
+# EXR→video codec picker groups (GUI). Keys must match ``VIDEO_CODECS`` order
+# within each group; empty groups are omitted per OS / build.
+VIDEO_CODEC_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "ProRes (software · FFmpeg)",
+        (
+            "prores_proxy",
+            "prores_lt",
+            "prores_422",
+            "prores",
+            "prores_4444",
+            "prores_xq",
+        ),
+    ),
+    (
+        "ProRes (VideoToolbox · macOS)",
+        (
+            "prores_vt_proxy",
+            "prores_vt_lt",
+            "prores_vt_422",
+            "prores_vt_hq",
+            "prores_vt_4444",
+            "prores_vt_xq",
+        ),
+    ),
+    (
+        "ProRes (oxideav · experimental)",
+        (
+            "prores_ox_4444",
+            "prores_ox_xq",
+        ),
+    ),
+    ("CineForm", ("cineform", "cineform_rgb")),
+    ("DNxHR", ("dnxhr_lb", "dnxhr_sq", "dnxhr_hq", "dnxhr_hqx", "dnxhr_444")),
+    ("H.264 / HEVC", ("h264", "hevc", "hevc_12", "hevc_8")),
+    ("FFV1 (lossless)", ("ffv1", "ffv1_12")),
+)
+
+
+def available_video_codecs_grouped() -> list[tuple[str, list[VideoCodecSpec]]]:
+    """``available_video_codecs()`` partitioned for the GUI codec picker."""
+    by_key = {c.key: c for c in available_video_codecs()}
+    grouped: list[tuple[str, list[VideoCodecSpec]]] = []
+    for label, keys in VIDEO_CODEC_GROUPS:
+        specs = [by_key[k] for k in keys if k in by_key]
+        if specs:
+            grouped.append((label, specs))
+    return grouped
 
 
 def video_codec_by_key(key: str) -> VideoCodecSpec | None:

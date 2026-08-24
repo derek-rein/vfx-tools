@@ -54,7 +54,7 @@ from .preferences import (
     reveal_in_file_manager,
 )
 from .size_grip import SizeGrip
-from .widgets import ConvertTab, OcioConfigPanel
+from .widgets import ConvertTab, OcioConfigPanel, _select_video_codec_combo_key
 
 
 class AboutDialog(QDialog):
@@ -1244,10 +1244,10 @@ class MainWindow(QMainWindow):
                         tab_widget.scale_combo.setCurrentIndex(i)
                         break
         if "e2v_codec" in data and self._e2v_tab.codec_combo:
-            for i in range(self._e2v_tab.codec_combo.count()):
-                if self._e2v_tab.codec_combo.itemData(i) == data["e2v_codec"]:
-                    self._e2v_tab.codec_combo.setCurrentIndex(i)
-                    break
+            _select_video_codec_combo_key(
+                self._e2v_tab.codec_combo,
+                str(data["e2v_codec"]),
+            )
 
     # -- Drag and drop --
 
