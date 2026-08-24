@@ -13,6 +13,11 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Changed
+
+- **README:** clearer upfront bullets for dailies (slate / burn-in / watermark),
+  ProRes ladder, multi-core OCIO speed, and configurable OCIO configs.
+
 ---
 
 ## [0.9.8] — 2026-08-24
