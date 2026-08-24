@@ -342,6 +342,12 @@ jobs:
           else
             EXTRA_FLAGS+=("--linux-icon=${{ steps.icon.outputs.path }}")
           fi
+          # macos-26-intel runners OOM during Nuitka LTO link once exr_prores is
+          # included; arm64/linux/windows tolerate --lto=yes.
+          LTO_FLAG="--lto=yes"
+          if [ "${{ matrix.os }}" == "macos-26-intel" ]; then
+            LTO_FLAG="--lto=no"
+          fi
           # Flags kept in sync with `make bundle` (shared strip set + LTO).
           uv run python -m nuitka \
             $MODE \
@@ -349,7 +355,7 @@ jobs:
             --output-filename=exr_converter \
             --assume-yes-for-downloads \
             --python-flag=-OO \
-            --lto=yes \
+            "$LTO_FLAG" \
             --enable-plugin=pyside6 \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
@@ -447,8 +453,10 @@ jobs:
               sh -c 'lipo -info "$1" 2>/dev/null | grep -q "universal\|two arch" && lipo -thin '"$ARCH"' "$1" -output "$1.thin" && mv "$1.thin" "$1" || true' _ {} \;
           fi
 
-          # Strip debug symbols (never strip private RED redistributables under r3d/).
-          find "$APP" -type f \( -name '*.dylib' -o -name '*.so' \) ! -path '*/r3d/*' -exec strip -x {} +
+          # Strip debug symbols (never strip private RED redistributables under r3d/
+          # or the oxideav PyO3 extension — strip can break extension load).
+          find "$APP" -type f \( -name '*.dylib' -o -name '*.so' \) \
+            ! -path '*/r3d/*' ! -path '*exr_prores*' -exec strip -x {} +
 
           echo "Bundle size after slimming:"
           du -sh "$APP"
