@@ -13,8 +13,8 @@ crate-type = ["cdylib"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-prores = "0.1"
-numpy = "0.25"
-pyo3 = { version = "0.25", features = ["extension-module"] }
+numpy = "0.29"
+pyo3 = { version = "0.29", features = ["extension-module"] }
 
 [profile.release]
 lto = true
