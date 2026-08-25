@@ -36,7 +36,7 @@ def test_default_codec_opts_public_alias() -> None:
 def test_conversion_cancelled_message() -> None:
     exc = ConversionCancelled()
     assert str(exc) == "Cancelled"
-    assert isinstance(exc, Exception)
+    assert isinstance(exc, RuntimeError)
 
 
 def test_process_frame_v2e_thread_pool(tmp_path) -> None:
