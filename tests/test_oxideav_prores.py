@@ -11,6 +11,7 @@ import pytest
 
 from src.core.constants import OXIDEAV_PRORES_KEYS, available_video_codecs, video_codec_by_key
 from src.core.convert import run_exr_to_video
+from src.core.errors import ConversionCancelled
 from src.core.ocio_utils import get_bundled_aces_studio_path, resolve_ocio_for_cli
 from src.core.oxideav_prores import (
     extension_version,
@@ -357,7 +358,7 @@ class TestOxideavConvertPath:
             calls["n"] += 1
             return calls["n"] > 2
 
-        with pytest.raises(RuntimeError, match="Cancelled"):
+        with pytest.raises(ConversionCancelled, match="Cancelled"):
             run_exr_to_video(
                 str(exr_dir),
                 out,
@@ -380,7 +381,7 @@ class TestOxideavConvertPath:
         cfg = _ocio_cfg()
         src, dst = _spaces_for("exr2video")
 
-        with pytest.raises(RuntimeError, match="Cancelled"):
+        with pytest.raises(ConversionCancelled, match="Cancelled"):
             run_exr_to_video(
                 str(exr_dir),
                 out,

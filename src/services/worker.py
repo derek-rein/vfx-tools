@@ -4,6 +4,8 @@ import threading
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from ..core.errors import ConversionCancelled
+
 
 class ConvertWorker(QObject):
     """Runs a conversion on a worker :class:`~PySide6.QtCore.QThread`.
@@ -39,7 +41,7 @@ class ConvertWorker(QObject):
     @staticmethod
     def _is_cancel_error(exc: BaseException) -> bool:
         """True when the pipeline stopped because the user hit Cancel."""
-        if isinstance(exc, InterruptedError):
+        if isinstance(exc, ConversionCancelled | InterruptedError):
             return True
         text = str(exc).strip().lower()
         return text in {"cancelled", "canceled", "cancelled.", "canceled."}

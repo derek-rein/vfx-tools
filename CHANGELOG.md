@@ -13,6 +13,14 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+### Changed
+
+- **CLI:** Ctrl-C cooperatively cancels `video2exr` / `exr2video` (exit 130)
+  instead of leaving pool workers hanging.
+- **Convert:** Video→EXR parallel path uses a thread pool so decoded RGB
+  frames are not pickled across processes; EXR→Video ordered-encode staging
+  is capped (~256 MiB) to limit out-of-order frame memory.
+
 ---
 
 ## [0.9.9] — 2026-08-25

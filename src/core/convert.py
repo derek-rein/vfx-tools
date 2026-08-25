@@ -3,7 +3,13 @@ from __future__ import annotations
 import multiprocessing
 import os
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Executor,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 from fractions import Fraction
 from pathlib import Path
 
@@ -12,6 +18,7 @@ import numpy as np
 import PyOpenColorIO as OCIO
 
 from .constants import OXIDEAV_PRORES_KEYS
+from .errors import ConversionCancelled
 from .exr_io import read_image, write_exr
 from .ocio_utils import (
     get_compositing_space,
@@ -34,9 +41,24 @@ _DEFAULT_WORKERS = min(os.cpu_count() or 4, 8)
 # Always spawn — forking a Qt multi-threaded process on Linux deadlocks.
 _MP_CTX = multiprocessing.get_context("spawn")
 
+# Cap ordered-encode / in-flight decode staging so out-of-order completion
+# and large float32 RGB buffers cannot pin multi-GB queues on 4K+ jobs.
+_READY_BYTES_BUDGET = 256 * 1024 * 1024  # 256 MiB
+
 
 def _process_pool(max_workers: int) -> ProcessPoolExecutor:
     return ProcessPoolExecutor(max_workers=max_workers, mp_context=_MP_CTX)
+
+
+def _thread_pool(max_workers: int) -> ThreadPoolExecutor:
+    """Thread pool for Video→EXR (avoids pickling full RGB frames)."""
+    return ThreadPoolExecutor(max_workers=max_workers)
+
+
+def _array_nbytes(arr: np.ndarray | None) -> int:
+    if arr is None:
+        return 0
+    return int(getattr(arr, "nbytes", 0) or 0)
 
 
 def _ensure_ocio(
@@ -119,7 +141,7 @@ def _scaled_dims(w: int, h: int, scale: float) -> tuple[int, int]:
     return sw, sh
 
 
-def _default_codec_opts(codec_key: str) -> dict[str, str]:
+def default_codec_opts(codec_key: str) -> dict[str, str]:
     """Built-in codec options when the caller does not supply any."""
     from .constants import (
         DEFAULT_CINEFORM_QUALITY,
@@ -146,6 +168,10 @@ def _default_codec_opts(codec_key: str) -> dict[str, str]:
     return {}
 
 
+# Backward-compatible private alias (tests / older call sites).
+_default_codec_opts = default_codec_opts
+
+
 def _configure_stream(
     stream,
     codec_key: str,
@@ -155,14 +181,14 @@ def _configure_stream(
 
     *codec_opts* (from GUI/CLI) overrides the defaults for the given *codec_key*.
     """
-    opts = dict(_default_codec_opts(codec_key))
+    opts = dict(default_codec_opts(codec_key))
     if codec_opts:
         opts.update({str(k): str(v) for k, v in codec_opts.items()})
     if opts:
         stream.options = opts
 
 
-def _cancel_pool(pool: ProcessPoolExecutor, pending: dict) -> None:
+def _cancel_pool(pool: Executor, pending: dict) -> None:
     """Best-effort cancel of in-flight pool work."""
     for fut in list(pending):
         fut.cancel()
@@ -323,18 +349,29 @@ def _e2v_oxideav(
 
         if use_pool:
             max_inflight = n_workers * 2
+            # Staging holds native rgb48 before optional resize; estimate from
+            # output size scaled back when scale < 1.
+            inv = (1.0 / scale) if 0.0 < scale < 1.0 else 1.0
+            est_w = max(ow, int(ow * inv + 0.5))
+            est_h = max(oh, int(oh * inv + 0.5))
+            frame_bytes_est = max(1, est_h * est_w * 3 * 2)
             with _process_pool(n_workers) as pool:
                 pending: dict = {}
                 ready: dict[int, np.ndarray] = {}
+                ready_bytes = 0
                 next_encode = 1
                 submit_idx = 0
 
                 def _submit_batch() -> None:
                     nonlocal submit_idx
-                    while len(pending) < max_inflight and submit_idx < total:
+                    while (
+                        len(pending) < max_inflight
+                        and submit_idx < total
+                        and ready_bytes + len(pending) * frame_bytes_est < _READY_BYTES_BUDGET
+                    ):
                         if cancel_check and cancel_check():
                             _cancel_pool(pool, pending)
-                            raise RuntimeError("Cancelled")
+                            raise ConversionCancelled()
                         path = paths[submit_idx]
                         frame_idx = submit_idx + 1
                         submit_idx += 1
@@ -352,9 +389,10 @@ def _e2v_oxideav(
                         pending[fut] = frame_idx
 
                 def _drain_ready() -> None:
-                    nonlocal next_encode, finished
+                    nonlocal next_encode, finished, ready_bytes
                     while next_encode in ready:
                         rgb_u16 = ready.pop(next_encode)
+                        ready_bytes -= _array_nbytes(rgb_u16)
                         if do_resize:
                             vf = av.VideoFrame.from_ndarray(rgb_u16, format="rgb48le")
                             vf = vf.reformat(width=ow, height=oh)
@@ -369,12 +407,13 @@ def _e2v_oxideav(
                 while pending:
                     if cancel_check and cancel_check():
                         _cancel_pool(pool, pending)
-                        raise RuntimeError("Cancelled")
+                        raise ConversionCancelled()
                     done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
                     for done in done_set:
                         pending.pop(done)
                         fidx, rgb_u16 = done.result()
                         ready[fidx] = rgb_u16
+                        ready_bytes += _array_nbytes(rgb_u16)
                     _drain_ready()
                     _submit_batch()
                 _drain_ready()
@@ -384,7 +423,7 @@ def _e2v_oxideav(
             auth_space = overlay_auth_space or get_internal_overlay_authoring_space()
             for _idx, path in enumerate(paths, 1):
                 if cancel_check and cancel_check():
-                    raise RuntimeError("Cancelled")
+                    raise ConversionCancelled()
                 rgb = read_image(path)
                 frame_buf = np.ascontiguousarray(rgb[:, :, :3], dtype=np.float32)
                 fh, fw = frame_buf.shape[:2]
@@ -609,21 +648,24 @@ def _v2e_parallel_from_source(
     output_name: str = "",
     render_total: int = 0,
 ) -> None:
+    """Parallel Video→EXR using a thread pool (no RGB frame pickling)."""
     stem = output_name
     fmt = f"0{padding}d"
     max_inflight = n_workers * 2
     finished = 0
+    pending_bytes = 0
 
-    with _process_pool(n_workers) as pool:
+    # Threads share memory with the decoder — OCIO apply releases the GIL.
+    with _thread_pool(n_workers) as pool:
         pending: dict = {}
         frame_iter = src.iter_frames(frame_set, cancel_check=cancel_check)
         all_submitted = False
 
         def _submit_batch() -> None:
-            nonlocal all_submitted
+            nonlocal all_submitted, pending_bytes
             if all_submitted:
                 return
-            while len(pending) < max_inflight:
+            while len(pending) < max_inflight and pending_bytes < _READY_BYTES_BUDGET:
                 try:
                     idx_1based, rgb, extra_attrs = next(frame_iter)
                 except StopIteration:
@@ -631,9 +673,10 @@ def _v2e_parallel_from_source(
                     return
                 if cancel_check and cancel_check():
                     _cancel_pool(pool, pending)
-                    raise RuntimeError("Cancelled")
+                    raise ConversionCancelled()
                 frame_num = start_frame + idx_1based - 1
                 out_path = str(output_dir / f"{stem}.{frame_num:{fmt}}.exr")
+                nbytes = _array_nbytes(rgb)
                 fut = pool.submit(
                     process_frame_v2e,
                     idx_1based,
@@ -647,17 +690,18 @@ def _v2e_parallel_from_source(
                     exr_opts,
                     extra_attrs or None,
                 )
-                pending[fut] = idx_1based
+                pending[fut] = nbytes
+                pending_bytes += nbytes
 
         _submit_batch()
         while pending:
             if cancel_check and cancel_check():
                 _cancel_pool(pool, pending)
-                raise RuntimeError("Cancelled")
+                raise ConversionCancelled()
             done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
             for done in done_set:
                 done.result()
-                del pending[done]
+                pending_bytes -= int(pending.pop(done) or 0)
                 finished += 1
                 if progress:
                     progress(finished, render_total or finished)
@@ -867,15 +911,24 @@ def run_exr_to_video(
         with _process_pool(n_workers) as pool:
             pending: dict = {}
             ready: dict[int, np.ndarray] = {}
+            ready_bytes = 0
             next_encode = 1
             submit_idx = 0
+            inv = (1.0 / scale) if 0.0 < scale < 1.0 else 1.0
+            est_w = max(ow, int(ow * inv + 0.5))
+            est_h = max(oh, int(oh * inv + 0.5))
+            frame_bytes_est = max(1, est_h * est_w * 3 * 2)
 
             def _submit_batch() -> None:
                 nonlocal submit_idx
-                while len(pending) < max_inflight and submit_idx < total:
+                while (
+                    len(pending) < max_inflight
+                    and submit_idx < total
+                    and ready_bytes + len(pending) * frame_bytes_est < _READY_BYTES_BUDGET
+                ):
                     if cancel_check and cancel_check():
                         _cancel_pool(pool, pending)
-                        raise RuntimeError("Cancelled")
+                        raise ConversionCancelled()
                     path = paths[submit_idx]
                     frame_idx = submit_idx + 1
                     submit_idx += 1
@@ -893,9 +946,10 @@ def run_exr_to_video(
                     pending[fut] = frame_idx
 
             def _drain_ready() -> None:
-                nonlocal next_encode
+                nonlocal next_encode, ready_bytes
                 while next_encode in ready:
                     rgb_u16 = ready.pop(next_encode)
+                    ready_bytes -= _array_nbytes(rgb_u16)
                     vf = av.VideoFrame.from_ndarray(rgb_u16, format="rgb48le")
                     if do_resize:
                         vf = vf.reformat(width=ow, height=oh)
@@ -909,12 +963,13 @@ def run_exr_to_video(
             while pending:
                 if cancel_check and cancel_check():
                     _cancel_pool(pool, pending)
-                    raise RuntimeError("Cancelled")
+                    raise ConversionCancelled()
                 done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for done in done_set:
                     pending.pop(done)
                     fidx, rgb_u16 = done.result()
                     ready[fidx] = rgb_u16
+                    ready_bytes += _array_nbytes(rgb_u16)
                 _drain_ready()
                 _submit_batch()
 
@@ -990,7 +1045,7 @@ def _e2v_serial(
 
         for idx, path in enumerate(paths, 1):
             if cancel_check and cancel_check():
-                raise RuntimeError("Cancelled")
+                raise ConversionCancelled()
             rgb = read_image(path)
             frame_buf = np.ascontiguousarray(rgb[:, :, :3], dtype=np.float32)
             fh, fw = frame_buf.shape[:2]

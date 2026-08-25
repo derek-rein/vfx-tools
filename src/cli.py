@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
 
 from .core.constants import (
@@ -32,9 +34,27 @@ from .core.constants import (
     available_video_codecs,
     video_codec_by_key,
 )
+from .core.errors import ConversionCancelled
 from .core.ocio_utils import find_equivalent_space, resolve_ocio_for_cli
 
 _CODEC_KEYS = [spec.key for spec in available_video_codecs()]
+
+# Set by SIGINT during CLI convert so cancel_check can stop pools cleanly.
+_cli_cancel = threading.Event()
+
+
+def _install_cli_sigint() -> None:
+    """Map Ctrl-C to a cooperative cancel flag (and keep default interrupt)."""
+
+    def _handler(signum: int, frame: object) -> None:
+        _cli_cancel.set()
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        # Not on the main thread, or signals unsupported — best-effort only.
+        pass
+
 
 _EPILOG = """\
 usage modes
@@ -571,6 +591,9 @@ def run_cli(args: argparse.Namespace) -> int:
         else int(getattr(args, "workers_global", 0) or 0)
     )
 
+    _cli_cancel.clear()
+    _install_cli_sigint()
+
     try:
         cfg = resolve_ocio_for_cli(args.ocio)
         cs, cp = _resolve_config_source(args.ocio)
@@ -604,6 +627,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 src,
                 dst,
                 progress=_progress,
+                cancel_check=_cli_cancel.is_set,
                 log=_log,
                 compression=args.exr_compression,
                 workers=workers,
@@ -648,6 +672,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 dst,
                 args.fps,
                 progress=_progress,
+                cancel_check=_cli_cancel.is_set,
                 log=_log,
                 workers=workers,
                 config_source=cs,
@@ -661,6 +686,13 @@ def run_cli(args: argparse.Namespace) -> int:
             )
             _log(f"Done → {out_path}")
         print(file=sys.stderr)
+    except ConversionCancelled:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    except KeyboardInterrupt:
+        _cli_cancel.set()
+        print("\nCancelled.", file=sys.stderr)
+        return 130
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         return 1

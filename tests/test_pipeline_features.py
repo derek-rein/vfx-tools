@@ -15,6 +15,7 @@ import OpenImageIO as oiio
 import pytest
 
 from src.core.convert import _fps_to_rate, run_exr_to_video, run_video_to_exr
+from src.core.errors import ConversionCancelled
 from src.core.exr_io import read_exr, write_exr
 from src.core.ocio_utils import resolve_ocio_for_cli
 from src.core.sequence import find_exr_sequence, scan_exr_sequences
@@ -194,7 +195,7 @@ class TestVideoToExrFeatures:
             n["i"] += 1
             return n["i"] > 2
 
-        with pytest.raises(RuntimeError, match="Cancelled"):
+        with pytest.raises(ConversionCancelled, match="Cancelled"):
             run_video_to_exr(
                 str(vid),
                 out,
