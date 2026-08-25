@@ -13,6 +13,10 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+---
+
+## [0.9.10] — 2026-08-25
+
 ### Changed
 
 - **CLI:** Ctrl-C cooperatively cancels `video2exr` / `exr2video` (exit 130)
@@ -676,7 +680,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.9...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.10...HEAD
+[0.9.10]: https://github.com/derek-rein/exr-converter/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/derek-rein/exr-converter/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/derek-rein/exr-converter/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/derek-rein/exr-converter/compare/v0.9.6...v0.9.7
