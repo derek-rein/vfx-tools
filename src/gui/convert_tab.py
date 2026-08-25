@@ -69,7 +69,7 @@ from ..core.constants import (
     is_image_sequence_ext,
     video_codec_by_key,
 )
-from ..core.convert import _default_codec_opts
+from ..core.convert import default_codec_opts
 from ..core.framerange import format_frame_range
 from ..core.ocio_utils import find_equivalent_space, resolve_alias
 from ..core.sequence import (
@@ -92,7 +92,6 @@ from .style import DESC_STYLE, HINT_STYLE
 from .video_browser import VideoBrowserDialog
 
 log = logging.getLogger(__name__)
-
 
 
 # ---------------------------------------------------------------------------
@@ -1115,7 +1114,7 @@ class ConvertTab(QWidget):
     def get_codec_opts(self) -> dict[str, str]:
         """Return saved video codec options for PyAV stream.options."""
         key = self.get_video_codec_info()[0]
-        opts = dict(_default_codec_opts(key))
+        opts = dict(default_codec_opts(key))
         if key == "h264":
             crf = str(int(self._settings.value("codec_opts/h264_crf", 18)))
             preset = self._settings.value("codec_opts/h264_preset", "medium")

@@ -1,21 +1,27 @@
-"""Multiprocessing worker functions for parallel OCIO + EXR I/O.
+"""Parallel OCIO + EXR I/O helpers for process *and* thread pools.
 
-Each worker process lazily initializes its own OCIO CPUProcessor on first use
+Process workers lazily initialize their own OCIO CPUProcessor on first use
 since OCIO.Config objects cannot be pickled across process boundaries.
+Thread workers share a process-wide cache protected by a lock (Video→EXR
+uses a thread pool so decoded frames are not pickled).
 """
 
 from __future__ import annotations
+
+import threading
 
 import numpy as np
 import PyOpenColorIO as OCIO
 
 from .exr_io import read_image, write_exr
+from .ocio_utils import load_config_from_source_info
 
 # Workers cache up to two CPUProcessors: one for src→working (OCIO load
 # stage) and one for working→display (OCIO display stage).  Each is keyed
 # on (config_source, config_path, src, dst) so they only rebuild when the
 # args change.
 _worker_cpus: dict[tuple[str, str, str, str], OCIO.CPUProcessor] = {}
+_worker_cpus_lock = threading.Lock()
 
 
 def _ensure_cpu(
@@ -23,19 +29,23 @@ def _ensure_cpu(
 ) -> OCIO.CPUProcessor:
     """Return a cached CPUProcessor, rebuilding only when args change."""
     key = (config_source, config_path, src_space, dst_space)
-    cached = _worker_cpus.get(key)
-    if cached is not None:
-        return cached
+    with _worker_cpus_lock:
+        cached = _worker_cpus.get(key)
+        if cached is not None:
+            return cached
 
     # Prefer the shared loader so version-mismatch errors include the fix hint
     # (oiio-python can rewire PyOpenColorIO onto a 2.4 dylib).
-    from .ocio_utils import load_config_from_source_info
-
     cfg = load_config_from_source_info(config_source, config_path)
-
     proc = cfg.getProcessor(src_space, dst_space).getDefaultCPUProcessor()
-    _worker_cpus[key] = proc
-    return proc
+
+    with _worker_cpus_lock:
+        # Another thread may have won the race; reuse theirs if so.
+        existing = _worker_cpus.get(key)
+        if existing is not None:
+            return existing
+        _worker_cpus[key] = proc
+        return proc
 
 
 def _alpha_over_rgb(bg_rgb: np.ndarray, fg_rgba: np.ndarray) -> np.ndarray:
