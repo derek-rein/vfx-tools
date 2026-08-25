@@ -7,7 +7,7 @@ from .oxideav_prores import is_available as oxideav_prores_available
 
 APP_ORG = "VFXTools"
 APP_NAME = "EXRConverter"
-APP_VERSION = "0.9.8"
+APP_VERSION = "0.9.9"
 
 GITHUB_REPO = "derek-rein/exr-converter"
 
