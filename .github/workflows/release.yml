@@ -303,14 +303,6 @@ jobs:
           uv run python scripts/build_r3d_bridge.py -v
           ls -la build/r3d/
 
-      - name: Inject version from tag
-        shell: bash
-        run: |
-          VERSION="${RELEASE_TAG#v}"
-          echo "Building version ${VERSION} (tag ${RELEASE_TAG}, source ${RELEASE_REF})"
-          sed -i.bak "s/^APP_VERSION = \"[^\"]*\"/APP_VERSION = \"${VERSION}\"/" src/core/constants.py
-          rm -f src/core/constants.py.bak
-
       - name: Compile Qt resources
         run: uv run pyside6-rcc resources.qrc -o src/rc_resources.py
 
@@ -377,6 +369,7 @@ jobs:
             --include-package=fileseq \
             --include-package=OpenGL \
             --include-data-dir=resources/ocio=resources/ocio \
+            --include-data-files=pyproject.toml=pyproject.toml \
             --include-module=ssl \
             --include-module=exr_prores \
             --quiet \

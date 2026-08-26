@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 from src.cli import build_parser, run_cli
-from src.core.constants import APP_NAME, APP_ORG
+from src.core.constants import APP_NAME, APP_ORG, APP_VERSION
 
 
 def main() -> int:
@@ -32,6 +32,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setOrganizationName(APP_ORG)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setStyle("Fusion")
     app.setStyleSheet(load_stylesheet())
     # macOS: do not setWindowIcon — Dock must use the .app bundle's .icns

@@ -40,5 +40,6 @@ That is independent of the versioned app **Release** workflow. Preview locally
 with `make docs-serve`. Public URL:
 [derek-rein.github.io/exr-converter](https://derek-rein.github.io/exr-converter/).
 
+User-facing ProRes / VideoToolbox guide: [prores.md](./prores.md).
 Related design notes (not release machinery):
 [plan-12bit-prores-oxideav.md](./plan-12bit-prores-oxideav.md).

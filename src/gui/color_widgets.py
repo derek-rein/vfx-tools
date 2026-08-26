@@ -39,6 +39,18 @@ from ..core.ocio_utils import (
 )
 from .style import STATUS_DIM, STATUS_ERR, STATUS_OK
 
+# Single-line convert/OCIO controls. QSS min-height is the content box
+# (~22px + 4px padding + 1px border each side = 32px widget).
+FORM_ROW_MIN_HEIGHT = 32
+
+
+def lock_form_row_height(widget: QWidget, height: int = FORM_ROW_MIN_HEIGHT) -> None:
+    """Keep a single-line control at a fixed readable height (never squash)."""
+    widget.setFixedHeight(height)
+    pol = widget.sizePolicy()
+    widget.setSizePolicy(pol.horizontalPolicy(), QSizePolicy.Policy.Fixed)
+
+
 # ---------------------------------------------------------------------------
 # Color-space menu button
 # ---------------------------------------------------------------------------
@@ -64,13 +76,14 @@ class ColorSpaceButton(QToolButton):
 
     # Visual cue when the displayed name is not in the current config.
     _INVALID_STYLE = (
-        "QToolButton { color: #e07070; border: 1px solid #a04040; background-color: #3a2020; }"
+        "QToolButton { color: #e07070; border: 1px solid #a04040; "
+        "background-color: #3a2020; min-height: 22px; }"
     )
     # Brief cue when the space was chosen by media auto-detect (not sticky).
     _AUTO_STYLE = (
         "QToolButton { color: #e8dcc0; border: 1px solid #8a6a30; "
         "background-color: #3a3020; border-radius: 3px; padding: 4px 8px; "
-        "text-align: left; font-size: 13px; }"
+        "text-align: left; font-size: 13px; min-height: 22px; }"
     )
     _AUTO_FLASH_MS = 1200
 
@@ -80,6 +93,7 @@ class ColorSpaceButton(QToolButton):
         self.setPopupMode(QToolButton.ToolButtonPopupMode.DelayedPopup)
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        lock_form_row_height(self)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._current = ""
         self._valid = False
@@ -341,6 +355,9 @@ class FpsCombo(QWidget):
 
         layout.addWidget(self._combo, 1)
         layout.addWidget(self._spin)
+        lock_form_row_height(self._combo)
+        lock_form_row_height(self._spin)
+        lock_form_row_height(self)
 
         saved = float(settings.value(key, 24.0))
         self._restore(saved)
@@ -393,14 +410,17 @@ class OcioConfigPanel(QGroupBox):
         self._settings = settings
         self._prev_index = 0
         self._file_path = settings.value("ocio/file_path", "")
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
 
         source_row = QHBoxLayout()
+        source_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         source_row.addWidget(QLabel("OCIO Config:"))
         self._source_combo = QComboBox()
         self._source_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        lock_form_row_height(self._source_combo)
         source_row.addWidget(self._source_combo, 1)
         layout.addLayout(source_row)
 

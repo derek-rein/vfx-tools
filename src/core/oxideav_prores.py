@@ -44,12 +44,31 @@ def extension_version() -> str:
 
 
 def profile_for_codec_key(codec_key: str) -> str:
-    """Map preset key → oxideav profile name (``4444`` / ``xq``)."""
+    """Map preset key → oxideav profile (proxy / lt / 422 / hq / 4444 / xq)."""
     key = codec_key.strip().lower()
-    if key in ("prores_ox_xq", "xq", "ap4x"):
-        return "xq"
-    if key in ("prores_ox_4444", "4444", "ap4h"):
-        return "4444"
+    mapping = {
+        "prores_ox_proxy": "proxy",
+        "proxy": "proxy",
+        "apco": "proxy",
+        "prores_ox_lt": "lt",
+        "lt": "lt",
+        "apcs": "lt",
+        "prores_ox_422": "422",
+        "422": "422",
+        "standard": "422",
+        "apcn": "422",
+        "prores_ox_hq": "hq",
+        "hq": "hq",
+        "apch": "hq",
+        "prores_ox_4444": "4444",
+        "4444": "4444",
+        "ap4h": "4444",
+        "prores_ox_xq": "xq",
+        "xq": "xq",
+        "ap4x": "xq",
+    }
+    if key in mapping:
+        return mapping[key]
     raise ValueError(f"not an oxideav ProRes codec key: {codec_key!r}")
 
 

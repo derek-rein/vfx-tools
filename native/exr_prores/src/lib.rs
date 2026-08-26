@@ -1,7 +1,8 @@
 //! PyO3 bindings: oxideav-prores 12-bit encode + in-process MOV mux.
 //!
 //! Used by EXR Converter for experimental cross-platform true 12-bit
-//! RDD-36 ProRes-compatible output (`prores_ox_4444` / `prores_ox_xq`).
+//! RDD-36 ProRes-compatible output (`prores_ox_*`: Proxy / LT / 422 / HQ /
+//! 4444 / XQ).
 //! No subprocess — the extension links oxideav-prores and writes `.mov`
 //! directly so Nuitka can ship it as a normal extension module.
 
@@ -24,7 +25,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-use crate::color::rgb48_to_yuv444_p12_le;
+use crate::color::{rgb48_to_yuv422_p12_le, rgb48_to_yuv444_p12_le};
 use crate::mov::ProResMovWriter;
 
 /// Extension / crate version string.
@@ -43,15 +44,17 @@ struct WriterState {
     mov: ProResMovWriter,
     width: u32,
     height: u32,
+    chroma_422: bool,
     frame_index: i64,
     finished: bool,
 }
 
 #[pymethods]
 impl PyProResMovWriter {
-    /// Create a progressive 12-bit 4:4:4 ProRes MOV writer.
+    /// Create a progressive 12-bit ProRes MOV writer.
     ///
-    /// *profile*: ``"4444"`` (ap4h) or ``"xq"`` (ap4x).
+    /// *profile*: ``proxy`` / ``lt`` / ``422`` / ``hq`` (4:2:2) or
+    /// ``4444`` / ``xq`` (4:4:4).
     /// *fps_num* / *fps_den*: frame rate as a rational (e.g. 24000/1001).
     #[new]
     #[pyo3(signature = (path, width, height, fps_num, fps_den, profile="4444"))]
@@ -65,12 +68,20 @@ impl PyProResMovWriter {
     ) -> PyResult<Self> {
         let profile = parse_profile(profile)?;
         let fourcc = *fourcc_for_profile(profile);
+        let chroma_422 = matches!(
+            profile,
+            Profile::Proxy | Profile::Lt | Profile::Standard | Profile::Hq
+        );
 
         let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         params.media_type = MediaType::Video;
         params.width = Some(width);
         params.height = Some(height);
-        params.pixel_format = Some(PixelFormat::Yuv444P12Le);
+        params.pixel_format = Some(if chroma_422 {
+            PixelFormat::Yuv422P12Le
+        } else {
+            PixelFormat::Yuv444P12Le
+        });
         params.frame_rate = Some(Rational::new(i64::from(fps_num), i64::from(fps_den)));
 
         let cfg = EncoderConfig::signature_for_profile(profile);
@@ -85,6 +96,7 @@ impl PyProResMovWriter {
                 mov,
                 width,
                 height,
+                chroma_422,
                 frame_index: 0,
                 finished: false,
             }),
@@ -123,7 +135,11 @@ impl PyProResMovWriter {
             arr.iter().copied().collect()
         };
 
-        let (y, cb, cr) = rgb48_to_yuv444_p12_le(&flat, width, height);
+        let (y, cb, cr) = if state.chroma_422 {
+            rgb48_to_yuv422_p12_le(&flat, width, height)
+        } else {
+            rgb48_to_yuv444_p12_le(&flat, width, height)
+        };
         self.encode_planes(&mut state, width, &y, &cb, &cr)
     }
 
@@ -229,20 +245,21 @@ impl PyProResMovWriter {
         cb: &[u8],
         cr: &[u8],
     ) -> PyResult<()> {
-        let stride = width * 2;
+        let y_stride = width * 2;
+        let c_stride = if state.chroma_422 { width } else { width * 2 };
         let video = VideoFrame {
             pts: Some(state.frame_index),
             planes: vec![
                 VideoPlane {
-                    stride,
+                    stride: y_stride,
                     data: y.to_vec(),
                 },
                 VideoPlane {
-                    stride,
+                    stride: c_stride,
                     data: cb.to_vec(),
                 },
                 VideoPlane {
-                    stride,
+                    stride: c_stride,
                     data: cr.to_vec(),
                 },
             ],
@@ -273,12 +290,17 @@ impl PyProResMovWriter {
 
 fn parse_profile(s: &str) -> PyResult<Profile> {
     match s.trim().to_ascii_lowercase().as_str() {
+        "proxy" | "apco" | "prores_ox_proxy" => Ok(Profile::Proxy),
+        "lt" | "apcs" | "prores_ox_lt" => Ok(Profile::Lt),
+        "422" | "standard" | "apcn" | "prores_ox_422" => Ok(Profile::Standard),
+        "hq" | "apch" | "prores_ox_hq" => Ok(Profile::Hq),
         "4444" | "ap4h" | "prores_4444" | "prores_ox_4444" => Ok(Profile::Prores4444),
         "xq" | "4444xq" | "4444_xq" | "ap4x" | "prores_xq" | "prores_ox_xq" => {
             Ok(Profile::Prores4444Xq)
         }
         other => Err(PyValueError::new_err(format!(
-            "unknown oxideav ProRes profile {other:?} (expected '4444' or 'xq')"
+            "unknown oxideav ProRes profile {other:?} \
+             (expected proxy, lt, 422, hq, 4444, or xq)"
         ))),
     }
 }

@@ -38,6 +38,10 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit {
     padding: 4px 6px;
     color: @FG;
 }
+QLineEdit, QSpinBox, QDoubleSpinBox {
+    /* Content-box floor; Python lock_form_row_height is the widget floor. */
+    min-height: 22px;
+}
 QSpinBox, QDoubleSpinBox {
     /* Room for up/down arrows without eating the value digits. */
     padding-right: 18px;
@@ -96,7 +100,7 @@ QComboBox {
     border-radius: 3px;
     padding: 4px 8px;
     color: @FG;
-    min-height: 20px;
+    min-height: 22px;
 }
 QComboBox:focus, QComboBox:on {
     border-color: @ACCENT;
@@ -126,8 +130,10 @@ QPushButton {
     background-color: @BG_BTN;
     border: 1px solid @BORDER;
     border-radius: 3px;
-    padding: 5px 14px;
+    /* 4px vertical matches QLineEdit so Browse sits flush with the path field. */
+    padding: 4px 14px;
     color: @FG;
+    min-height: 22px;
 }
 QPushButton:hover {
     background-color: @BG_BTN_HOVER;
@@ -142,13 +148,14 @@ QPushButton:disabled {
     border-color: @BORDER;
 }
 
-/* Primary action button */
+/* Primary action button — same vertical padding / min-height as Cancel. */
 QPushButton#convertBtn {
     background-color: @ACCENT;
     color: #fff;
     font-weight: bold;
     border: 1px solid @ACCENT_DARK;
-    padding: 6px 22px;
+    padding: 4px 22px;
+    min-height: 22px;
 }
 QPushButton#convertBtn:hover {
     background-color: @ACCENT_HOVER;
@@ -198,6 +205,7 @@ QToolButton {
     text-align: left;
     font-size: 13px;
     color: @FG;
+    min-height: 22px;
 }
 QToolButton:hover {
     border-color: @ACCENT;
@@ -315,8 +323,12 @@ QProgressBar {
     border-radius: 3px;
     text-align: center;
     color: @FG;
+    min-height: 14px;
+}
+QProgressBar#convertProgress {
+    /* Match convert form row (32px widget; Python lock_form_row_height). */
     min-height: 22px;
-    max-height: 22px;
+    max-height: 32px;
 }
 QProgressBar::chunk {
     background-color: @ACCENT;

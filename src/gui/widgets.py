@@ -51,12 +51,19 @@ from .browser_chrome import (
     _tree_click_toggle_expand,
     _wire_volume_refresh,
 )
-from .color_widgets import ColorSpaceButton, FpsCombo, OcioConfigPanel
+from .color_widgets import (
+    FORM_ROW_MIN_HEIGHT,
+    ColorSpaceButton,
+    FpsCombo,
+    OcioConfigPanel,
+    lock_form_row_height,
+)
 from .convert_tab import (
     _CODEC_HAS_SETTINGS,
     _CODEC_HELP,
     _EXR_COMPRESSION_HELP,
     _EXR_HAS_SETTINGS,
+    CodecPicker,
     ConvertTab,
     ExrCompressionSettingsDialog,
     VideoCodecSettingsDialog,
@@ -64,12 +71,13 @@ from .convert_tab import (
     _InputProbeWorker,
     _populate_video_codec_combo,
     _select_video_codec_combo_key,
-    _set_codec_combo_header_row,
 )
 from .sequence_browser import SequenceBrowserDialog
 from .video_browser import VideoBrowserDialog
 
 __all__ = [
+    "FORM_ROW_MIN_HEIGHT",
+    "lock_form_row_height",
     "ColorSpaceButton",
     "FpsCombo",
     "OcioConfigPanel",
@@ -78,6 +86,7 @@ __all__ = [
     "ExrCompressionSettingsDialog",
     "VideoCodecSettingsDialog",
     "VideoInput",
+    "CodecPicker",
     "ConvertTab",
     "_CODEC_HELP",
     "_EXR_COMPRESSION_HELP",
@@ -86,7 +95,6 @@ __all__ = [
     "_InputProbeWorker",
     "_populate_video_codec_combo",
     "_select_video_codec_combo_key",
-    "_set_codec_combo_header_row",
     "_add_copy_path_actions",
     "_configure_path_line_edit",
     "_copy_to_clipboard",

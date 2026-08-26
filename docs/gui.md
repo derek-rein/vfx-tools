@@ -27,6 +27,11 @@ from a Read — see [nuke.md](./nuke.md).
 | **Video → EXR** | Decode video → OCIO → EXR sequence | **Ingest only** — never slate / burn-in / watermark. Output field uses ``name.####.exr``; that basename is written (not forced to the video stem). Accepts common video containers plus optional **`.r3d` / `.nev`** when the [R3D SDK bridge](./r3d.md) is available (browser thumbs + player preview use low-res R3D decode; convert is full quality; camera/timecode metadata lands on EXRs). |
 | **EXR → Video** | Image sequence → OCIO → video | OpenEXR primary; also DPX, PNG, JPEG, WebP. Slate / burn-in / watermark via that tab’s controls. Sequences may use ``name.####.ext`` or ``name_####.ext`` pads. |
 
+Dragging the **Log** splitter up does not squash Input / Output / Options
+fields — those controls keep a fixed readable height, and the convert form
+scrolls if the pane is short. **Convert** and **Cancel** share that height;
+the progress bar matches the input rows.
+
 Mode can be forced with `--mode video2exr|exr2video`, or inferred from `--open`
 (`auto`: image-sequence paths open **EXR → Video**, common video extensions open
 **Video → EXR**).
@@ -183,12 +188,19 @@ sequence. Extraction uses the known EXR frame list (not a video seek).
 ## Codecs
 
 Same honest bit-depth ladder as the CLI. Default is software **ProRes 422 HQ**
-(`prores`, **10-bit**). The EXR → Video **Codec** dropdown groups presets by
-family (ProRes software, VideoToolbox on macOS, experimental oxideav, CineForm,
-DNxHR, H.264/HEVC, FFV1). macOS-only VideoToolbox ProRes keys appear only on
-Darwin. Experimental **oxideav** 12-bit ProRes keys (`prores_ox_4444` /
-`prores_ox_xq`) appear when the `exr_prores` extension is built
-(`make oxideav-prores`). Full key list and bit depths:
+(`prores`, **10-bit**). The EXR → Video **Codec** control is a nested family
+menu: open it, then pick a family (ProRes software, VideoToolbox, oxideav,
+CineForm, DNxHR, H.264/HEVC, FFV1) and a profile inside that submenu.
+
+**VideoToolbox** is Apple’s **hardware ProRes encoder**, **macOS only**. That
+submenu is omitted on Windows and Linux. 422 profiles stay 10-bit; **4444 /
+XQ** are **~12-bit class** (unlike software 4444/XQ, which encode 10-bit).
+See [ProRes and VideoToolbox](./prores.md) for why the three ProRes families
+exist and which key to pick.
+
+Experimental **oxideav** 12-bit keys (`prores_ox_proxy` / `lt` / `422` / `hq`
+/ `4444` / `xq`) appear when the `exr_prores` extension is built
+(`make oxideav-prores`; included in release binaries). Full key list:
 [CLI codecs](./cli.md#codecs-honest-bit-depths).
 
 ---
@@ -225,7 +237,10 @@ Opened from **EXR → Video** when editing slate / burn-in / watermark.
 - **Display:** prefers **GPU OCIO** (full-resolution texture + GLSL display/view
   transform). **Gain** is pre-display (exposure stops); **gamma** is Nuke-style
   post-display ``pow(rgb, 1/γ)`` (1 = identity; not the sRGB/Rec.1886 encode).
-  Falls back to CPU OCIO if OpenGL is unavailable. Export is unchanged.
+  Falls back to CPU OCIO if OpenGL is unavailable. The preview canvas
+  (letterbox around the frame) is **black**, with a 1px white format box
+  (Nuke-style) and the plate resolution right-justified under the
+  bottom-right of the frame. Export is unchanged.
 - **Overlays:** burn-in and watermark are composited in scene-linear working
   space so the preview matches the convert path.
 - **Undo:** ⌘/Ctrl+Z and Shift+⌘/Ctrl+Z undo/redo **feature toggles** and
@@ -247,7 +262,7 @@ Opened from **EXR → Video** when editing slate / burn-in / watermark.
 |------|----------|
 | **Check for Updates…** | Opens the [latest GitHub Release](https://github.com/derek-rein/exr-converter/releases/latest) in the system browser (no in-app download) |
 | **About EXR Converter** | Title + version header; deps, links, OCIO notes, and license in a scroll area |
-| **Version X.Y.Z** | Non-clickable; shows the running app version (below a separator) |
+| **Version X.Y.Z** | Non-clickable; running app version from `pyproject.toml` (same value as About, `--version`, and EXR `Software` metadata) |
 
 Site links stay in **About** only (not on the Help menu).
 

@@ -17,6 +17,7 @@ as the code (and [CHANGELOG.md](../CHANGELOG.md)). See
 |-------|--------|
 | [CLI](./cli.md) | `video2exr`, `exr2video`, GUI launch flags |
 | [GUI](./gui.md) | Tabs, browsers, overlays, preferences, post-convert |
+| [ProRes and VideoToolbox](./prores.md) | Software vs Apple VideoToolbox vs oxideav; bit depths |
 | [Nuke](./nuke.md) | Nuke menu integration |
 | [R3D / N-RAW](./r3d.md) | Optional RED R3D SDK (proprietary; build + license) |
 | [Releasing](./releasing.md) | Pointer to maintainer release process |

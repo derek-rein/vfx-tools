@@ -1,13 +1,59 @@
 from __future__ import annotations
 
 import sys
+import tomllib
+from pathlib import Path
 from typing import NamedTuple
 
+from .app_paths import package_root_from_file, runtime_exe_dirs
 from .oxideav_prores import is_available as oxideav_prores_available
 
 APP_ORG = "VFXTools"
 APP_NAME = "EXRConverter"
-APP_VERSION = "0.9.10"
+
+
+def _pyproject_candidates() -> list[Path]:
+    """Locations that may hold the project version file.
+
+    Source checkouts keep ``pyproject.toml`` at the repo root. Nuitka bundles
+    ship a copy next to the executable (``--include-data-files``).
+    """
+    paths: list[Path] = [package_root_from_file(__file__, parents=2) / "pyproject.toml"]
+    paths.extend(d / "pyproject.toml" for d in runtime_exe_dirs())
+    paths.append(Path.cwd() / "pyproject.toml")
+    out: list[Path] = []
+    seen: set[str] = set()
+    for p in paths:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _load_project_version() -> str:
+    """Read ``[project].version`` from pyproject.toml (the only written copy)."""
+    for candidate in _pyproject_candidates():
+        if not candidate.is_file():
+            continue
+        try:
+            data = tomllib.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        ver = data.get("project", {}).get("version")
+        if isinstance(ver, str) and ver.strip():
+            return ver.strip()
+    raise RuntimeError(
+        "Could not read [project].version from pyproject.toml "
+        "(expected at the repo root or next to the frozen app)."
+    )
+
+
+APP_VERSION = _load_project_version()
 
 GITHUB_REPO = "derek-rein/exr-converter"
 
@@ -177,6 +223,23 @@ def _prores_vt(
     )
 
 
+def _prores_ox(
+    key: str,
+    label: str,
+    pix_fmt: str,
+    chroma: str,
+) -> VideoCodecSpec:
+    """Experimental true 12-bit RDD-36 via oxideav PyO3 (cross-platform)."""
+    return VideoCodecSpec(
+        key,
+        f"{label} · 12-bit {chroma} · oxideav (experimental, RDD-36)",
+        "oxideav_prores",
+        pix_fmt,
+        12,
+        chroma,
+    )
+
+
 def _dnxhr(
     key: str,
     label: str,
@@ -228,22 +291,13 @@ VIDEO_CODECS: list[VideoCodecSpec] = [
     # ── ProRes oxideav (experimental, cross-platform true 12-bit) ────────
     # Pure-Rust RDD-36 encode via PyO3 ``exr_prores`` (not FFmpeg). Hidden
     # when the extension is not built — see available_video_codecs().
-    VideoCodecSpec(
-        "prores_ox_4444",
-        "ProRes 4444 · 12-bit 4:4:4 · oxideav (experimental, RDD-36)",
-        "oxideav_prores",
-        "yuv444p12le",
-        12,
-        "4:4:4",
-    ),
-    VideoCodecSpec(
-        "prores_ox_xq",
-        "ProRes 4444 XQ · 12-bit 4:4:4 · oxideav (experimental, RDD-36)",
-        "oxideav_prores",
-        "yuv444p12le",
-        12,
-        "4:4:4",
-    ),
+    # Full ladder: 422 Proxy/LT/422/HQ + 4444/XQ (crate Profile enum).
+    _prores_ox("prores_ox_proxy", "ProRes 422 Proxy", "yuv422p12le", "4:2:2"),
+    _prores_ox("prores_ox_lt", "ProRes 422 LT", "yuv422p12le", "4:2:2"),
+    _prores_ox("prores_ox_422", "ProRes 422", "yuv422p12le", "4:2:2"),
+    _prores_ox("prores_ox_hq", "ProRes 422 HQ", "yuv422p12le", "4:2:2"),
+    _prores_ox("prores_ox_4444", "ProRes 4444", "yuv444p12le", "4:4:4"),
+    _prores_ox("prores_ox_xq", "ProRes 4444 XQ", "yuv444p12le", "4:4:4"),
     # ── CineForm ──────────────────────────────────────────────────────────
     VideoCodecSpec(
         "cineform",
@@ -323,7 +377,16 @@ HEVC_CODEC_KEYS: frozenset[str] = frozenset({"hevc", "hevc_8", "hevc_12"})
 FFV1_CODEC_KEYS: frozenset[str] = frozenset({"ffv1", "ffv1_12"})
 X26X_CODEC_KEYS: frozenset[str] = frozenset({"h264"}) | HEVC_CODEC_KEYS
 # Experimental true 12-bit RDD-36 via PyO3 ``exr_prores`` (not FFmpeg).
-OXIDEAV_PRORES_KEYS: frozenset[str] = frozenset({"prores_ox_4444", "prores_ox_xq"})
+OXIDEAV_PRORES_KEYS: frozenset[str] = frozenset(
+    {
+        "prores_ox_proxy",
+        "prores_ox_lt",
+        "prores_ox_422",
+        "prores_ox_hq",
+        "prores_ox_4444",
+        "prores_ox_xq",
+    }
+)
 DEFAULT_VIDEO_CODEC = "prores"
 
 # prores_ks / prores_videotoolbox profile values keyed by our preset *key*.
@@ -417,6 +480,10 @@ VIDEO_CODEC_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "ProRes (oxideav · experimental)",
         (
+            "prores_ox_proxy",
+            "prores_ox_lt",
+            "prores_ox_422",
+            "prores_ox_hq",
             "prores_ox_4444",
             "prores_ox_xq",
         ),

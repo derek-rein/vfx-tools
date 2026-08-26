@@ -22,10 +22,20 @@ import re
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QMouseEvent, QSurfaceFormat, QWheelEvent
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QMouseEvent,
+    QPainter,
+    QPalette,
+    QPen,
+    QSurfaceFormat,
+    QWheelEvent,
+)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QWidget
+
+from .viewer_chrome import paint_format_label
 
 log = logging.getLogger(__name__)
 
@@ -225,12 +235,17 @@ class OcioGpuImagePlane(QOpenGLWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(200, 150)
         self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.NoPartialUpdate)
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0))
+        self.setPalette(pal)
 
         self._gl_ready = False
         self._gpu_dead = False
         self._image: np.ndarray | None = None
         self._image_w = 1
         self._image_h = 1
+        self._format_w = 0
+        self._format_h = 0
         self._tex_w = 0
         self._tex_h = 0
         self._pending_upload = False
@@ -376,6 +391,17 @@ class OcioGpuImagePlane(QOpenGLWidget):
         # Gamma is a post-display shader uniform — no OCIO processor rebuild.
         self.update()
 
+    def set_format(self, w: int, h: int) -> None:
+        """Native plate size for the HUD (may differ from the uploaded proxy)."""
+        self._format_w = max(0, int(w))
+        self._format_h = max(0, int(h))
+        self.update()
+
+    def format_text(self) -> str:
+        if self._format_w <= 0 or self._format_h <= 0:
+            return ""
+        return f"{self._format_w} \u00d7 {self._format_h}"
+
     def fit_in_view(self) -> None:
         if self._image_w <= 0 or self._image_h <= 0:
             return
@@ -439,7 +465,7 @@ class OcioGpuImagePlane(QOpenGLWidget):
                 GL.glDisable(GL.GL_BLEND)
             except Exception:
                 pass
-            GL.glClearColor(0.196, 0.196, 0.196, 1.0)
+            GL.glClearColor(0.0, 0.0, 0.0, 1.0)
 
             self._image_tex = int(GL.glGenTextures(1))
             GL.glBindTexture(GL.GL_TEXTURE_2D, self._image_tex)
@@ -550,36 +576,40 @@ class OcioGpuImagePlane(QOpenGLWidget):
                 self._upload_overlay_tex()
                 self._overlay_pending = False
 
-            if self._program == 0 or self._image is None:
-                return
-
-            GL.glUseProgram(self._program)
-            self._bind_ocio_textures()
-            self._update_ocio_uniforms()
-
-            if self._mvp_loc >= 0:
-                GL.glUniformMatrix4fv(self._mvp_loc, 1, GL.GL_TRUE, self._mvp_matrix())
-
-            GL.glActiveTexture(GL.GL_TEXTURE0)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._image_tex)
-            if self._image_tex_loc >= 0:
-                GL.glUniform1i(self._image_tex_loc, 0)
-
-            GL.glActiveTexture(GL.GL_TEXTURE1)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._overlay_tex)
-            if self._overlay_tex_loc >= 0:
-                GL.glUniform1i(self._overlay_tex_loc, 1)
-            if self._has_overlay_loc >= 0:
-                GL.glUniform1i(self._has_overlay_loc, 1 if self._has_overlay else 0)
-            if self._viewer_gamma_loc >= 0:
-                GL.glUniform1f(self._viewer_gamma_loc, float(self._gamma))
-
-            GL.glBindVertexArray(self._vao)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
-            GL.glBindVertexArray(0)
-            GL.glUseProgram(0)
+            if self._program != 0 and self._image is not None:
+                self._draw_image_quad()
+            self._paint_viewer_chrome()
         except Exception:
             log.exception("paintGL failed")
+
+    def _draw_image_quad(self) -> None:
+        from OpenGL import GL
+
+        GL.glUseProgram(self._program)
+        self._bind_ocio_textures()
+        self._update_ocio_uniforms()
+
+        if self._mvp_loc >= 0:
+            GL.glUniformMatrix4fv(self._mvp_loc, 1, GL.GL_TRUE, self._mvp_matrix())
+
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._image_tex)
+        if self._image_tex_loc >= 0:
+            GL.glUniform1i(self._image_tex_loc, 0)
+
+        GL.glActiveTexture(GL.GL_TEXTURE1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._overlay_tex)
+        if self._overlay_tex_loc >= 0:
+            GL.glUniform1i(self._overlay_tex_loc, 1)
+        if self._has_overlay_loc >= 0:
+            GL.glUniform1i(self._has_overlay_loc, 1 if self._has_overlay else 0)
+        if self._viewer_gamma_loc >= 0:
+            GL.glUniform1f(self._viewer_gamma_loc, float(self._gamma))
+
+        GL.glBindVertexArray(self._vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         # Explicit cleanup with makeCurrent (Qt docs: do not rely on deleteLater
@@ -756,6 +786,38 @@ class OcioGpuImagePlane(QOpenGLWidget):
                 GL.GL_FLOAT,
                 self._overlay,
             )
+
+    def _frame_widget_rect(self) -> QRectF:
+        """Widget-space rect of the image quad (for the format box)."""
+        mvp = self._mvp_matrix()
+        vw = max(1.0, float(self.width()))
+        vh = max(1.0, float(self.height()))
+        xs: list[float] = []
+        ys: list[float] = []
+        for px, py in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)):
+            clip = mvp @ np.array([px, py, 0.0, 1.0], dtype=np.float32)
+            ndc_x = float(clip[0])
+            ndc_y = float(clip[1])
+            xs.append((ndc_x + 1.0) * 0.5 * vw)
+            ys.append((1.0 - ndc_y) * 0.5 * vh)
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+    def _paint_viewer_chrome(self) -> None:
+        """Nuke-style 1px white format box + resolution under the BR corner."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        frame: QRectF | None = None
+        if self._image is not None:
+            frame = self._frame_widget_rect()
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidth(1)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(frame)
+        if frame is not None:
+            paint_format_label(painter, frame, self.format_text())
+        painter.end()
 
     def _mvp_matrix(self) -> np.ndarray:
         vw = max(1.0, float(self.width()))

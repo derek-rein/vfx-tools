@@ -73,8 +73,7 @@ def _y_means(path: Path, *, width: int, height: int) -> list[float]:
 class TestOxideavAvailability:
     def test_presets_listed_when_extension_present(self):
         keys = {s.key for s in available_video_codecs()}
-        assert "prores_ox_4444" in keys
-        assert "prores_ox_xq" in keys
+        assert OXIDEAV_PRORES_KEYS <= keys
 
     def test_spec_labels_twelve_bit(self):
         for key in OXIDEAV_PRORES_KEYS:
@@ -82,13 +81,24 @@ class TestOxideavAvailability:
             assert s is not None
             assert s.bit_depth == 12
             assert s.libav_codec == "oxideav_prores"
-            assert s.pix_fmt == "yuv444p12le"
+            if key in ("prores_ox_4444", "prores_ox_xq"):
+                assert s.pix_fmt == "yuv444p12le"
+                assert s.chroma == "4:4:4"
+            else:
+                assert s.pix_fmt == "yuv422p12le"
+                assert s.chroma == "4:2:2"
             assert "12" in s.display_name
             assert s.is_available()
 
     def test_profile_mapping(self):
+        assert profile_for_codec_key("prores_ox_proxy") == "proxy"
+        assert profile_for_codec_key("prores_ox_lt") == "lt"
+        assert profile_for_codec_key("prores_ox_422") == "422"
+        assert profile_for_codec_key("prores_ox_hq") == "hq"
         assert profile_for_codec_key("prores_ox_4444") == "4444"
         assert profile_for_codec_key("prores_ox_xq") == "xq"
+        assert profile_for_codec_key("apco") == "proxy"
+        assert profile_for_codec_key("apch") == "hq"
         assert profile_for_codec_key("ap4h") == "4444"
         assert profile_for_codec_key("ap4x") == "xq"
         with pytest.raises(ValueError, match="not an oxideav"):
@@ -128,13 +138,24 @@ class TestOxideavEncode:
         assert probe.streams.video[0].codec_context.codec_tag == "ap4x"
         probe.close()
 
+    def test_422_hq_fourcc(self, tmp_path: Path):
+        out = tmp_path / "hq.mov"
+        w, h = 64, 48
+        with open_writer(out, w, h, 24, 1, "prores_ox_hq") as writer:
+            write_rgb48_frame(writer, np.full((h, w, 3), 18000, dtype=np.uint16))
+        probe = av.open(str(out))
+        stream = probe.streams.video[0]
+        assert stream.codec_context.codec_tag == "apch"
+        assert "422" in (stream.codec_context.pix_fmt or "")
+        probe.close()
+
     def test_rejects_odd_dimensions(self, tmp_path: Path):
         with pytest.raises(Exception, match="even"):
             open_writer(tmp_path / "odd.mov", 65, 48, 24, 1, "prores_ox_4444")
 
     def test_rejects_invalid_profile(self, tmp_path: Path):
         with pytest.raises(Exception, match="profile"):
-            exr_prores.ProResMovWriter(str(tmp_path / "bad.mov"), 64, 48, 24, 1, profile="proxy")
+            exr_prores.ProResMovWriter(str(tmp_path / "bad.mov"), 64, 48, 24, 1, profile="nope")
 
     def test_rejects_wrong_rgb_shape(self, tmp_path: Path):
         out = tmp_path / "shape.mov"

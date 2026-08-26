@@ -144,6 +144,7 @@ class SequencePlayer(QWidget):
 
         self._preview = ImagePreviewView()
         self._preview_stack = QStackedWidget()
+        self._preview_stack.setStyleSheet("background-color: #000000;")
         self._preview_stack.addWidget(self._preview)
         # Create the GPU plane *eagerly* (before the top-level window is shown).
         # Qt 6.4+ docs: adding the first QOpenGLWidget to an *already shown*
@@ -159,6 +160,7 @@ class SequencePlayer(QWidget):
                 self._gpu_plane = plane
                 self._use_gpu = True
                 self._preview_stack.setCurrentWidget(plane)
+                plane.set_format(self._width, self._height)
                 log.info("SequencePlayer: GPU OCIO display enabled")
             except Exception:
                 log.exception("GPU OCIO preview init failed; using CPU path")
@@ -548,6 +550,8 @@ class SequencePlayer(QWidget):
         self._width = max(1, int(w))
         self._height = max(1, int(h))
         self._preview.set_frame_size(self._width, self._height)
+        if self._gpu_plane is not None:
+            self._gpu_plane.set_format(self._width, self._height)
 
     def resolution(self) -> tuple[int, int]:
         return self._width, self._height

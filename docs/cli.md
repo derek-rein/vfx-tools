@@ -21,7 +21,7 @@ exr_converter --help
 "/Applications/EXR Converter.app/Contents/MacOS/exr_converter" --help
 ```
 
-Related: [GUI](./gui.md) · [Nuke integration](./nuke.md) · [README](../README.md)
+Related: [GUI](./gui.md) · [ProRes and VideoToolbox](./prores.md) · [Nuke integration](./nuke.md) · [README](../README.md)
 
 ---
 
@@ -37,6 +37,7 @@ Global flags (before the subcommand; convert flags may also appear after it):
 
 | Flag | Meaning |
 |------|---------|
+| `-V` / `--version` | Print the app version (`pyproject.toml`) and exit |
 | `--workers N` | CLI convert parallelism (`0` = auto, `1` = serial). May appear **before** the subcommand or **after** it (subcommand value wins). |
 | `--smoke-test` | CI: launch GUI briefly, verify OCIO/ssl, exit |
 | `--open PATH` | **GUI only:** open this media on launch |
@@ -154,8 +155,12 @@ named after the folder, with a codec-appropriate extension:
 ### Codecs (honest bit depths)
 
 Keys match `exr2video --codec`. Software ProRes is **always 10-bit** encode
-(`prores_ks`); do not treat 4444/XQ as true 12-bit on that path. VideoToolbox
-variants are **macOS only**.
+(`prores_ks`); do not treat 4444/XQ as true 12-bit on that path.
+
+**VideoToolbox** (`prores_vt_*`) is **Apple’s hardware ProRes encoder** on
+**macOS only** — faster than software, and 4444/XQ keep **~12-bit class**
+precision that `prores_ks` does not. Full explanation:
+[ProRes and VideoToolbox](./prores.md).
 
 | Key | Encode (this app) | Notes |
 |-----|-------------------|--------|
@@ -165,9 +170,18 @@ variants are **macOS only**.
 | `prores` | 10-bit 4:2:2 | **Default** — software ProRes 422 HQ |
 | `prores_4444` | 10-bit 4:4:4:4 | Software; not true 12-bit |
 | `prores_xq` | 10-bit 4:4:4:4 | Software; not true 12-bit |
-| `prores_vt_proxy` … `prores_vt_hq` | 10-bit 4:2:2 | VideoToolbox (macOS) |
-| `prores_vt_4444`, `prores_vt_xq` | ~12-bit 4:4:4:4 | VideoToolbox (macOS) |
-| `prores_ox_4444`, `prores_ox_xq` | **12-bit** 4:4:4 | Experimental RDD-36 via oxideav (PyO3); requires `make oxideav-prores` |
+| `prores_vt_proxy` | 10-bit 4:2:2 | VideoToolbox 422 Proxy (macOS) |
+| `prores_vt_lt` | 10-bit 4:2:2 | VideoToolbox 422 LT (macOS) |
+| `prores_vt_422` | 10-bit 4:2:2 | VideoToolbox 422 (macOS) |
+| `prores_vt_hq` | 10-bit 4:2:2 | VideoToolbox 422 HQ (macOS) |
+| `prores_vt_4444` | ~12-bit 4:4:4:4 | VideoToolbox 4444 (macOS) |
+| `prores_vt_xq` | ~12-bit 4:4:4:4 | VideoToolbox 4444 XQ (macOS) |
+| `prores_ox_proxy` | **12-bit** 4:2:2 | Experimental RDD-36 via oxideav; requires `make oxideav-prores` |
+| `prores_ox_lt` | **12-bit** 4:2:2 | Experimental RDD-36 via oxideav |
+| `prores_ox_422` | **12-bit** 4:2:2 | Experimental RDD-36 via oxideav |
+| `prores_ox_hq` | **12-bit** 4:2:2 | Experimental RDD-36 via oxideav |
+| `prores_ox_4444` | **12-bit** 4:4:4 | Experimental RDD-36 via oxideav |
+| `prores_ox_xq` | **12-bit** 4:4:4 | Experimental RDD-36 via oxideav |
 | `cineform` | 10-bit 4:2:2 | GoPro CineForm |
 | `cineform_rgb` | 12-bit RGB | CineForm RGB |
 | `dnxhr_lb` / `sq` / `hq` | 8-bit 4:2:2 | DNxHR |
@@ -186,11 +200,12 @@ List keys on your build (filters macOS-only codecs on other OSes):
 uv run python main.py exr2video --help
 ```
 
-Research notes and implementation status for cross-platform 12-bit ProRes:
+User guide for the three ProRes encoders (software vs VideoToolbox vs oxideav):
+[ProRes and VideoToolbox](./prores.md). Research notes for the oxideav path:
 [plan-12bit-prores-oxideav.md](./plan-12bit-prores-oxideav.md). Experimental
-presets `prores_ox_4444` / `prores_ox_xq` use in-process oxideav PyO3 bindings
-when `exr_prores` is built (`make oxideav-prores`); they are omitted from
-`--codec` choices otherwise.
+presets `prores_ox_*` use in-process oxideav PyO3 bindings when `exr_prores` is
+built (`make oxideav-prores`); they are omitted from `--codec` choices
+otherwise.
 
 ---
 

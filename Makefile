@@ -3,7 +3,7 @@
 # Usage:
 #   make help
 #   make run                              # launch the GUI
-#   make bump PART=minor                  # bump semver + sync APP_VERSION + uv lock
+#   make bump PART=minor                  # bump pyproject.toml version + uv lock
 #   make release PART=patch               # bump + lock + commit + tag + push (triggers Release workflow)
 #   make release PUSH=0                   # … local only; push branch + tag yourself to trigger CI
 
@@ -155,6 +155,7 @@ bundle: resources
 		--include-package=fileseq \
 		--include-package=OpenGL \
 		--include-data-dir=resources/ocio=resources/ocio \
+		--include-data-files=pyproject.toml=pyproject.toml \
 		--include-module=ssl \
 		--include-module=exr_prores \
 		$(ENTRY)
@@ -191,7 +192,7 @@ release:
 	$(UV) lock; \
 	eval $$($(BUMP) show); \
 	if [ -z "$${TAG}" ]; then echo "ERROR: TAG is empty — bump show failed"; exit 1; fi; \
-	git add pyproject.toml src/core/constants.py uv.lock; \
+	git add pyproject.toml uv.lock; \
 	if git diff --staged --quiet; then echo "No changes to commit."; exit 1; fi; \
 	git commit -m "release: $${VERSION}"; \
 	git tag -a "$${TAG}" -m "release: $${VERSION}"; \
