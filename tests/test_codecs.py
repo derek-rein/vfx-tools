@@ -108,14 +108,27 @@ class TestVideoCodecSpecs:
 
     def test_oxideav_prores_twelve_bit_gated(self):
         """oxideav presets claim true 12-bit and hide when extension missing."""
-        assert OXIDEAV_PRORES_KEYS == frozenset({"prores_ox_4444", "prores_ox_xq"})
+        assert OXIDEAV_PRORES_KEYS == frozenset(
+            {
+                "prores_ox_proxy",
+                "prores_ox_lt",
+                "prores_ox_422",
+                "prores_ox_hq",
+                "prores_ox_4444",
+                "prores_ox_xq",
+            }
+        )
         for key in OXIDEAV_PRORES_KEYS:
             s = video_codec_by_key(key)
             assert s is not None
             assert s.libav_codec == "oxideav_prores"
             assert s.bit_depth == 12
-            assert s.pix_fmt == "yuv444p12le"
-            assert s.chroma == "4:4:4"
+            if key in ("prores_ox_4444", "prores_ox_xq"):
+                assert s.pix_fmt == "yuv444p12le"
+                assert s.chroma == "4:4:4"
+            else:
+                assert s.pix_fmt == "yuv422p12le"
+                assert s.chroma == "4:2:2"
         avail_keys = {c.key for c in available_video_codecs()}
         if oxideav_prores_available():
             assert OXIDEAV_PRORES_KEYS <= avail_keys

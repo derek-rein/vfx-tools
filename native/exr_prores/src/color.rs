@@ -44,3 +44,30 @@ pub fn rgb48_to_yuv444_p12_le(rgb: &[u16], width: usize, height: usize) -> (Vec<
 
     (y_plane, cb_plane, cr_plane)
 }
+
+/// Full-range RGB48 → limited BT.709 YUV422P12Le (planar LE u16).
+///
+/// Chroma is horizontally subsampled (average of each pair of 4:4:4 samples).
+/// Width must be even.
+pub fn rgb48_to_yuv422_p12_le(rgb: &[u16], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    debug_assert_eq!(width % 2, 0);
+    let (y_plane, cb444, cr444) = rgb48_to_yuv444_p12_le(rgb, width, height);
+    let cw = width / 2;
+    let mut cb_plane = vec![0u8; height * cw * 2];
+    let mut cr_plane = vec![0u8; height * cw * 2];
+    for row in 0..height {
+        for x in 0..cw {
+            let i0 = (row * width + x * 2) * 2;
+            let i1 = i0 + 2;
+            let avg = |plane: &[u8]| {
+                let a = u16::from_le_bytes([plane[i0], plane[i0 + 1]]);
+                let b = u16::from_le_bytes([plane[i1], plane[i1 + 1]]);
+                ((u32::from(a) + u32::from(b)) / 2) as u16
+            };
+            let o = (row * cw + x) * 2;
+            cb_plane[o..o + 2].copy_from_slice(&avg(&cb444).to_le_bytes());
+            cr_plane[o..o + 2].copy_from_slice(&avg(&cr444).to_le_bytes());
+        }
+    }
+    (y_plane, cb_plane, cr_plane)
+}

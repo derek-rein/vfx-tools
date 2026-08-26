@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QPainter, QWheelEvent
-from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QWheelEvent
+from PySide6.QtWidgets import QGraphicsRectItem, QGraphicsScene, QGraphicsView
+
+from ..viewer_chrome import paint_format_label
 
 ZOOM_MIN = 0.05
 ZOOM_MAX = 5.0
@@ -36,11 +38,17 @@ class ImagePreviewView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
-        self.setBackgroundBrush(QBrush(QColor("#323232")))
+        # Letterbox around the frame — black so overlays and the plate read cleanly.
+        self.setBackgroundBrush(QBrush(QColor("#000000")))
+        self._scene.setBackgroundBrush(QBrush(QColor("#000000")))
 
         self._scene.setSceneRect(-1e6, -1e6, 2e6, 2e6)
 
         self._frame_rect = QRectF(0, 0, 1920, 1080)
+        self._format_w = 1920
+        self._format_h = 1080
+        self._border: QGraphicsRectItem | None = None
+        self._ensure_border()
 
         self._panning = False
         self._zooming = False
@@ -49,9 +57,28 @@ class ImagePreviewView(QGraphicsView):
 
     def set_frame_size(self, w: int, h: int) -> None:
         """Set the logical fit rect (maps source aspect to a 1080-tall canvas)."""
+        self._format_w = max(1, int(w))
+        self._format_h = max(1, int(h))
         preview_h = 1080
         preview_w = int(preview_h * w / max(h, 1))
         self._frame_rect = QRectF(0, 0, preview_w, preview_h)
+        self._ensure_border()
+
+    def format_text(self) -> str:
+        return f"{self._format_w} \u00d7 {self._format_h}"
+
+    def _ensure_border(self) -> None:
+        """Nuke-style 1px white format box (cosmetic — stays 1 screen pixel)."""
+        pen = QPen(QColor("#ffffff"))
+        pen.setCosmetic(True)
+        pen.setWidth(1)
+        if self._border is None:
+            self._border = self._scene.addRect(self._frame_rect, pen)
+            self._border.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            self._border.setZValue(100)
+        else:
+            self._border.setPen(pen)
+            self._border.setRect(self._frame_rect)
 
     # Back-compat alias used by older slate code.
     def set_slate_size(self, w: int, h: int) -> None:
@@ -145,6 +172,14 @@ class ImagePreviewView(QGraphicsView):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
+        super().drawForeground(painter, rect)
+        painter.save()
+        painter.resetTransform()
+        frame = QRectF(self.mapFromScene(self._frame_rect).boundingRect())
+        paint_format_label(painter, frame, self.format_text())
+        painter.restore()
 
 
 __all__ = ["ImagePreviewView", "ZOOM_MAX", "ZOOM_MIN"]

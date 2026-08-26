@@ -46,6 +46,7 @@ from ..core.ocio_utils import color_space_families, config_source_info
 from ..core.video import is_ignored_media_filename
 from ..services.presets import delete_preset, list_presets, load_preset, save_preset
 from ..services.worker import ConvertWorker
+from .color_widgets import lock_form_row_height
 from .preferences import (
     PLAYER_MODE_BUILTIN,
     PreferencesDialog,
@@ -55,6 +56,11 @@ from .preferences import (
 )
 from .size_grip import SizeGrip
 from .widgets import ConvertTab, OcioConfigPanel, _select_video_codec_combo_key
+
+# Floor so the log splitter cannot hide the convert form or the log entirely.
+# ConvertTab scrolls internally if the tab page is shorter than the form.
+CONVERT_TABS_MIN_HEIGHT = 200
+LOG_PANE_MIN_HEIGHT = 72
 
 
 class AboutDialog(QDialog):
@@ -187,6 +193,8 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setObjectName("logSplitter")
+        splitter.setChildrenCollapsible(False)
         root.addWidget(splitter)
 
         top = QWidget()
@@ -198,6 +206,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self._ocio_panel)
 
         self._tabs = QTabWidget()
+        self._tabs.setMinimumHeight(CONVERT_TABS_MIN_HEIGHT)
         self._v2e_tab = ConvertTab("video2exr", self._settings)
         self._e2v_tab = ConvertTab("exr2video", self._settings)
         self._tabs.addTab(self._v2e_tab, "Video \u2192 EXR")
@@ -208,6 +217,8 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self._tabs, 1)
 
         prog_row = QHBoxLayout()
+        prog_row.setContentsMargins(0, 0, 0, 0)
+        prog_row.setSpacing(6)
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
@@ -219,6 +230,9 @@ class MainWindow(QMainWindow):
         self._go.setObjectName("convertBtn")
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setEnabled(False)
+        lock_form_row_height(self._progress)
+        lock_form_row_height(self._go)
+        lock_form_row_height(self._cancel_btn)
         prog_row.addWidget(self._go)
         prog_row.addWidget(self._cancel_btn)
         top_layout.addLayout(prog_row)
@@ -283,6 +297,7 @@ class MainWindow(QMainWindow):
         mono.setPointSize(11)
         self._log.setFont(mono)
         self._log.setObjectName("logPane")
+        self._log.setMinimumHeight(LOG_PANE_MIN_HEIGHT)
         log_layout.addWidget(self._log, 1)
         splitter.addWidget(log_container)
         splitter.setStretchFactor(0, 3)

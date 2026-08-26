@@ -15,6 +15,36 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.9.11] — 2026-08-26
+
+### Added
+
+- **Docs:** [ProRes and VideoToolbox](docs/prores.md) explains Apple’s
+  hardware encoder (`prores_vt_*`, macOS only), why software 4444/XQ stay
+  10-bit, and the experimental oxideav 12-bit ladder.
+
+### Changed
+
+- **EXR → Video codec picker:** nested family menus instead of flat heading
+  rows. Experimental oxideav ProRes now includes the full 12-bit ladder
+  (Proxy / LT / 422 / HQ / 4444 / XQ), not only 4444 and XQ.
+- **App version:** Help → Version, About, ``--version``, and EXR ``Software``
+  metadata all read ``pyproject.toml`` (the only written copy). Frozen builds
+  ship that file with the binary.
+- **Viewer canvas:** slate editor, browser Preview, and the built-in player
+  use a black surround around the frame, a 1px white format box, and the
+  plate resolution right-justified under the frame's bottom-right corner.
+
+### Fixed
+
+- **Convert form:** Input, Output, Options, and color-space rows keep a
+  readable fixed height when the window or log splitter is short. Browse
+  and other row buttons match the field height. The form still scrolls
+  instead of collapsing those controls into unreadable slivers. Convert
+  matches Cancel; the progress bar matches the input row height.
+
+---
+
 ## [0.9.10] — 2026-08-25
 
 ### Changed
@@ -680,7 +710,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/derek-rein/exr-converter/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/derek-rein/exr-converter/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/derek-rein/exr-converter/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/derek-rein/exr-converter/compare/v0.9.7...v0.9.8

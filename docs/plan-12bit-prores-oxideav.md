@@ -14,6 +14,9 @@ pure-Rust **oxideav-prores** stack, linked **in-process** through a PyO3
 extension (`exr_prores`) and included in **Nuitka** releases. No subprocess
 sidecar.
 
+User-facing encoder comparison (software vs **Apple VideoToolbox** vs this
+path): [ProRes and VideoToolbox](./prores.md).
+
 ---
 
 ## 1. Goals
@@ -73,7 +76,7 @@ EXR Converter (Python / Nuitka)
 |-------|----------|
 | Rust crate | `native/exr_prores/` (maturin) |
 | Python façade | `src/core/oxideav_prores.py` |
-| Presets | `prores_ox_4444`, `prores_ox_xq` in `VIDEO_CODECS` |
+| Presets | `prores_ox_proxy` / `lt` / `422` / `hq` / `4444` / `xq` in `VIDEO_CODECS` |
 | Convert branch | `run_exr_to_video` → `_e2v_oxideav` when key ∈ `OXIDEAV_PRORES_KEYS` |
 | Build | `make oxideav-prores` → `scripts/build_oxideav_prores.py` |
 | CI / Release | Rust toolchain + maturin develop before pytest / Nuitka |

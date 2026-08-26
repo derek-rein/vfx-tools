@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 
 from .core.constants import (
+    APP_VERSION,
     DEFAULT_DST_E2V,
     DEFAULT_DST_V2E,
     DEFAULT_EXR_COMPRESSION,
@@ -150,6 +151,12 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"EXR Converter {APP_VERSION}",
+    )
     p.add_argument(
         "--smoke-test",
         action="store_true",

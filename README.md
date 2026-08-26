@@ -82,6 +82,7 @@ built with Hugo from [`site/`](site/) and published to GitHub Pages:
 |-------|--|
 | [CLI](docs/cli.md) | `video2exr` / `exr2video` / GUI launch flags |
 | [GUI](docs/gui.md) | Tabs, overlays, preferences, post-convert, codec picker |
+| [ProRes and VideoToolbox](docs/prores.md) | Software vs Apple VideoToolbox vs oxideav; honest bit depths |
 | [R3D / N-RAW](docs/r3d.md) | Optional RED SDK (license, build, CI, preview) |
 | [12-bit ProRes (oxideav)](docs/plan-12bit-prores-oxideav.md) | Experimental RDD-36 12-bit ProRes via PyO3 |
 | [Nuke](docs/nuke.md) | Menu: open selected Read + session OCIO |
@@ -134,13 +135,15 @@ Common convert options:
 
 ### EXR → video codecs (ProRes and more)
 
-Default **`prores`** = software **ProRes 422 HQ** (cross-platform, **10-bit** encode). GUI codec menu is grouped by family.
+Default **`prores`** = software **ProRes 422 HQ** (cross-platform, **10-bit** encode). GUI codec picker is nested by family.
+
+**VideoToolbox** is Apple’s **hardware ProRes encoder** on **macOS only** (`prores_videotoolbox` via PyAV). Faster than software; 422 profiles stay 10-bit; **4444/XQ keep ~12-bit class** precision that FFmpeg `prores_ks` does not. Full write-up: [docs/prores.md](docs/prores.md).
 
 | Family | Keys | Notes |
 |--------|------|--------|
 | **ProRes (software)** | `prores_proxy` … `prores_xq` | FFmpeg `prores_ks`; all profiles encode **10-bit** |
-| **ProRes (VideoToolbox)** | `prores_vt_*` | **macOS only** — Apple HW encoder; faster; 4444/XQ ~12-bit class |
-| **ProRes (oxideav)** | `prores_ox_4444`, `prores_ox_xq` | Experimental **true 12-bit** RDD-36 in release builds |
+| **ProRes (VideoToolbox)** | `prores_vt_proxy` … `prores_vt_xq` | **macOS only** — Apple HW encoder; faster; 4444/XQ ~12-bit class |
+| **ProRes (oxideav)** | `prores_ox_proxy` … `prores_ox_xq` | Experimental **true 12-bit** RDD-36 in release builds (full 422 + 4444 ladder) |
 | **Also** | DNxHR, CineForm, H.264/HEVC, FFV1 | Delivery and lossless options — see [docs/cli.md](docs/cli.md#codecs-honest-bit-depths) |
 
 **Quick picks:** macOS dailies → **`prores_vt_hq`** or **`prores_vt_4444`**; cross-platform ProRes → **`prores`**; cross-platform 12-bit 4:4:4 → **`prores_ox_4444`** (experimental). Software 4444/XQ are **not** true 12-bit despite probe labels.

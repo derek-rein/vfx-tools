@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Bump [project].version in pyproject.toml and sync APP_VERSION in src/core/constants.py.
+"""Bump [project].version in pyproject.toml (the only written app version).
 
+Runtime code reads that file via ``APP_VERSION`` in ``src/core/constants.py``.
 Tags use plain semver: v1.2.3.
 """
 from __future__ import annotations
@@ -12,13 +13,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
-CONSTANTS = REPO_ROOT / "src" / "core" / "constants.py"
 
 VERSION_LINE = re.compile(r"^version\s*=\s*\"([^\"]+)\"\s*$", re.MULTILINE)
-APP_VERSION_LINE = re.compile(
-    r"^(APP_VERSION\s*=\s*\")([^\"]+)(\"\s*)$",
-    re.MULTILINE,
-)
 
 
 def parse_semver(s: str) -> tuple[int, int, int]:
@@ -59,26 +55,11 @@ def write_pyproject_version(new_version: str, dry_run: bool) -> None:
         PYPROJECT.write_text(new_text, encoding="utf-8")
 
 
-def write_app_version(new_version: str, dry_run: bool) -> None:
-    text = CONSTANTS.read_text(encoding="utf-8")
-    new_text, n = APP_VERSION_LINE.subn(
-        lambda m: f'{m.group(1)}{new_version}{m.group(3)}',
-        text,
-        count=1,
-    )
-    if n != 1:
-        raise SystemExit(
-            f"expected exactly one APP_VERSION = \"...\" line in {CONSTANTS}",
-        )
-    if not dry_run:
-        CONSTANTS.write_text(new_text, encoding="utf-8")
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_bump = sub.add_parser("bump", help="increment semver and sync constants.py")
+    p_bump = sub.add_parser("bump", help="increment semver in pyproject.toml")
     p_bump.add_argument(
         "part",
         choices=("patch", "minor", "major"),
@@ -106,8 +87,6 @@ def main() -> None:
 
     if not PYPROJECT.is_file():
         raise SystemExit(f"missing {PYPROJECT}")
-    if not CONSTANTS.is_file():
-        raise SystemExit(f"missing {CONSTANTS}")
 
     current = read_pyproject_version()
     new_version = bump_semver(current, args.part)
@@ -117,7 +96,6 @@ def main() -> None:
     print(f"tag: {tag}")
 
     write_pyproject_version(new_version, args.dry_run)
-    write_app_version(new_version, args.dry_run)
 
     if args.dry_run:
         print("(dry-run: no files modified)")

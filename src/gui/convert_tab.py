@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QPoint,
     QRegularExpression,
     QSettings,
+    QSize,
     Qt,
     QThread,
     QTimer,
@@ -27,7 +28,6 @@ from PySide6.QtGui import (
     QGuiApplication,
     QKeySequence,
     QRegularExpressionValidator,
-    QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -36,12 +36,15 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QToolButton,
@@ -64,6 +67,7 @@ from ..core.constants import (
     EXR_COMPRESSIONS,
     SCALE_OPTIONS,
     X26X_PRESETS,
+    VideoCodecSpec,
     available_video_codecs,
     available_video_codecs_grouped,
     is_image_sequence_ext,
@@ -85,7 +89,7 @@ from ..services.slate_model import SlateModel
 from .browser_chrome import _VIDEO_EXTS, _add_copy_path_actions, _folder_path_for_copy
 from .browser_path import clean_path_string
 from .browser_state import BrowserPreviewContext
-from .color_widgets import ColorSpaceButton, FpsCombo
+from .color_widgets import ColorSpaceButton, FpsCombo, lock_form_row_height
 from .preferences import file_manager_label, path_is_revealable
 from .sequence_browser import SequenceBrowserDialog
 from .style import DESC_STYLE, HINT_STYLE
@@ -258,14 +262,30 @@ _CODEC_HELP: dict[str, str] = {
         "Hardware ProRes 4444 XQ via VideoToolbox (macOS only). ~12-bit class "
         "precision; preferred over software XQ when bit depth matters."
     ),
+    "prores_ox_proxy": (
+        "Experimental 12-bit ProRes 422 Proxy (SMPTE RDD 36 / apco via oxideav). "
+        "Not Apple-certified. Requires exr_prores (make oxideav-prores)."
+    ),
+    "prores_ox_lt": (
+        "Experimental 12-bit ProRes 422 LT (RDD 36 / apcs via oxideav). "
+        "Not Apple-certified. Requires exr_prores."
+    ),
+    "prores_ox_422": (
+        "Experimental 12-bit ProRes 422 (RDD 36 / apcn via oxideav). "
+        "Not Apple-certified. Requires exr_prores."
+    ),
+    "prores_ox_hq": (
+        "Experimental 12-bit ProRes 422 HQ (RDD 36 / apch via oxideav). "
+        "Not Apple-certified. Requires exr_prores."
+    ),
     "prores_ox_4444": (
         "Experimental cross-platform true 12-bit ProRes 4444-compatible encode "
-        "(SMPTE RDD 36 via oxideav-prores PyO3 bindings). Not Apple-certified. "
+        "(SMPTE RDD 36 / ap4h via oxideav-prores PyO3 bindings). Not Apple-certified. "
         "Requires the built-in exr_prores extension (make oxideav-prores)."
     ),
     "prores_ox_xq": (
         "Experimental cross-platform true 12-bit ProRes 4444 XQ-compatible encode "
-        "(SMPTE RDD 36 via oxideav-prores). Not Apple-certified. Requires exr_prores."
+        "(SMPTE RDD 36 / ap4x via oxideav-prores). Not Apple-certified. Requires exr_prores."
     ),
     "cineform": (
         "GoPro CineForm (cfhd) — 10-bit 4:2:2 wavelet intermediate. "
@@ -489,52 +509,131 @@ class _InputProbeWorker(QObject):
             self.failed.emit(str(e))
 
 
-def _set_codec_combo_header_row(combo: QComboBox, index: int) -> None:
-    """Non-selectable bold group label row in the codec picker."""
-    model = combo.model()
-    if not isinstance(model, QStandardItemModel):
-        return
-    item = model.item(index)
-    if item is None:
-        return
-    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
-    font = item.font()
-    font.setBold(True)
-    item.setFont(font)
+class CodecPicker(QToolButton):
+    """Nested family menu for EXR→video codecs (not a flat heading list)."""
+
+    key_changed = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.DelayedPopup)
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        lock_form_row_height(self)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._key = ""
+        self._menu = QMenu(self)
+        self.rebuild()
+
+    def currentData(self) -> str | None:
+        return self._key or None
+
+    def rebuild(self) -> None:
+        old = self._menu
+        self._menu = QMenu(self)
+        old.deleteLater()
+        first_key = ""
+        for group_label, specs in available_video_codecs_grouped():
+            sub = self._menu.addMenu(group_label)
+            for spec in specs:
+                if not first_key:
+                    first_key = spec.key
+                tip = spec.format_label
+                if spec.platforms:
+                    tip += f" · {', '.join(spec.platforms)} only"
+                action = sub.addAction(spec.display_name)
+                action.setToolTip(tip)
+                action.setData(spec.key)
+                action.triggered.connect(lambda checked=False, k=spec.key: self._pick(k))
+        if self._key:
+            self.set_key(self._key)
+        elif first_key:
+            self.set_key(first_key)
+
+    def set_key(self, key: str, *, fallback: str = DEFAULT_VIDEO_CODEC) -> None:
+        by_key = {c.key: c for c in available_video_codecs()}
+        for candidate in (key, fallback):
+            spec = by_key.get(str(candidate or ""))
+            if spec is not None:
+                self._apply(spec)
+                return
+        if by_key:
+            self._apply(next(iter(by_key.values())))
+
+    def _apply(self, spec: VideoCodecSpec) -> None:
+        changed = spec.key != self._key
+        self._key = spec.key
+        self.setText(spec.display_name)
+        self.setToolTip(spec.format_label)
+        if changed:
+            self.key_changed.emit(spec.key)
+
+    def _pick(self, key: str) -> None:
+        self.set_key(key)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._popup(event.position().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (
+            Qt.Key.Key_Space,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+            Qt.Key.Key_Down,
+        ):
+            self._popup(QPoint(0, self.height() // 2))
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _popup(self, local_pos: QPoint) -> None:
+        if self._menu is None or not self._menu.actions():
+            return
+        x = max(0, min(local_pos.x(), max(0, self.width() - 8)))
+        self._menu.popup(self.mapToGlobal(QPoint(x, self.height())))
 
 
-def _populate_video_codec_combo(combo: QComboBox) -> None:
-    """Fill *combo* with OS-filtered codecs grouped by family."""
-    combo.clear()
-    first_group = True
-    for group_label, specs in available_video_codecs_grouped():
-        if not first_group:
-            combo.insertSeparator(combo.count())
-        first_group = False
-
-        combo.addItem(group_label, None)
-        _set_codec_combo_header_row(combo, combo.count() - 1)
-
-        for spec in specs:
-            tip = spec.format_label
-            if spec.platforms:
-                tip += f" · {', '.join(spec.platforms)} only"
-            combo.addItem(spec.display_name, spec.key)
-            idx = combo.count() - 1
-            combo.setItemData(idx, tip, Qt.ItemDataRole.ToolTipRole)
+def _populate_video_codec_combo(combo: CodecPicker) -> None:
+    combo.rebuild()
 
 
 def _select_video_codec_combo_key(
-    combo: QComboBox,
+    combo: CodecPicker,
     key: str,
     *,
     fallback: str = DEFAULT_VIDEO_CODEC,
 ) -> None:
-    for codec_key in (key, fallback):
-        for i in range(combo.count()):
-            if combo.itemData(i) == codec_key:
-                combo.setCurrentIndex(i)
-                return
+    combo.set_key(key, fallback=fallback)
+
+
+class _ConvertFormBody(QWidget):
+    """Convert form contents.
+
+    ``QScrollArea.setWidgetResizable(True)`` will shrink the inner widget to
+    the viewport when it can. Returning ``sizeHint`` as the minimum stops
+    that, so a short pane scrolls instead of crushing the rows.
+    """
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+
+def _form_scroll_area(body: QWidget) -> QScrollArea:
+    """Host a convert form so a short pane scrolls instead of squashing fields."""
+    body.setObjectName("convertTabBody")
+    body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    scroll = QScrollArea()
+    scroll.setObjectName("convertTabScroll")
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    scroll.setWidget(body)
+    return scroll
 
 
 class ConvertTab(QWidget):
@@ -552,7 +651,12 @@ class ConvertTab(QWidget):
         self._input_seq: fileseq.FileSequence | None = None
         self._video_info: VideoInput | None = None
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        body = _ConvertFormBody()
+        layout = QVBoxLayout(body)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
@@ -562,6 +666,7 @@ class ConvertTab(QWidget):
         in_main.setSpacing(4)
 
         in_row = QHBoxLayout()
+        in_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.input_path = QLineEdit()
         self.input_path.setPlaceholderText(
             "Video file (mp4, mov, mkv, \u2026)"
@@ -578,12 +683,14 @@ class ConvertTab(QWidget):
         in_main.addLayout(in_row)
 
         cs_in_row = QHBoxLayout()
+        cs_in_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         cs_in_row.addWidget(QLabel("Color space:"))
         self.src_btn = ColorSpaceButton()
         cs_in_row.addWidget(self.src_btn, 1)
         in_main.addLayout(cs_in_row)
 
         range_row = QHBoxLayout()
+        range_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         range_row.addWidget(QLabel("Frames:"))
         self._frame_range_edit = QLineEdit()
         self._frame_range_edit.setPlaceholderText("e.g. 1001-1100, 1-50x2")
@@ -607,6 +714,7 @@ class ConvertTab(QWidget):
 
         in_main.addLayout(range_row)
         self._full_input_range = ""
+        in_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         layout.addWidget(in_group)
 
@@ -616,6 +724,7 @@ class ConvertTab(QWidget):
         out_main.setSpacing(4)
 
         out_row = QHBoxLayout()
+        out_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.output_path = QLineEdit()
         self.output_path.setPlaceholderText(
             f"Output directory for EXR sequence (name.{'#' * DEFAULT_FRAME_PADDING}.exr)"
@@ -632,10 +741,12 @@ class ConvertTab(QWidget):
         out_main.addLayout(out_row)
 
         cs_out_row = QHBoxLayout()
+        cs_out_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         cs_out_row.addWidget(QLabel("Color space:"))
         self.dst_btn = ColorSpaceButton()
         cs_out_row.addWidget(self.dst_btn, 1)
         out_main.addLayout(cs_out_row)
+        out_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         layout.addWidget(out_group)
 
@@ -657,6 +768,7 @@ class ConvertTab(QWidget):
         )
 
         scale_row = QHBoxLayout()
+        scale_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         scale_row.setSpacing(12)
         scale_row.addWidget(self.scale_combo, 1)
 
@@ -709,6 +821,7 @@ class ConvertTab(QWidget):
                 )
             )
             comp_row = QHBoxLayout()
+            comp_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
             comp_row.setSpacing(4)
             comp_row.addWidget(self.compression_combo, 1)
             self._comp_settings_btn = QToolButton()
@@ -764,17 +877,14 @@ class ConvertTab(QWidget):
             self.fps_widget = FpsCombo(settings, f"{mode}/fps")
             opts_layout.addRow("Frame rate", self.fps_widget)
 
-            self.codec_combo = QComboBox()
-            _populate_video_codec_combo(self.codec_combo)
+            self.codec_combo = CodecPicker()
             saved_codec = settings.value(f"{mode}/video_codec", DEFAULT_VIDEO_CODEC)
             _select_video_codec_combo_key(self.codec_combo, str(saved_codec))
-            self.codec_combo.currentIndexChanged.connect(
-                lambda _: self._settings.setValue(
-                    f"{self._mode}/video_codec",
-                    self.codec_combo.currentData(),
-                )
+            self.codec_combo.key_changed.connect(
+                lambda k: self._settings.setValue(f"{self._mode}/video_codec", k)
             )
             codec_row = QHBoxLayout()
+            codec_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
             codec_row.setSpacing(4)
             codec_row.addWidget(self.codec_combo, 1)
             self._codec_settings_btn = QToolButton()
@@ -784,9 +894,9 @@ class ConvertTab(QWidget):
             self._codec_settings_btn.setToolTip("Codec settings\u2026")
             self._codec_settings_btn.clicked.connect(self._open_codec_settings)
             self._update_codec_btn_state()
-            self.codec_combo.currentIndexChanged.connect(lambda _: self._update_codec_btn_state())
-            self.codec_combo.currentIndexChanged.connect(lambda _: self._update_output_ext())
-            self.codec_combo.currentIndexChanged.connect(lambda _: self._update_dst_for_codec())
+            self.codec_combo.key_changed.connect(lambda _: self._update_codec_btn_state())
+            self.codec_combo.key_changed.connect(lambda _: self._update_output_ext())
+            self.codec_combo.key_changed.connect(lambda _: self._update_dst_for_codec())
             codec_row.addWidget(self._codec_settings_btn)
             opts_layout.addRow("Codec", codec_row)
         else:
@@ -796,6 +906,7 @@ class ConvertTab(QWidget):
             self.fps_widget = None
             self.codec_combo = None
 
+        opts_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout.addWidget(opts_group)
 
         # Two-way binding between the master checkboxes and the model.
@@ -812,6 +923,32 @@ class ConvertTab(QWidget):
             self._slate_model.changed.connect(self._on_slate_model_changed)
 
         layout.addStretch()
+
+        for w in (
+            self.input_path,
+            self._browse_in,
+            self.src_btn,
+            self._frame_range_edit,
+            self._reset_range_btn,
+            self.output_path,
+            self._browse_out,
+            self.dst_btn,
+            self.scale_combo,
+            self.compression_combo,
+            getattr(self, "_comp_settings_btn", None),
+            self.padding_spin,
+            self.start_frame_spin,
+            self.codec_combo,
+            getattr(self, "_codec_settings_btn", None),
+            self._slate_check,
+            self._burnin_check,
+            self._watermark_check,
+            getattr(self, "_edit_slate_btn", None),
+        ):
+            if w is not None:
+                lock_form_row_height(w)
+
+        outer.addWidget(_form_scroll_area(body))
 
         # -- Tab order --
         tab_chain = [

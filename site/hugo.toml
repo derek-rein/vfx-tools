@@ -29,6 +29,10 @@ disableKinds = ["taxonomy", "term", "RSS"]
     pageRef = "/docs/gui"
     weight = 25
   [[menus.main]]
+    name = "ProRes"
+    pageRef = "/docs/prores"
+    weight = 28
+  [[menus.main]]
     name = "Nuke"
     pageRef = "/docs/nuke"
     weight = 30

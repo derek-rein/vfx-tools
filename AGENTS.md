@@ -12,7 +12,7 @@ binaries for Linux, macOS (arm64 + x86_64), and Windows.
 | Item | Value |
 |------|--------|
 | Package / app | `exr-converter` / EXR Converter |
-| Version source of truth | `pyproject.toml` `version` + `APP_VERSION` in `src/core/constants.py` (kept in sync by `scripts/bump_app_version.py`) |
+| Version source of truth | `pyproject.toml` `[project].version` — Help / About / `--version` / EXR metadata read it at runtime (`APP_VERSION` in `src/core/constants.py`). `scripts/bump_app_version.py` edits only this file. |
 | Python | **3.13 only** (`requires-python = "==3.13.*"`) |
 | Deps / runs | **uv** (`uv sync`, `uv run …`) |
 | Entry | `main.py` (GUI with no subcommand; CLI: `video2exr`, `exr2video`) |
@@ -45,7 +45,7 @@ GitHub Pages: https://derek-rein.github.io/exr-converter/
 |------|--------|
 | When | Any change that affects how users run or integrate the app: CLI flags, GUI behavior, codecs, OCIO/defaults, install/packaging users notice, Nuke/helpers, post-convert prefs, launch flags |
 | Where | Update the matching file under `docs/` in the **same PR / commit set** as the code (and [CHANGELOG.md](./CHANGELOG.md) when user-visible) |
-| Map | [docs/cli.md](./docs/cli.md) CLI + GUI launch · [docs/gui.md](./docs/gui.md) GUI / prefs / overlays · [docs/nuke.md](./docs/nuke.md) Nuke menu · [docs/releasing.md](./docs/releasing.md) short release pointer · design notes only when the design changes |
+| Map | [docs/cli.md](./docs/cli.md) CLI + GUI launch · [docs/gui.md](./docs/gui.md) GUI / prefs / overlays · [docs/prores.md](./docs/prores.md) VideoToolbox / software / oxideav · [docs/nuke.md](./docs/nuke.md) Nuke menu · [docs/releasing.md](./docs/releasing.md) short release pointer · design notes only when the design changes |
 | Local | `make docs-serve` (preview) · `make docs-build` (static `site/public/`) |
 | Do not | Leave docs describing old flags/defaults/codecs. Do not hand-edit generated `site/public/`. Do not put the only copy of user docs solely in chat or PR text. |
 
@@ -205,7 +205,7 @@ feature commits (PR → main)
         │
         ▼
  make release PART=patch|minor|major   (on release/X.Y.Z branch, PUSH=0)
-        │  1. scripts/bump_app_version.py → pyproject + APP_VERSION
+        │  1. scripts/bump_app_version.py → pyproject.toml version
         │  2. uv lock
         │  3. commit: "release: X.Y.Z"  (only version files)
         │  4. optional local annotated tag vX.Y.Z  (not required for publish)
@@ -230,7 +230,7 @@ feature commits (PR → main)
 ```
 
 Tags are plain semver: **`v1.2.3`**. The tag is the published app version
-(workflow also injects `APP_VERSION` from the tag during the Nuitka build).
+(the frozen binary ships `pyproject.toml` and reads `[project].version` at runtime).
 
 **Critical GitHub quirk:** a tag created with the default **`GITHUB_TOKEN` does
 not start other workflows** (recursion guard). Auto-tag therefore **dispatches**
@@ -246,7 +246,7 @@ dispatch can race (concurrency serializes same-tag runs, but wastes minutes).
 ### Prerequisites
 
 - Feature work committed (or stashed) before `make release`.
-- Release commit stages **only**: `pyproject.toml`, `src/core/constants.py`, `uv.lock`.
+- Release commit stages **only**: `pyproject.toml`, `uv.lock`.
 - `uv` available; `scripts/bump_app_version.py` is plain Python 3.
 - [GitHub CLI](https://cli.github.com/) (`gh auth status`) for checks / releases.
 - **`main` is branch-protected** — no direct pushes; use PRs. Do not run
@@ -376,7 +376,7 @@ applies).
 | Auto-tag refuses: CHANGELOG missing section | Add `## [X.Y.Z]` + `[X.Y.Z]:` compare link, merge fix PR |
 | Tag exists locally not on remote | After merge, retag if needed, `git push origin vX.Y.Z`. Never force-push a published public tag lightly |
 | Gate red on Release | Fix forward with a new patch; prefer not rewriting a published tag |
-| Wrong version in GUI binary | Tag must be `vX.Y.Z`; check inject-version step and `APP_VERSION` on the tagged commit |
+| Wrong version in GUI binary | Tag must be `vX.Y.Z` matching `pyproject.toml`; Nuitka must include that file (`--include-data-files=pyproject.toml=pyproject.toml`) |
 | OCIO 2.4 vs 2.5 in CI/local | `scripts/ensure_ocio.py` / `make ensure-ocio` |
 | `Unable to reserve cache` (setup-uv) | Benign race if two writers share a key; CI/Release use `cache-suffix` + lint `save-cache: false` |
 | Two Release runs for one tag | Concurrency group `release-vX.Y.Z` queues; avoid double-trigger (tag push + dispatch) |
@@ -434,8 +434,9 @@ Branch protection on `main` should require `ci-ok`.
 | [site/](./site/) | Hugo config + theme; mounts `docs/` → GitHub Pages |
 | [docs/cli.md](./docs/cli.md) | CLI + GUI launch flags |
 | [docs/gui.md](./docs/gui.md) | GUI tabs, overlays, preferences, post-convert |
+| [docs/prores.md](./docs/prores.md) | Software vs VideoToolbox vs oxideav ProRes |
 | [docs/nuke.md](./docs/nuke.md) | Nuke menu integration |
-| [docs/plan-12bit-prores-oxideav.md](./docs/plan-12bit-prores-oxideav.md) | Future 12-bit ProRes plan (not implemented) |
+| [docs/plan-12bit-prores-oxideav.md](./docs/plan-12bit-prores-oxideav.md) | Experimental RDD-36 12-bit ProRes (oxideav; shipping in releases) |
 | [docs/r3d.md](./docs/r3d.md) | Optional RED R3D / N-RAW (proprietary SDK; license + build) |
 | [docs/releasing.md](./docs/releasing.md) | Short pointer here + docs-site note |
 | [integrations/nuke/](./integrations/nuke/) | Nuke `menu.py` + helpers |
