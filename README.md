@@ -1,6 +1,15 @@
 # EXR Converter
 
-Desktop app and CLI for converting between **video** and **OpenEXR** sequences with **OpenColorIO** color management and built-in **slate rendering**. Uses **PyAV** for decode/encode, **OpenImageIO** for EXR (and other still) I/O, and **PySide6** (QPainter) for the GUI and slate compositing. **EXR → video** also accepts **DPX** and display still sequences (**PNG**, **JPEG**, **WebP**).
+Desktop app and CLI for **EXR ↔ video** workflows — built for **VFX dailies**, review exports, and plate round-trips with **OpenColorIO** color management end to end.
+
+**Why people use it**
+
+- **Dailies-ready EXR → video** — prepend a **slate** frame, per-frame **burn-ins** (show / shot / version / frame tokens), and a **watermark** (tiled text, opacity/size/angle); preview overlays live in the slate editor before you encode
+- **ProRes out of the box** — full software ladder (Proxy → XQ, default **422 HQ**), **Apple VideoToolbox** on macOS (fast HW encode; 4444/XQ ~12-bit class), plus experimental cross-platform **true 12-bit** RDD-36 presets (`prores_ox_*`) in release builds
+- **Built for speed** — multi-core **OCIO worker pools** (auto worker count, `--workers` on CLI), ordered frame delivery, optional half-res **`--scale`**, and GPU OCIO in the built-in player / slate preview hot path
+- **OCIO your way** — ships **ACES Studio Config v4** (camera IDTs, ACES outputs); also `$OCIO`, custom `.ocio` files, other built-ins, and **local Nuke install configs** (path reference only) from the GUI picker
+
+Under the hood: **PyAV** (FFmpeg) for video, **OpenImageIO** for EXR and still sequences (**DPX**, **PNG**, **JPEG**, **WebP**), **PySide6** + **QPainter** for slate/overlays (no embedded browser).
 
 **Optional RED R3D / N-RAW:** when built with the official RED R3D SDK bridge, **Video → EXR** can decode `.r3d` and `.nev` (IPP2 primary → Log3G10 REDWideGamutRGB for OCIO), including browser thumbnails, sequence-player preview, and camera/timecode metadata on written EXRs. Release binaries may ship only RED’s allowed Redistributable libraries in a private app folder — see [docs/r3d.md](docs/r3d.md) and **Help → About** for the redistributable notice.
 
@@ -54,11 +63,13 @@ CI runs on **GitHub Actions**; releases publish binaries for Linux, macOS (Apple
 uv run python main.py
 ```
 
-No subcommand — opens the main window. OCIO resolution follows `$OCIO` when set, otherwise the bundled **ACES Studio Config v4 (ACES 2.0)** — the official rich config from the Academy Software Foundation containing a huge set of camera input transforms including **Apple Log** (for iPhone 15/16 Pro cinematic video and ProRes Log), ARRI LogC3/4, RED, Sony, Canon, DJI and many others, plus modern ACES Output Transforms and displays. 
+No subcommand — opens the main window.
 
-Common camera source names (when using the default ACES Studio config): "Apple Log" (or "apple_log", "iphone log"), "ARRI LogC3 (EI800)", "Log3G10 REDWideGamutRGB", etc. The UI source picker groups them under families like Input/Apple, Input/ARRI, etc. You can also pass `--ocio /path/to/your.config.ocio` or choose other built-ins / custom in the UI.
+On **EXR → Video**, check **Prepend slate**, **Burn-in**, and **Watermark** to build review/dailies exports in one pass. The slate editor shows live overlays with GPU OCIO preview. Convert presets remember codec, scale, and color spaces (not I/O paths).
 
-Enable the **Prepend slate** checkbox to add a 1-frame slate image before the converted output.
+**OCIO config picker:** bundled **ACES Studio v4** (recommended default), `$OCIO`, custom file, other built-ins, or a **Nuke install config** (uses your local Foundry OCIO — not redistributed). Source/destination spaces are grouped by family (Input/ARRI, Input/Apple, Output/Rec.709, …). Override from CLI with `--ocio PATH` or `--src` / `--dst`.
+
+Common camera sources on the bundled config include **Apple Log**, **ARRI LogC3**, **Log3G10 REDWideGamutRGB**, Sony, Canon, DJI, and many more.
 
 ## Documentation
 
@@ -121,17 +132,18 @@ Common convert options:
 | `--exr-compression NAME` | `video2exr` | e.g. `dwaa`, `zip`, `none` (see `--help`) |
 | `--codec KEY` | `exr2video` | ProRes / DNxHR / CineForm / HEVC / H.264 / FFV1 — see [docs/cli.md](docs/cli.md) for bit-depth notes and codec keys |
 
-### EXR → video codecs (summary)
+### EXR → video codecs (ProRes and more)
 
-Default **`prores`** is software **ProRes 422 HQ** (FFmpeg `prores_ks`, **10-bit** encode). The GUI codec menu groups presets by family (ProRes software, VideoToolbox on macOS, experimental oxideav, CineForm, DNxHR, H.264/HEVC, FFV1).
+Default **`prores`** = software **ProRes 422 HQ** (cross-platform, **10-bit** encode). GUI codec menu is grouped by family.
 
-| Path | When to use |
-|------|-------------|
-| **`prores_*` (software)** | Cross-platform ProRes; all profiles encode at **10-bit** |
-| **`prores_vt_*` (macOS)** | Apple **VideoToolbox** — faster, official HW encoder; 4444/XQ ~12-bit class |
-| **`prores_ox_*` (oxideav)** | Experimental **true 12-bit** RDD-36 ProRes-compatible MOV in **release builds**; not Apple-certified. Dev from source: `make oxideav-prores` |
+| Family | Keys | Notes |
+|--------|------|--------|
+| **ProRes (software)** | `prores_proxy` … `prores_xq` | FFmpeg `prores_ks`; all profiles encode **10-bit** |
+| **ProRes (VideoToolbox)** | `prores_vt_*` | **macOS only** — Apple HW encoder; faster; 4444/XQ ~12-bit class |
+| **ProRes (oxideav)** | `prores_ox_4444`, `prores_ox_xq` | Experimental **true 12-bit** RDD-36 in release builds |
+| **Also** | DNxHR, CineForm, H.264/HEVC, FFV1 | Delivery and lossless options — see [docs/cli.md](docs/cli.md#codecs-honest-bit-depths) |
 
-Software ProRes 4444/XQ must not be treated as true 12-bit. On macOS, prefer VideoToolbox for speed and Apple’s encoder. Full ladder: [docs/cli.md](docs/cli.md#codecs-honest-bit-depths).
+**Quick picks:** macOS dailies → **`prores_vt_hq`** or **`prores_vt_4444`**; cross-platform ProRes → **`prores`**; cross-platform 12-bit 4:4:4 → **`prores_ox_4444`** (experimental). Software 4444/XQ are **not** true 12-bit despite probe labels.
 
 ```bash
 uv run python main.py --help

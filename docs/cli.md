@@ -43,6 +43,10 @@ Global flags (before the subcommand; convert flags may also appear after it):
 | `--gui-ocio PATH` | **GUI only:** load this OCIO config on launch |
 | `--mode auto\|video2exr\|exr2video` | **GUI only:** which tab (`auto` from `--open`) |
 
+**Interrupt:** during CLI convert, **Ctrl-C** sets a cancel flag so the
+pipeline stops cooperatively (pool work is cancelled) and the process exits
+with status **130**.
+
 ---
 
 ## GUI launch (for shells & Nuke)

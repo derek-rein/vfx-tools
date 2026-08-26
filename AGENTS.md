@@ -64,6 +64,10 @@ main.py                 # GUI / CLI entry
 src/
   core/                 # convert, video, EXR I/O, OCIO, codecs constants, sequences
   gui/                  # PySide6 window, tabs, slate UI, preferences, style
+  gui/convert_tab.py    # ConvertTab + codec/compression dialogs
+  gui/color_widgets.py  # ColorSpaceButton, FpsCombo, OcioConfigPanel
+  gui/sequence_browser.py / video_browser.py / browser_chrome.py
+  gui/widgets.py        # thin re-export façade (prefer specific modules)
   gui/player/           # SequencePlayer, ShuttleBar, ImagePreviewView (shared playback)
   render/               # slate, burn-in, watermark, tokens (QPainter)
   services/             # worker thread, presets, cache, slate model, prefetch
@@ -91,7 +95,9 @@ site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
 | CLI | `src/cli.py` |
 | Main window / post-convert actions | `src/gui/window.py` |
 | Player prefs / reveal-in-folder | `src/gui/preferences.py` |
-| Convert tabs / codecs UI | `src/gui/widgets.py` |
+| Convert tabs / codecs UI | `src/gui/convert_tab.py` (façade: `src/gui/widgets.py`) |
+| Color / OCIO panel widgets | `src/gui/color_widgets.py` |
+| Sequence / video browsers | `src/gui/sequence_browser.py`, `src/gui/video_browser.py`, `src/gui/browser_chrome.py` |
 | Sequence player | `src/gui/player/` (`SequencePlayer`, transport, preview view) |
 | Slate dialog / viewer | `src/gui/slate_widgets.py` (composes player + overlay hooks), `src/gui/ocio_gpu_plane.py`, `src/services/slate_model.py` |
 | Background convert | `src/services/worker.py` |

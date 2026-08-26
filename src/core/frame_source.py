@@ -16,6 +16,8 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from .errors import ConversionCancelled
+
 log = logging.getLogger(__name__)
 
 ProgressCancel = Callable[[], bool]
@@ -508,7 +510,7 @@ class VideoIngestSource:
                 container, stream, deinterlace=self._deinterlace, log=self._log_fn
             ):
                 if cancel_check and cancel_check():
-                    raise RuntimeError("Cancelled")
+                    raise ConversionCancelled()
                 idx += 1
                 if frame_set is not None:
                     if idx not in frame_set:
@@ -621,7 +623,7 @@ class R3DIngestSource:
         ow, oh = self._out_w, self._out_h
         for idx_1based in indices:
             if cancel_check and cancel_check():
-                raise RuntimeError("Cancelled")
+                raise ConversionCancelled()
             idx_0 = idx_1based - 1
             rgb = self._clip.decode_frame(idx_0, mode=self._mode)
             if self._need_extra_resize and (rgb.shape[1], rgb.shape[0]) != (ow, oh):

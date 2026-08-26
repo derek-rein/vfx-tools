@@ -15,6 +15,32 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.9.10] — 2026-08-25
+
+### Changed
+
+- **CLI:** Ctrl-C cooperatively cancels `video2exr` / `exr2video` (exit 130)
+  instead of leaving pool workers hanging.
+- **Convert:** Video→EXR parallel path uses a thread pool so decoded RGB
+  frames are not pickled across processes; EXR→Video ordered-encode staging
+  is capped (~256 MiB) to limit out-of-order frame memory.
+
+---
+
+## [0.9.9] — 2026-08-25
+
+### Security
+
+- **oxideav PyO3 extension:** bump ``pyo3`` 0.25 → 0.29 (fixes
+  GHSA-36hh-v3qg-5jq4 iterator OOB read) and matching ``numpy`` crate.
+
+### Changed
+
+- **README:** clearer upfront bullets for dailies (slate / burn-in / watermark),
+  ProRes ladder, multi-core OCIO speed, and configurable OCIO configs.
+
+---
+
 ## [0.9.8] — 2026-08-24
 
 ### Added
@@ -654,7 +680,9 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.10...HEAD
+[0.9.10]: https://github.com/derek-rein/exr-converter/compare/v0.9.9...v0.9.10
+[0.9.9]: https://github.com/derek-rein/exr-converter/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/derek-rein/exr-converter/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/derek-rein/exr-converter/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/derek-rein/exr-converter/compare/v0.9.5...v0.9.6
