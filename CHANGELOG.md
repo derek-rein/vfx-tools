@@ -13,6 +13,10 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ## [Unreleased]
 
+---
+
+## [0.9.11] — 2026-08-26
+
 ### Added
 
 - **Docs:** [ProRes and VideoToolbox](docs/prores.md) explains Apple’s
@@ -706,7 +710,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/derek-rein/exr-converter/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/derek-rein/exr-converter/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/derek-rein/exr-converter/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/derek-rein/exr-converter/compare/v0.9.7...v0.9.8
