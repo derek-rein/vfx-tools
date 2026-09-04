@@ -194,11 +194,13 @@ class VideoPreviewDecoder:
             pass
 
     def _frame_to_rgb_f32(self, frame) -> np.ndarray:
+        from .video import av_frame_to_rgb_ndarray
+
         try:
-            arr = frame.to_ndarray(format="rgb48le")
+            arr = av_frame_to_rgb_ndarray(frame, pix_fmt="rgb48le")
             rgb = np.ascontiguousarray(arr.astype(np.float32) * (1.0 / 65535.0))
         except Exception:
-            arr = frame.to_ndarray(format="rgb24")
+            arr = av_frame_to_rgb_ndarray(frame, pix_fmt="rgb24")
             rgb = np.ascontiguousarray(arr.astype(np.float32) * (1.0 / 255.0))
         self._decode_w = int(rgb.shape[1])
         self._decode_h = int(rgb.shape[0])
@@ -493,7 +495,7 @@ class VideoIngestSource:
     ) -> Iterator[tuple[int, np.ndarray, dict[str, str]]]:
         import av
 
-        from .video import decode_video_frames
+        from .video import av_frame_reformat, av_frame_to_rgb_ndarray, decode_video_frames
 
         do_resize = self._scale < 1.0
         ow, oh = self._out_w, self._out_h
@@ -518,8 +520,8 @@ class VideoIngestSource:
                             break
                         continue
                 if do_resize:
-                    frame = frame.reformat(width=ow, height=oh)
-                rgb_u16 = frame.to_ndarray(format="rgb48le")
+                    frame = av_frame_reformat(frame, width=ow, height=oh)
+                rgb_u16 = av_frame_to_rgb_ndarray(frame, pix_fmt="rgb48le")
                 rgb_f32 = np.ascontiguousarray(rgb_u16.astype(np.float32) * (1.0 / 65535.0))
                 yield idx, rgb_f32, {}
                 submitted += 1
@@ -587,10 +589,20 @@ class R3DIngestSource:
     def log_header(self, log_fn: Callable[[str], None] | None) -> None:
         if not log_fn:
             return
-        from .r3d import sdk_version
+        from .r3d import decoder_kind, sdk_version
 
         log_fn(f"R3D SDK: {sdk_version() or self._sdk_version}")
-        log_fn(f"R3D decode: mode={self._mode} pipeline=IPP2 primary Log3G10/RWG")
+
+        if self._clip.uses_gpu():
+            kind = decoder_kind()
+            backend = {
+                "metal": "Metal GPU",
+                "cuda": "CUDA GPU",
+                "opencl": "OpenCL GPU",
+            }.get(kind, "GPU")
+        else:
+            backend = "CPU"
+        log_fn(f"R3D decode: {backend} mode={self._mode} pipeline=IPP2 primary Log3G10/RWG")
         cam = self._base_attrs.get("exrconverter:r3d:camera_model")
         if cam:
             log_fn(f"R3D camera: {cam}")

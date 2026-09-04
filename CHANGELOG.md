@@ -15,6 +15,25 @@ rolling the `[Unreleased]` section into a versioned heading.
 
 ---
 
+## [0.9.12] — 2026-09-05
+
+### Fixed
+
+- **Built-in player / preview:** oxideav ProRes MOVs open again. Decoded YUV
+  frames were tagged ``colorspace=RGB``, so libswscale refused ``rgb48le`` /
+  ``rgb24`` (``ENOTSUP``) and the viewer stayed empty. Preview, thumbs, and
+  Video→EXR now copy planes into a swscale-compatible frame when that happens.
+
+### Changed
+
+- **R3D → EXR GPU decode:** macOS uses Metal (`GpuDecoder` + REDMetal) for
+  classic R3D (including KOMODO 6K). Windows and Linux use the SDK
+  ``R3DDecoder`` (CUDA, then OpenCL). Convert log reports ``Metal GPU`` /
+  ``CUDA GPU`` / ``OpenCL GPU`` vs ``CPU``. Set ``EXR_CONVERTER_R3D_CPU=1``
+  to force the CPU path.
+
+---
+
 ## [0.9.11] — 2026-08-26
 
 ### Added
@@ -710,7 +729,8 @@ hardening (QImage/QBuffer; exclude PIL from bundles).
 - Releases: https://github.com/derek-rein/exr-converter/releases
 - Compare tags: `https://github.com/derek-rein/exr-converter/compare/vA.B.C...vX.Y.Z`
 
-[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.11...HEAD
+[Unreleased]: https://github.com/derek-rein/exr-converter/compare/v0.9.12...HEAD
+[0.9.12]: https://github.com/derek-rein/exr-converter/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/derek-rein/exr-converter/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/derek-rein/exr-converter/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/derek-rein/exr-converter/compare/v0.9.8...v0.9.9

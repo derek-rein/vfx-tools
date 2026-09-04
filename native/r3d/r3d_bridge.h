@@ -111,6 +111,12 @@ R3D_BRIDGE_API size_t r3d_bridge_decode_buffer_bytes(
 /* Human-readable last error (thread-local best-effort; process-wide is fine). */
 R3D_BRIDGE_API const char *r3d_bridge_last_error(void);
 
+/* Decode backend: "metal", "cuda", "opencl", "cpu", or empty if not initialized. */
+R3D_BRIDGE_API const char *r3d_bridge_decoder_kind(void);
+
+/* 1 if this open clip will use GPU decode. 0 = CPU (or null clip). */
+R3D_BRIDGE_API int r3d_bridge_clip_uses_gpu(void *clip);
+
 /* Clip-level metadata string for *key* (case-insensitive RMD key).
  * Writes NUL-terminated UTF-8 into *buf*. Returns 1 if present and non-empty,
  * 0 if missing / empty, -1 on error. */

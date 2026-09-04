@@ -80,6 +80,15 @@ class R3DClip:
             self._lib.r3d_bridge_close(self._handle)
             self._handle = None
 
+    def uses_gpu(self) -> bool:
+        """True when this clip decodes on GPU (Metal / CUDA / OpenCL)."""
+        if not self._handle or self._lib is None:
+            return False
+        try:
+            return bool(self._lib.r3d_bridge_clip_uses_gpu(self._handle))
+        except AttributeError:
+            return False
+
     def __enter__(self) -> R3DClip:
         return self
 

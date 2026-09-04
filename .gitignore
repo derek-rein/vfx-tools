@@ -33,3 +33,6 @@ r3d_sdk/
 .r3d-sdk-location.example
 
 native/exr_prores/target/
+
+# Local R3D sample copies (do not commit camera originals)
+.tmp-r3d-sample/
