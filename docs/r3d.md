@@ -18,16 +18,22 @@ Related: [CLI](./cli.md) · [GUI](./gui.md) · [AGENTS.md](../AGENTS.md)
 | Item | Behavior |
 |------|----------|
 | Formats | `.r3d` (classic multi-part + R3D NE), `.nev` (N-RAW) |
-| Decode | CPU path via R3D SDK (IPP2 **Primary Development** → **REDWideGamutRGB + Log3G10**) |
+| Decode | R3D SDK IPP2 **Primary Development** → **REDWideGamutRGB + Log3G10** |
 | OCIO | Auto-detect source space prefers Log3G10 / RWG names on the active config |
 | Output | Same video→EXR pipeline (EXR compression, scale ladder, frame range, workers) |
-| GPU | Not used in this integration yet (CUDA / Metal / OpenCL left for a later pass) |
+| GPU | **macOS Metal** (`GpuDecoder` + REDMetal) for classic R3D GPU decompress. **Windows / Linux:** SDK `R3DDecoder` — CUDA if an NVIDIA device is present, otherwise OpenCL. CPU fallback when no GPU init, or for clips Metal cannot GPU-decompress (N-RAW / R3D NE / RED ONE on macOS). Force CPU with `EXR_CONVERTER_R3D_CPU=1`. |
 | Preview | Sequence player + video browser (half-res decode for scrub) |
 | Thumbnails | Grid thumbs via sixteenth-res decode (fast ID, not full premium) |
 | Metadata | Clip + per-frame timecode written to EXR as ``exrconverter:r3d:*`` attrs |
 
 Scale maps to the SDK resolution ladder (full / half / quarter / …) for faster
 proxies; odd scale factors may apply a small software resize after decode.
+
+The SDK is cross-platform, but GPU APIs are not one path: **Metal** on macOS
+(full GPU decompress), **CUDA then OpenCL** on Windows/Linux via managed
+`R3DDecoder` (CPU decompress + GPU IPP2). CUDA needs an NVIDIA driver and the
+CUDA runtime (`cudart`) on the library path; OpenCL needs a GPU ICD. No extra
+compile-time CUDA/OpenCL SDK is required to build the bridge.
 
 ---
 
@@ -105,6 +111,7 @@ Override discovery:
 | `R3D_SDK_ROOT` | Unpacked SDK root for **building** the bridge |
 | `EXR_CONVERTER_R3D_BRIDGE` | Path to `libr3d_bridge.*` (or its directory) |
 | `EXR_CONVERTER_R3D_LIBS` / `R3D_SDK_LIBS` | Folder containing `REDR3D.*` redistributables |
+| `EXR_CONVERTER_R3D_CPU` | Set to `1` to skip GPU decode (CPU only) |
 | `R3D_SDK_READ_TOKEN` | PAT that can download the private Release asset |
 
 Convert:
@@ -158,6 +165,7 @@ Windows:<dist>/r3d/
 | Multi-part classic R3D | Point at any part (e.g. `…_001.R3D`); the SDK loads siblings |
 | `._….R3D` in browser | macOS AppleDouble metadata next to the real clip — hidden from the video browser (not media) |
 | `.RMD` next to clip | RED metadata recipe sidecar — not listed as video (open the `.R3D`) |
+| Convert log says `CPU` on a KOMODO `.R3D` | GPU init failed (Metal / CUDA / OpenCL). Rebuild `make r3d-bridge`. CUDA needs a NVIDIA driver + `cudart` next to the RED libs; OpenCL needs a GPU ICD. Force CPU with `EXR_CONVERTER_R3D_CPU=1` to compare. |
 
 Sample clips (from RED / Nikon, not this repo):
 

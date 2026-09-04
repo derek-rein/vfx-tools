@@ -81,6 +81,12 @@ def _bind(lib: ctypes.CDLL) -> None:
     lib.r3d_bridge_last_error.restype = ctypes.c_char_p
     lib.r3d_bridge_last_error.argtypes = []
 
+    lib.r3d_bridge_decoder_kind.restype = ctypes.c_char_p
+    lib.r3d_bridge_decoder_kind.argtypes = []
+
+    lib.r3d_bridge_clip_uses_gpu.restype = ctypes.c_int
+    lib.r3d_bridge_clip_uses_gpu.argtypes = [ctypes.c_void_p]
+
     lib.r3d_bridge_metadata_string.restype = ctypes.c_int
     lib.r3d_bridge_metadata_string.argtypes = [
         ctypes.c_void_p,
@@ -212,6 +218,19 @@ def sdk_version() -> str:
     buf = ctypes.create_string_buffer(256)
     _lib.r3d_bridge_sdk_version(buf, 256)
     return buf.value.decode("utf-8", errors="replace")
+
+
+def decoder_kind() -> str:
+    """``metal``, ``cuda``, ``opencl``, ``cpu``, or empty if not initialized."""
+    if not ensure_initialized() or _lib is None:
+        return ""
+    try:
+        raw = _lib.r3d_bridge_decoder_kind()
+    except AttributeError:
+        return "cpu"
+    if not raw:
+        return ""
+    return raw.decode("utf-8", errors="replace")
 
 
 def get_lib() -> ctypes.CDLL | None:

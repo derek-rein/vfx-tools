@@ -31,6 +31,8 @@ from packaging_util import ignore_macos_junk, is_macos_junk_name, safe_print  # 
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "native" / "r3d" / "r3d_bridge.cpp"
+METAL_SRC = ROOT / "native" / "r3d" / "r3d_bridge_metal.mm"
+DECODER_SRC = ROOT / "native" / "r3d" / "r3d_bridge_decoder.cpp"
 HDR_DIR = ROOT / "native" / "r3d"
 OUT_DIR = ROOT / "build" / "r3d"
 
@@ -139,8 +141,9 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
         # Must match the RED static lib CRT: R3DSDK-*-MD.lib → /MD (DLL runtime).
         # Without explicit /MD, some CI images default to /MT and LNK2038.
         # Prefer /Fo + /Fe into out_dir so intermediates stay out of the source tree.
-        obj = out_dir / "r3d_bridge.obj"
-        cmd = [
+        if not DECODER_SRC.is_file():
+            raise SystemExit(f"Missing decoder bridge source: {DECODER_SRC}")
+        win_common = [
             "cl.exe",
             "/nologo",
             "/O2",
@@ -150,24 +153,76 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
             f"/I{include}",
             f"/I{HDR_DIR}",
             "/DR3D_BRIDGE_EXPORTS",
+            "/c",
+        ]
+        objs: list[Path] = []
+        for src in (SRC, DECODER_SRC):
+            obj = out_dir / f"{src.stem}.obj"
+            cmd = [*win_common, str(src), f"/Fo{obj}"]
+            if verbose:
+                print(" ".join(cmd), file=sys.stderr)
+            subprocess.check_call(cmd)
+            objs.append(obj)
+        cmd = [
+            "cl.exe",
+            "/nologo",
             "/LD",
-            str(SRC),
+            "/MD",
+            *[str(o) for o in objs],
             str(static),
-            f"/Fo{obj}",
             f"/Fe{out_lib}",
         ]
+        if verbose:
+            print(" ".join(cmd), file=sys.stderr)
+        subprocess.check_call(cmd)
     else:
         cxx = os.environ.get("CXX", "c++")
-        cmd = [
-            cxx,
+        common = [
             "-std=c++17",
             "-O2",
             "-fPIC",
-            "-shared",
             f"-I{include}",
             f"-I{HDR_DIR}",
             "-DR3D_BRIDGE_EXPORTS",
-            str(SRC),
+        ]
+        obj = out_dir / "r3d_bridge.o"
+        compile_cpp = [cxx, *common, "-c", str(SRC), "-o", str(obj)]
+        if verbose:
+            print(" ".join(compile_cpp), file=sys.stderr)
+        subprocess.check_call(compile_cpp)
+        link_inputs = [str(obj)]
+        if system == "Darwin":
+            if not METAL_SRC.is_file():
+                raise SystemExit(f"Missing Metal bridge source: {METAL_SRC}")
+            metal_obj = out_dir / "r3d_bridge_metal.o"
+            compile_mm = [
+                cxx,
+                *common,
+                "-fobjc-arc",
+                "-x",
+                "objective-c++",
+                "-c",
+                str(METAL_SRC),
+                "-o",
+                str(metal_obj),
+            ]
+            if verbose:
+                print(" ".join(compile_mm), file=sys.stderr)
+            subprocess.check_call(compile_mm)
+            link_inputs.append(str(metal_obj))
+        else:
+            if not DECODER_SRC.is_file():
+                raise SystemExit(f"Missing decoder bridge source: {DECODER_SRC}")
+            decoder_obj = out_dir / "r3d_bridge_decoder.o"
+            compile_dec = [cxx, *common, "-c", str(DECODER_SRC), "-o", str(decoder_obj)]
+            if verbose:
+                print(" ".join(compile_dec), file=sys.stderr)
+            subprocess.check_call(compile_dec)
+            link_inputs.append(str(decoder_obj))
+        cmd = [
+            cxx,
+            "-shared",
+            *link_inputs,
             str(static),
             "-o",
             str(out_lib),
@@ -183,11 +238,9 @@ def build(sdk: Path, out_dir: Path, verbose: bool) -> Path:
             )
         elif system == "Linux":
             cmd.extend(["-Wl,-rpath,$ORIGIN", "-Wl,-rpath,$ORIGIN/redistributable"])
-
-    if verbose:
-        print(" ".join(cmd), file=sys.stderr)
-
-    subprocess.check_call(cmd)
+        if verbose:
+            print(" ".join(cmd), file=sys.stderr)
+        subprocess.check_call(cmd)
 
     # Copy only Redistributable dynamic libraries (allowed by RED license).
     # Skip macOS AppleDouble (._*) / .DS_Store junk that can ride along in tarballs

@@ -79,8 +79,10 @@ def load_video_thumbnail_rgb(
 
         container = av.open(path)
         try:
+            from ..core.video import av_frame_to_rgb_ndarray
+
             for frame in container.decode(video=0):
-                rgb = frame.to_ndarray(format="rgb24")
+                rgb = av_frame_to_rgb_ndarray(frame, pix_fmt="rgb24")
                 return _downscale_uint8_rgb(rgb, max_edge)
         finally:
             container.close()

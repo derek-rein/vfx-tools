@@ -116,6 +116,10 @@ call it “Apple ProRes.” Full ladder (not only 4444/XQ):
 Implementation status and tests:
 [plan-12bit-prores-oxideav.md](./plan-12bit-prores-oxideav.md).
 
+The built-in player, browser thumbs, and Video→EXR decode these MOVs through
+PyAV. FFmpeg may present oxideav frames as YUV with an RGB colorspace tag;
+the app strips that before RGB convert so preview is not blank.
+
 ---
 
 ## Quick picks

@@ -41,6 +41,32 @@ def test_decode_mode_for_scale() -> None:
     assert decode_mode_for_scale(0.25) == DECODE_QUARTER_GOOD
 
 
+def test_decoder_kind_when_unavailable() -> None:
+    from src.core.r3d import native as native_mod
+
+    prev = (
+        native_mod._init_attempted,
+        native_mod._init_ok,
+        native_mod._init_error,
+        native_mod._lib,
+    )
+    native_mod._init_attempted = True
+    native_mod._init_ok = False
+    native_mod._init_error = "test: bridge missing"
+    native_mod._lib = None
+    try:
+        from src.core.r3d import decoder_kind
+
+        assert decoder_kind() == ""
+    finally:
+        (
+            native_mod._init_attempted,
+            native_mod._init_ok,
+            native_mod._init_error,
+            native_mod._lib,
+        ) = prev
+
+
 def test_src_colorspace_candidates_include_log3g10() -> None:
     cands = r3d_src_colorspace_candidates("x.R3D")
     assert any("Log3G10" in c or "log3g10" in c.lower() for c in cands)

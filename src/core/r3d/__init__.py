@@ -34,7 +34,7 @@ from .constants import (
     decode_mode_for_scale,
     scale_for_decode_mode,
 )
-from .native import is_available, sdk_version, unavailable_reason
+from .native import decoder_kind, is_available, sdk_version, unavailable_reason
 from .paths import bridge_candidates, bridge_names
 
 # Tests / advanced callers still poke private helpers under these names.
@@ -81,6 +81,7 @@ __all__ = [
     "R3D_SRC_COLORSPACE_CANDIDATES",
     "R3D_SUFFIXES",
     "decode_mode_for_scale",
+    "decoder_kind",
     "is_available",
     "is_r3d_path",
     "probe_r3d",

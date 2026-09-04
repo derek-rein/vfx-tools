@@ -138,6 +138,25 @@ class TestOxideavEncode:
         assert probe.streams.video[0].codec_context.codec_tag == "ap4x"
         probe.close()
 
+    def test_preview_decoder_reads_hq_mov(self, tmp_path: Path):
+        """Built-in player must RGB-convert oxideav HQ (swscale ENOTSUP otherwise)."""
+        from src.core.frame_source import open_preview_decoder
+
+        out = tmp_path / "hq_preview.mov"
+        w, h = 64, 48
+        with open_writer(out, w, h, 24, 1, "prores_ox_hq") as writer:
+            write_rgb48_frame(writer, np.full((h, w, 3), 22000, dtype=np.uint16))
+            write_rgb48_frame(writer, np.full((h, w, 3), 40000, dtype=np.uint16))
+        dec = open_preview_decoder(str(out), fps=24.0)
+        try:
+            rgb = dec.get_frame(1)
+        finally:
+            dec.close()
+        assert rgb is not None
+        assert rgb.shape == (h, w, 3)
+        assert rgb.dtype == np.float32
+        assert float(rgb.mean()) > 0.05
+
     def test_422_hq_fourcc(self, tmp_path: Path):
         out = tmp_path / "hq.mov"
         w, h = 64, 48

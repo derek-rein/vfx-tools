@@ -174,6 +174,38 @@ def _make_deint_graph(frame, time_base, deint: str):
     return graph
 
 
+def av_frame_sws_compatible(frame):
+    """Copy *frame* planes into a new VideoFrame with default colour metadata.
+
+    oxideav ProRes (and some other bitstreams) decode as YUV but tag
+    ``colorspace=RGB`` / reserved-0 primaries. libswscale then returns
+    ``ENOTSUP`` on ``rgb24`` / ``rgb48le``. A plane copy drops that metadata
+    so swscale can convert. Cheap relative to the convert itself.
+    """
+    import av
+
+    clean = av.VideoFrame(int(frame.width), int(frame.height), frame.format.name)
+    for i, plane in enumerate(frame.planes):
+        clean.planes[i].update(plane)
+    return clean
+
+
+def av_frame_reformat(frame, **kwargs):
+    """``VideoFrame.reformat`` with a swscale-compatible fallback."""
+    try:
+        return frame.reformat(**kwargs)
+    except Exception:
+        return av_frame_sws_compatible(frame).reformat(**kwargs)
+
+
+def av_frame_to_rgb_ndarray(frame, pix_fmt: str = "rgb48le"):
+    """RGB numpy array from a PyAV frame (``rgb48le`` / ``rgb24``, …)."""
+    try:
+        return frame.to_ndarray(format=pix_fmt)
+    except Exception:
+        return av_frame_sws_compatible(frame).to_ndarray(format=pix_fmt)
+
+
 def decode_video_frames(container, stream, deinterlace: str = "auto", log=None):
     """Yield decoded video frames, deinterlacing interlaced sources.
 

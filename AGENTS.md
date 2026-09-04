@@ -88,7 +88,7 @@ site/                   # Hugo config + theme; mounts docs/ → GitHub Pages
 | Area | Start here |
 |------|------------|
 | Convert pipeline | `src/core/convert.py`, `src/core/video.py`, `src/core/exr_io.py` |
-| Optional R3D / N-RAW | `src/core/r3d.py`, `native/r3d/`, `scripts/build_r3d_bridge.py`, `scripts/fetch_r3d_sdk.py`, `scripts/install_r3d_into_bundle.py`, [docs/r3d.md](./docs/r3d.md) |
+| Optional R3D / N-RAW | `src/core/r3d/`, `native/r3d/` (macOS Metal; Win/Linux CUDA then OpenCL; CPU fallback), `scripts/build_r3d_bridge.py`, `scripts/fetch_r3d_sdk.py`, `scripts/install_r3d_into_bundle.py`, [docs/r3d.md](./docs/r3d.md) |
 | Optional 12-bit ProRes (oxideav) | `native/exr_prores/` (PyO3), `src/core/oxideav_prores.py`, `make oxideav-prores`, [docs/plan-12bit-prores-oxideav.md](./docs/plan-12bit-prores-oxideav.md) |
 | Private full SDK (local) | `~/code/r3d-sdk-private/R3DSDKv9_2_1` — never commit; CI feed = private repo `derek-rein/r3d-sdk-private` release `sdk-9.2.1` |
 | Codec ladder / bit depth labels | `src/core/constants.py` |

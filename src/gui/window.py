@@ -87,12 +87,18 @@ class AboutDialog(QDialog):
 
         r3d_line = ""
         try:
+            from ..core.r3d import decoder_kind, sdk_version
             from ..core.r3d import is_available as r3d_available
-            from ..core.r3d import sdk_version
 
             if r3d_available():
                 ver = sdk_version() or "loaded"
-                r3d_line = f"<br>RED R3D SDK: {ver}"
+                kind = decoder_kind()
+                gpu = {
+                    "metal": " · Metal GPU",
+                    "cuda": " · CUDA GPU",
+                    "opencl": " · OpenCL GPU",
+                }.get(kind, "")
+                r3d_line = f"<br>RED R3D SDK: {ver}{gpu}"
             else:
                 r3d_line = "<br>RED R3D: not available (optional)"
         except Exception:
